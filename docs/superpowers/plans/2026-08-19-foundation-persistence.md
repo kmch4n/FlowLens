@@ -62,8 +62,14 @@ Live-verified against official PyPI release pages on 2026-08-19:
 | `PyInstaller==6.21.0` | [PyPI 6.21.0 release](https://pypi.org/project/PyInstaller/6.21.0/) | Exists; released 2026-06-13; requires Python `>=3.8,<3.16`; publishes `py3-none-win_amd64` |
 | `pytest-qt==4.5.0` | [PyPI 4.5.0 release](https://pypi.org/project/pytest-qt/4.5.0/) | Exists; released 2025-07-01; requires Python `>=3.9`; publishes `py3-none-any` |
 | `python-ulid==3.1.0` | [PyPI 3.1.0 release](https://pypi.org/project/python-ulid/3.1.0/) | Exists; released 2025-08-18; requires Python `>=3.9`; publishes `py3-none-any`; its documented API supports `str(ULID())` |
+| `PyAudioWPatch==0.2.12.8` | [PyPI 0.2.12.8 release](https://pypi.org/project/PyAudioWPatch/0.2.12.8/) | Exists; Windows x86-64 and CPython 3.12 support verified for WASAPI loopback capture |
+| `numpy==2.5.2` | [PyPI 2.5.2 release](https://pypi.org/project/numpy/2.5.2/) | Exists; Windows x86-64 CPython 3.12 wheel support verified |
+| `soxr==1.1.0` | [PyPI 1.1.0 release](https://pypi.org/project/soxr/1.1.0/) | Exists; Windows x86-64 CPython 3.12 wheel support verified for resampling |
+| `webrtcvad-wheels==2.0.14` | [PyPI 2.0.14 release](https://pypi.org/project/webrtcvad-wheels/2.0.14/) | Exists; Windows x86-64 CPython 3.12 wheel support verified; runtime import name is `webrtcvad` |
+| `faster-whisper==1.2.1` | [PyPI 1.2.1 release](https://pypi.org/project/faster-whisper/1.2.1/) | Exists; Python 3.12 installation support verified; GPU execution is provided through the pinned CTranslate2 runtime |
+| `ctranslate2==4.7.2` | [PyPI 4.7.2 release](https://pypi.org/project/ctranslate2/4.7.2/) | Exists; Windows x86-64 CPython 3.12 support verified; CUDA 12 and cuDNN runtime DLL directories must be discoverable through `PATH` |
 
-Pin existence and declared interpreter compatibility are confirmed. Actual installation and import on the designated PC remain mandatory gates; PyPI metadata alone does not prove that the local CUDA compiler/toolkit can build `llama-cpp-python`.
+Pin existence and declared interpreter compatibility are confirmed. Install `webrtcvad-wheels` and import it as `webrtcvad`; the legacy `webrtcvad` distribution must not appear in either requirements file. Actual installation and import on the designated PC remain mandatory gates; PyPI metadata alone does not prove that the local CUDA compiler/toolkit can build `llama-cpp-python`, that CTranslate2 can load the required CUDA 12/cuDNN DLLs, or that the designated GPU can execute float16 inference.
 
 ## Shared Interface Catalog
 
@@ -215,6 +221,12 @@ dist/
 python-ulid==3.1.0
 PySide6==6.11.2
 llama-cpp-python==0.3.35
+PyAudioWPatch==0.2.12.8
+numpy==2.5.2
+soxr==1.1.0
+webrtcvad-wheels==2.0.14
+faster-whisper==1.2.1
+ctranslate2==4.7.2
 ```
 
 `requirements-dev.txt` contains exact pins:
@@ -244,10 +256,13 @@ try {
     Remove-Item -LiteralPath "Env:CMAKE_ARGS" -ErrorAction SilentlyContinue
 }
 .\.venv\Scripts\python.exe -m pip install --editable .
+.\.venv\Scripts\python.exe -c "import pyaudiowpatch, numpy, soxr, webrtcvad, faster_whisper, ctranslate2"
 .\.venv\Scripts\python.exe -m pytest tests\test_package.py -v
 ```
 
-Expected: dependency installation completes without falling back to a CPU-only `llama-cpp-python` build, and one test passes. If the CUDA source build fails, stop with the complete pip/CMake error; do not remove the pin or install an unpinned substitute.
+Expected: dependency installation completes without falling back to a CPU-only `llama-cpp-python` build, `python -c "import pyaudiowpatch, numpy, soxr, webrtcvad, faster_whisper, ctranslate2"` exits 0, and one test passes. If the CUDA source build fails or CTranslate2 cannot load CUDA 12/cuDNN DLLs from `PATH`, stop with the complete pip/CMake/DLL error; do not remove a pin, add the legacy `webrtcvad` distribution, or install an unpinned substitute.
+
+Before audio/ASR implementation is accepted on the designated PC, run a focused GPU smoke with `faster_whisper.WhisperModel` configured exactly as the specification requires: local Kotoba-Whisper model path, `device="cuda"`, `compute_type="float16"`, `language="ja"`, `beam_size=1`, `temperature=0`, `condition_on_previous_text=False`, and `word_timestamps=True`. The smoke must transcribe a short local Japanese fixture, return at least one segment and at least one word timestamp, and show no CPU fallback or missing CUDA/cuDNN DLL error.
 
 - [ ] **Step 5: Run the initial static gate**
 
