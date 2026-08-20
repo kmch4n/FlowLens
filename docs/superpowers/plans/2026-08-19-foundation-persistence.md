@@ -1667,6 +1667,15 @@ Expected: all commands pass.
 - Consumes: recovery inspection, `EventRecord`, `AtomicJsonFile`, `JsonlAppender`, and WAV repair.
 - Produces: `recover_incomplete_session(session_dir: Path, recovered_at: datetime) -> RecoveryReport` and `recover_incomplete_sessions(sessions_root: Path, recovered_at: datetime) -> tuple[RecoveryReport, ...]`.
 
+**Security requirement:** The complete mutation transaction must retain verified
+directory anchors for its full lifetime. On Windows, hold directory handles
+that prevent rename/deletion; on POSIX, perform mutations relative to verified
+`dir_fd` anchors. Mutation callbacks must not re-resolve session artifact paths.
+A pre/post path identity check alone is forbidden because a callback can mutate
+an attacker-swapped directory before the post-check. Post-validation and handle
+cleanup must run even when the operation raises, preserving the primary error
+and attaching cleanup failures as notes.
+
 - [ ] **Step 1: Write failing complete recovery test**
 
 ```python

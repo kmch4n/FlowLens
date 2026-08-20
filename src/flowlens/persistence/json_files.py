@@ -224,6 +224,13 @@ def inspect_jsonl_tail(path: Path) -> JsonlRepairPlan:
 
     normalized_path = Path(path)
     encoded = normalized_path.read_bytes()
+    return _inspect_jsonl_tail_bytes(normalized_path, encoded)
+
+
+def _inspect_jsonl_tail_bytes(path: Path, encoded: bytes) -> JsonlRepairPlan:
+    """Inspect already-held JSONL bytes without reopening their path."""
+
+    normalized_path = Path(path)
     lines = encoded.splitlines(keepends=True)
     valid_record_count = 0
     discarded_tail_bytes = 0
