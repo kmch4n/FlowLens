@@ -64,6 +64,20 @@ def _remove_temp_file(path: Path) -> None:
     path.unlink()
 
 
+def encode_jsonl_record(value: object) -> bytes:
+    """Encode one compact UTF-8 JSON record terminated by LF."""
+
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
 class JsonlValidationError(ValueError):
     """Raised when a complete JSONL record is not a UTF-8 JSON object."""
 
@@ -186,15 +200,7 @@ class JsonlAppender:
     def append(self, value: object) -> None:
         """Append and flush one compact UTF-8 JSON record."""
 
-        encoded = (
-            json.dumps(
-                value,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                allow_nan=False,
-            )
-            + "\n"
-        ).encode("utf-8")
+        encoded = encode_jsonl_record(value)
         with self._lock:
             _write_all(self._file, encoded)
             self._file.flush()

@@ -10,7 +10,7 @@ from flowlens.domain.enums import (
     SessionMode,
     SessionStatus,
 )
-from flowlens.domain.messages import EventRecord, TranscriptRecord
+from flowlens.domain.messages import EventRecord, TranscriptRecord, WriterFinalize
 from flowlens.domain.session import DeviceIdentity, ModelIdentity, SessionManifest
 
 
@@ -103,4 +103,28 @@ def make_event_record(
         ),
         created_at=datetime.fromisoformat("2026-08-19T12:05:00+09:00"),
         details={},
+    )
+
+
+def make_finalize_command(
+    event_sequence: int = 1,
+    session_id: str = "01J00000000000000000000000",
+) -> WriterFinalize:
+    """Create a deterministic normal-finalization command."""
+
+    return WriterFinalize(
+        ended_at=datetime.fromisoformat("2026-08-19T12:30:00+09:00"),
+        active_duration_ms=1_800_000,
+        pause_intervals=(),
+        final_state=make_discussion_state(revision=0),
+        completion_event=EventRecord(
+            schema_version=1,
+            session_id=session_id,
+            sequence=event_sequence,
+            event_type=EventType.SESSION_COMPLETED,
+            source=ProcessSource.GUI,
+            session_time_ms=1_800_000,
+            created_at=datetime.fromisoformat("2026-08-19T12:30:00+09:00"),
+            details={},
+        ),
     )

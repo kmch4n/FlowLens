@@ -6,16 +6,27 @@ import stat
 import struct
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
+from fractions import Fraction
 from pathlib import Path
 from typing import Self
 
+from flowlens.domain._validation import json_dumps
 from flowlens.domain.discussion import DiscussionState, StateHistoryRecord
-from flowlens.domain.enums import AudioSource, SessionStatus
-from flowlens.domain.messages import AudioWriteCommand, EventRecord, TranscriptRecord
-from flowlens.domain.session import SessionManifest
-from flowlens.persistence.json_files import AtomicJsonFile, JsonlAppender
+from flowlens.domain.enums import AudioSource, EventType, SessionStatus
+from flowlens.domain.messages import (
+    AudioWriteCommand,
+    EventRecord,
+    TranscriptRecord,
+    WriterFinalize,
+)
+from flowlens.domain.session import PauseInterval, SessionManifest
+from flowlens.persistence.json_files import (
+    AtomicJsonFile,
+    JsonlAppender,
+    encode_jsonl_record,
+)
 from flowlens.persistence.wav_sink import WavSink
 
 _SOURCE_RANK = {
@@ -23,6 +34,15 @@ _SOURCE_RANK = {
     AudioSource.OTHERS: 1,
 }
 _BOOTSTRAP_CLAIM_NAME = ".flowlens-bootstrap.claim"
+_OWNED_RESOURCE_NAMES = frozenset(
+    {
+        "mic.wav",
+        "loopback.wav",
+        "transcript.jsonl",
+        "state-history.jsonl",
+        "events.jsonl",
+    }
+)
 
 
 class PersistenceInvariantError(ValueError):
@@ -124,11 +144,13 @@ class SessionWriter:
         owner_pid: int,
         sync_interval_seconds: float,
         opened_monotonic: float,
+        next_sync_deadline: float,
     ) -> None:
         self.session_dir = Path(session_dir)
         self.owner_pid = owner_pid
         self.opened_monotonic = opened_monotonic
         self._sync_interval_seconds = sync_interval_seconds
+        self._next_sync_deadline = next_sync_deadline
         self._manifest = manifest
         self._manifest_file = AtomicJsonFile(self.session_dir / "session.json")
         self._discussion_file = AtomicJsonFile(
@@ -145,12 +167,14 @@ class SessionWriter:
         }
         self._next_transcript_sequence = 1
         self._next_event_sequence = 1
+        self._discussion_state = initial_state
         self._discussion_revision = initial_state.revision
         self._transcript_segment_ids: set[str] = set()
         self._last_transcript_order: tuple[int, int] | None = None
         self._last_event_session_time_ms: int | None = None
         self._state = _WriterState.OPEN
         self._resources_closed = False
+        self._closed_resource_names: set[str] = set()
 
     @classmethod
     def open(
@@ -169,14 +193,27 @@ class SessionWriter:
             initial_state,
             "initial discussion state",
         )
-        cls._validate_open_inputs(
+        sync_interval_seconds = cls._validate_open_inputs(
             manifest,
             initial_state,
             sync_interval_seconds,
         )
-        cls._validate_storage_path(normalized_dir)
         owner_pid = os.getpid()
-        opened_monotonic = time.monotonic()
+        opened_monotonic = cls._canonical_finite_number(
+            time.monotonic(),
+            "opened_monotonic",
+        )
+        initial_deadline = opened_monotonic + sync_interval_seconds
+        if not math.isfinite(initial_deadline) or initial_deadline <= opened_monotonic:
+            raise PersistenceInvariantError(
+                "no finite representable sync deadline exists"
+            )
+        next_sync_deadline = cls._calculate_next_sync_deadline(
+            opened_monotonic,
+            sync_interval_seconds,
+            opened_monotonic,
+        )
+        cls._validate_storage_path(normalized_dir)
         cls._prepare_empty_session_directory(normalized_dir)
         cls._validate_storage_path(normalized_dir)
         claim = _BootstrapClaim.acquire(normalized_dir)
@@ -224,6 +261,7 @@ class SessionWriter:
                 owner_pid=owner_pid,
                 sync_interval_seconds=sync_interval_seconds,
                 opened_monotonic=opened_monotonic,
+                next_sync_deadline=next_sync_deadline,
             )
         except BaseException as error:
             primary_error = error
@@ -360,6 +398,7 @@ class SessionWriter:
         except BaseException as primary_error:
             self._fail_closed(primary_error)
             raise
+        self._discussion_state = state
         self._discussion_revision = state.revision
 
     def append_event(self, record: EventRecord) -> None:
@@ -389,6 +428,51 @@ class SessionWriter:
         self._next_event_sequence += 1
         self._last_event_session_time_ms = record.session_time_ms
 
+    def sync_if_due(self, now_monotonic: float) -> bool:
+        """Durably synchronize append resources at fixed monotonic intervals."""
+
+        self._ensure_mutable()
+        now_monotonic = self._canonical_finite_number(
+            now_monotonic,
+            "now_monotonic",
+        )
+        if now_monotonic < self._next_sync_deadline:
+            return False
+        next_sync_deadline = self._calculate_next_sync_deadline(
+            self.opened_monotonic,
+            self._sync_interval_seconds,
+            now_monotonic,
+        )
+        try:
+            self._sync_all()
+        except BaseException as primary_error:
+            self._fail_closed(primary_error)
+            raise
+        self._next_sync_deadline = next_sync_deadline
+        return True
+
+    def finalize(self, command: WriterFinalize) -> SessionManifest:
+        """Publish completed metadata only after every owned handle is durable."""
+
+        self._ensure_mutable()
+        command = self._canonical_finalize_command(command)
+        completed_manifest = self._build_completed_manifest(command)
+        self._preflight_finalization_documents(command, completed_manifest)
+        try:
+            self._append_completion_event(command.completion_event)
+            self._sync_jsonl()
+            self._finalize_wavs()
+            self._replace_state(command.final_state)
+            self._close_jsonl_resources()
+            self._write_manifest(completed_manifest)
+        except BaseException as primary_error:
+            self._fail_closed(primary_error)
+            raise
+        self._manifest = completed_manifest
+        self._state = _WriterState.CLOSED
+        self._resources_closed = True
+        return completed_manifest
+
     def close_incomplete(self) -> None:
         """Synchronize and close all resources without changing the manifest."""
 
@@ -407,7 +491,7 @@ class SessionWriter:
         manifest: SessionManifest,
         initial_state: DiscussionState,
         sync_interval_seconds: float,
-    ) -> None:
+    ) -> float:
         if not isinstance(manifest, SessionManifest):
             raise PersistenceInvariantError("manifest must be a SessionManifest")
         if not isinstance(initial_state, DiscussionState):
@@ -429,15 +513,58 @@ class SessionWriter:
                 "manifest final discussion revision must match the initial state "
                 "revision"
             )
-        if (
-            isinstance(sync_interval_seconds, bool)
-            or not isinstance(sync_interval_seconds, int | float)
-            or not math.isfinite(sync_interval_seconds)
-            or sync_interval_seconds <= 0
-        ):
+        normalized_sync_interval = cls._canonical_finite_number(
+            sync_interval_seconds,
+            "sync_interval_seconds",
+        )
+        if normalized_sync_interval <= 0:
             raise PersistenceInvariantError(
                 "sync_interval_seconds must be a positive finite number"
             )
+        return normalized_sync_interval
+
+    @staticmethod
+    def _canonical_finite_number(value: object, field_name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise PersistenceInvariantError(f"{field_name} must be a finite number")
+        try:
+            normalized = float(value)
+        except (OverflowError, ValueError) as error:
+            raise PersistenceInvariantError(
+                f"{field_name} must be a finite number"
+            ) from error
+        if not math.isfinite(normalized):
+            raise PersistenceInvariantError(f"{field_name} must be a finite number")
+        return normalized
+
+    @staticmethod
+    def _calculate_next_sync_deadline(
+        opened_monotonic: float,
+        sync_interval_seconds: float,
+        now_monotonic: float,
+    ) -> float:
+        try:
+            opened = Fraction.from_float(opened_monotonic)
+            interval = Fraction.from_float(sync_interval_seconds)
+            now = Fraction.from_float(now_monotonic)
+            whole_intervals = (now - opened) // interval + 1
+            exact_deadline = opened + whole_intervals * interval
+            next_deadline = float(exact_deadline)
+        except (OverflowError, ValueError, ZeroDivisionError) as error:
+            raise PersistenceInvariantError(
+                "no finite representable sync deadline exists"
+            ) from error
+        if not math.isfinite(next_deadline):
+            raise PersistenceInvariantError(
+                "no finite representable sync deadline exists"
+            )
+        if next_deadline <= now_monotonic:
+            next_deadline = math.nextafter(now_monotonic, math.inf)
+        if not math.isfinite(next_deadline) or next_deadline <= now_monotonic:
+            raise PersistenceInvariantError(
+                "no finite representable sync deadline exists"
+            )
+        return next_deadline
 
     @staticmethod
     def _canonical_manifest(manifest: SessionManifest) -> SessionManifest:
@@ -483,6 +610,30 @@ class SessionWriter:
             return EventRecord.from_dict(record.to_dict())
         except Exception as error:
             raise PersistenceInvariantError(f"invalid event record: {error}") from error
+
+    @classmethod
+    def _canonical_finalize_command(cls, command: WriterFinalize) -> WriterFinalize:
+        if not isinstance(command, WriterFinalize):
+            raise PersistenceInvariantError("command must be a WriterFinalize")
+        try:
+            pause_intervals = tuple(
+                PauseInterval.from_dict(interval.to_dict())
+                for interval in command.pause_intervals
+            )
+            return WriterFinalize(
+                ended_at=command.ended_at,
+                active_duration_ms=command.active_duration_ms,
+                pause_intervals=pause_intervals,
+                final_state=cls._canonical_discussion_state(
+                    command.final_state,
+                    "final discussion state",
+                ),
+                completion_event=cls._canonical_event_record(command.completion_event),
+            )
+        except Exception as error:
+            raise PersistenceInvariantError(
+                f"invalid finalize command: {error}"
+            ) from error
 
     @staticmethod
     def _canonical_state_history_record(
@@ -623,6 +774,118 @@ class SessionWriter:
             return self._microphone_sink
         return self._loopback_sink
 
+    def _sync_all(self) -> None:
+        self._microphone_sink.sync()
+        self._loopback_sink.sync()
+        self._transcript_log.sync()
+        self._state_history_log.sync()
+        self._event_log.sync()
+
+    def _build_completed_manifest(
+        self,
+        command: WriterFinalize,
+    ) -> SessionManifest:
+        final_state = command.final_state
+        completion_event = command.completion_event
+        if final_state.revision != self._discussion_revision:
+            raise PersistenceInvariantError(
+                f"expected final discussion revision {self._discussion_revision}, "
+                f"got {final_state.revision}"
+            )
+        if final_state.mode is not self._manifest.mode:
+            raise PersistenceInvariantError(
+                "final discussion state mode must match the session manifest mode"
+            )
+        if final_state != self._discussion_state:
+            raise PersistenceInvariantError(
+                "final discussion state must exactly match the persisted state"
+            )
+        if completion_event.event_type is not EventType.SESSION_COMPLETED:
+            raise PersistenceInvariantError(
+                "completion event type must be SESSION_COMPLETED"
+            )
+        if completion_event.session_id != self._manifest.session_id:
+            raise PersistenceInvariantError(
+                "completion event session_id must match the session manifest"
+            )
+        if completion_event.sequence != self._next_event_sequence:
+            raise PersistenceInvariantError(
+                f"expected completion event sequence {self._next_event_sequence}, "
+                f"got {completion_event.sequence}"
+            )
+        if (
+            self._last_event_session_time_ms is not None
+            and completion_event.session_time_ms < self._last_event_session_time_ms
+        ):
+            raise PersistenceInvariantError(
+                "completion event must preserve chronological event order"
+            )
+        if command.ended_at < self._manifest.started_at:
+            raise PersistenceInvariantError(
+                "ended_at must not precede the session started_at"
+            )
+        completed_manifest = replace(
+            self._manifest,
+            status=SessionStatus.COMPLETED,
+            ended_at=command.ended_at,
+            active_duration_ms=command.active_duration_ms,
+            pause_intervals=command.pause_intervals,
+            transcript_entry_count=self._next_transcript_sequence - 1,
+            final_discussion_state_revision=final_state.revision,
+        )
+        return self._canonical_manifest(completed_manifest)
+
+    def _append_completion_event(self, event: EventRecord) -> None:
+        self._event_log.append(event.to_dict())
+        self._next_event_sequence += 1
+        self._last_event_session_time_ms = event.session_time_ms
+
+    @staticmethod
+    def _preflight_finalization_documents(
+        command: WriterFinalize,
+        completed_manifest: SessionManifest,
+    ) -> None:
+        try:
+            encode_jsonl_record(command.completion_event.to_dict())
+            json_dumps(command.final_state.to_dict()).encode("utf-8")
+            json_dumps(completed_manifest.to_dict()).encode("utf-8")
+        except Exception as error:
+            raise PersistenceInvariantError(
+                f"finalization document is not JSON encodable: {error}"
+            ) from error
+
+    def _sync_jsonl(self) -> None:
+        self._transcript_log.sync()
+        self._state_history_log.sync()
+        self._event_log.sync()
+
+    def _finalize_wavs(self) -> None:
+        primary_error = self._run_owned_resource_operations(
+            (
+                ("mic.wav", self._microphone_sink.finalize),
+                ("loopback.wav", self._loopback_sink.finalize),
+            )
+        )
+        if primary_error is not None:
+            raise primary_error
+
+    def _replace_state(self, state: DiscussionState) -> None:
+        self._discussion_file.replace(state.to_dict())
+
+    def _close_jsonl_resources(self) -> None:
+        primary_error = self._run_owned_resource_operations(
+            (
+                ("transcript.jsonl", self._transcript_log.close),
+                ("state-history.jsonl", self._state_history_log.close),
+                ("events.jsonl", self._event_log.close),
+            )
+        )
+        if primary_error is not None:
+            raise primary_error
+
+    def _write_manifest(self, manifest: SessionManifest) -> None:
+        self._manifest_file.replace(manifest.to_dict())
+
     def _ensure_mutable(self) -> None:
         self._ensure_owner()
         if self._state is _WriterState.FAILED:
@@ -650,7 +913,6 @@ class SessionWriter:
     ) -> BaseException | None:
         if self._resources_closed:
             return primary_error
-        self._resources_closed = True
         operations: list[tuple[str, Callable[[], None]]] = [
             ("events.jsonl", lambda: self._close_jsonl(self._event_log)),
             (
@@ -664,7 +926,34 @@ class SessionWriter:
             ("loopback.wav", self._loopback_sink.close_incomplete),
             ("mic.wav", self._microphone_sink.close_incomplete),
         ]
-        return self._run_cleanup_operations(operations, primary_error)
+        return self._run_owned_resource_operations(operations, primary_error)
+
+    def _run_owned_resource_operations(
+        self,
+        operations: Iterable[tuple[str, Callable[[], None]]],
+        primary_error: BaseException | None = None,
+    ) -> BaseException | None:
+        pending_operations = (
+            (name, operation)
+            for name, operation in operations
+            if name not in self._closed_resource_names
+        )
+        first_error = primary_error
+        for name, operation in pending_operations:
+            try:
+                operation()
+            except BaseException as cleanup_error:
+                if first_error is None:
+                    first_error = cleanup_error
+                else:
+                    first_error.add_note(
+                        f"Session resource cleanup failed for {name}: "
+                        f"{cleanup_error}"
+                    )
+            finally:
+                self._closed_resource_names.add(name)
+        self._resources_closed = self._closed_resource_names == _OWNED_RESOURCE_NAMES
+        return first_error
 
     @staticmethod
     def _close_jsonl(appender: JsonlAppender) -> None:

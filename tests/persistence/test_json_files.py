@@ -15,6 +15,7 @@ from flowlens.persistence.json_files import (
     JsonlAppender,
     JsonlValidationError,
     apply_jsonl_tail_repair,
+    encode_jsonl_record,
     inspect_jsonl_tail,
     validate_and_repair_jsonl_tail,
 )
@@ -146,6 +147,22 @@ def test_jsonl_flushes_each_record_and_uses_one_compact_lf_line(
         assert path.read_bytes() == '{"schema_version":1,"text":"保存"}\n'.encode()
     finally:
         appender.close()
+
+
+def test_jsonl_shared_encoder_matches_exact_appender_bytes() -> None:
+    """Changing either serializer independently must break byte parity."""
+
+    value = {"schema_version": 1, "text": "保存"}
+    expected = '{"schema_version":1,"text":"保存"}\n'.encode()
+    output = _ShortWriteFile()
+    appender = JsonlAppender(Path("events.jsonl"), cast(BinaryIO, output))
+
+    encoded = encode_jsonl_record(value)
+    appender.append(value)
+
+    assert encoded == expected
+    assert bytes(output.contents) == encoded
+    appender.close()
 
 
 def test_atomic_json_is_indented_utf8_and_has_no_leftover_temp(
