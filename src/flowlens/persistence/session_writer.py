@@ -451,6 +451,16 @@ class SessionWriter:
         self._next_sync_deadline = next_sync_deadline
         return True
 
+    def force_sync(self) -> None:
+        """Synchronize all append resources without shifting the deadline."""
+
+        self._ensure_mutable()
+        try:
+            self._sync_all()
+        except BaseException as primary_error:
+            self._fail_closed(primary_error)
+            raise
+
     def finalize(self, command: WriterFinalize) -> SessionManifest:
         """Publish completed metadata only after every owned handle is durable."""
 

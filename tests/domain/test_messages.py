@@ -19,6 +19,7 @@ from flowlens.domain.enums import (
     SessionStatus,
 )
 from flowlens.domain.messages import (
+    AudioDrainFence,
     AudioWriteCommand,
     DiscussionStateReplaced,
     EventRecord,
@@ -589,9 +590,19 @@ def test_audio_command_rejects_invalid_boundaries(
         command()
 
 
+def test_audio_drain_fence_is_empty_immutable_and_picklable() -> None:
+    fence = AudioDrainFence()
+
+    assert [field.name for field in fields(AudioDrainFence)] == []
+    assert pickle.loads(pickle.dumps(fence)) == fence
+    with pytest.raises((AttributeError, TypeError)):
+        fence.drained = False  # type: ignore[attr-defined]
+
+
 @pytest.mark.parametrize(
     ("record_type", "expected_fields"),
     [
+        (AudioDrainFence, []),
         (TranscriptCommitted, ["record"]),
         (DiscussionStateReplaced, ["previous_revision", "state"]),
         (WriterOpenSession, ["session_dir", "manifest", "initial_state"]),
@@ -661,6 +672,12 @@ def test_writer_ack_normalizes_wall_clock_to_milliseconds() -> None:
     assert ack.latest_successful_save_at == NOW
 
 
+def test_writer_fatal_accepts_zero_for_non_control_failures() -> None:
+    fatal = WriterFatal(0, "OSError", "audio write failed")
+
+    assert fatal.failed_sequence == 0
+
+
 @pytest.mark.parametrize(
     ("factory", "match"),
     [
@@ -703,7 +720,11 @@ def test_writer_ack_normalizes_wall_clock_to_milliseconds() -> None:
             "acknowledged_sequence",
         ),
         (
-            lambda: WriterFatal(0, "OSError", "disk full"),
+            lambda: WriterFatal(-1, "OSError", "disk full"),
+            "failed_sequence",
+        ),
+        (
+            lambda: WriterFatal(True, "OSError", "disk full"),
             "failed_sequence",
         ),
         (

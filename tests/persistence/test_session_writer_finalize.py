@@ -65,6 +65,68 @@ def test_sync_occurs_only_when_one_second_deadline_is_due(
     assert calls == ["sync"]
 
 
+def test_force_sync_does_not_shift_the_regular_deadline(
+    open_writer: SessionWriter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit flush must not postpone the fixed one-second schedule."""
+
+    calls: list[str] = []
+    monkeypatch.setattr(open_writer, "_sync_all", lambda: calls.append("sync"))
+
+    open_writer.force_sync()
+
+    assert open_writer.sync_if_due(open_writer.opened_monotonic + 0.999) is False
+    assert open_writer.sync_if_due(open_writer.opened_monotonic + 1.0) is True
+    assert calls == ["sync", "sync"]
+
+
+def test_force_sync_failure_keeps_incomplete_and_terminalizes_writer(
+    open_writer: SessionWriter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forced durability failure must use the same fail-closed path."""
+
+    def fail_sync() -> None:
+        raise OSError("forced sync failed")
+
+    monkeypatch.setattr(open_writer, "_sync_all", fail_sync)
+
+    with pytest.raises(OSError, match="forced sync failed"):
+        open_writer.force_sync()
+
+    assert _load_manifest(open_writer)["status"] == "incomplete"
+    with pytest.raises(RuntimeError, match="failed"):
+        open_writer.force_sync()
+
+
+def test_force_sync_rejects_non_owner_and_closed_writer_before_resource_access(
+    open_writer: SessionWriter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership and open-state checks must precede every explicit sync."""
+
+    calls: list[str] = []
+    monkeypatch.setattr(open_writer, "_sync_all", lambda: calls.append("sync"))
+    monkeypatch.setattr(
+        "flowlens.persistence.session_writer.os.getpid",
+        lambda: open_writer.owner_pid + 1,
+    )
+
+    with pytest.raises(WriterOwnershipError, match="owner PID"):
+        open_writer.force_sync()
+
+    assert calls == []
+    monkeypatch.setattr(
+        "flowlens.persistence.session_writer.os.getpid",
+        lambda: open_writer.owner_pid,
+    )
+    open_writer.close_incomplete()
+    with pytest.raises(RuntimeError, match="closed"):
+        open_writer.force_sync()
+    assert calls == []
+
+
 def test_late_sync_advances_by_whole_intervals_past_observed_time(
     open_writer: SessionWriter,
     monkeypatch: pytest.MonkeyPatch,

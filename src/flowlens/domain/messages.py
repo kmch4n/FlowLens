@@ -509,14 +509,18 @@ class WriterAck:
 
 @dataclass(frozen=True, slots=True)
 class WriterFatal:
-    """Writer response describing a fail-closed persistence error."""
+    """Writer response describing a fail-closed persistence error.
+
+    A failed sequence of zero identifies audio-queue or lifecycle work that did
+    not originate from a control envelope.
+    """
 
     failed_sequence: int
     error_type: str
     message: str
 
     def __post_init__(self) -> None:
-        failed_sequence = _require_positive_int(
+        failed_sequence = require_non_negative_int(
             self.failed_sequence,
             "failed_sequence",
         )
@@ -579,6 +583,11 @@ class AudioWriteCommand:
                 "captured_monotonic_ms",
             ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AudioDrainFence:
+    """Dedicated-audio-queue marker following the final audio command."""
 
 
 @dataclass(frozen=True, slots=True)

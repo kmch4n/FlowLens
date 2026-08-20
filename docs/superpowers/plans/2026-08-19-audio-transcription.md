@@ -33,6 +33,7 @@ The executor must read the foundation plan and `docs/mvp-spec.md` before Task 1.
 from flowlens.domain.enums import AudioSource, MessageType, WorkerName
 from flowlens.domain.ids import new_ulid
 from flowlens.domain.messages import (
+    AudioDrainFence,
     AudioWriteCommand,
     MessageEnvelope,
     TranscriptRecord,
@@ -66,6 +67,11 @@ TranscriptRecord(
 ```
 
 Every control/status `MessageEnvelope` has the exact section 21 fields: `schema_version`, `session_id`, `message_type`, sender-local `sequence`, `source`, `created_monotonic_ms`, and a JSON-serializable `payload` dictionary. The envelope sequence is not the transcript `TranscriptRecord.sequence`.
+
+`AudioDrainFence` is the foundation-owned, empty immutable marker for the
+dedicated Audio-to-Writer queue. It is not a general `MessageEnvelope`, never
+enters a control queue, and is not sent to the ASR audio queue unless a separate
+future contract explicitly introduces an ASR fence.
 
 ## File Map
 
@@ -518,7 +524,7 @@ from typing import cast
 from flowlens.audio.dispatch import AudioDispatcher, WriterQueueFull
 from flowlens.audio.types import AudioFrame
 from flowlens.domain.enums import AudioSource
-from flowlens.domain.messages import AudioWriteCommand
+from flowlens.domain.messages import AudioDrainFence, AudioWriteCommand
 
 
 def make_frame() -> AudioFrame:
@@ -526,7 +532,7 @@ def make_frame() -> AudioFrame:
 
 
 def test_dispatches_writer_command_before_asr_frame() -> None:
-    writer: Queue[object] = Queue(maxsize=1)
+    writer: Queue[AudioWriteCommand | AudioDrainFence] = Queue(maxsize=1)
     asr: Queue[AudioFrame] = Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=3_000)
     dispatcher.dispatch(make_frame())
@@ -536,8 +542,8 @@ def test_dispatches_writer_command_before_asr_frame() -> None:
 
 
 def test_full_writer_queue_is_fatal_before_asr_dispatch() -> None:
-    writer: Queue[object] = Queue(maxsize=1)
-    writer.put_nowait(object())
+    writer: Queue[AudioWriteCommand | AudioDrainFence] = Queue(maxsize=1)
+    writer.put_nowait(AudioWriteCommand(AudioSource.ME, bytes(640), 0, 320, 100, 1_100))
     asr: Queue[AudioFrame] = Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=3_000)
     try:
@@ -578,7 +584,7 @@ Expected: all tests pass and no dispatch thread remains alive.
 - Create: `tests/audio/test_worker.py`
 
 **Interfaces:**
-- Consumes: `MessageEnvelope`, `AudioWriteCommand`, `AudioFrame`, `CaptureBackendPort`, `SoxrAudioNormalizer`, and `AudioDispatcher`.
+- Consumes: `MessageEnvelope`, `AudioWriteCommand`, shared `AudioDrainFence`, `AudioFrame`, `CaptureBackendPort`, `SoxrAudioNormalizer`, and `AudioDispatcher`.
 - Produces:
 
 ```python
@@ -586,7 +592,7 @@ def run_audio_worker(
     config: AudioWorkerConfig,
     control_in: "multiprocessing.Queue[MessageEnvelope]",
     control_out: "multiprocessing.Queue[MessageEnvelope]",
-    writer_audio_out: "multiprocessing.Queue[AudioWriteCommand]",
+    writer_audio_out: "multiprocessing.Queue[AudioWriteCommand | AudioDrainFence]",
     asr_audio_out: "multiprocessing.Queue[AudioFrame]",
 ) -> None: ...
 ```
@@ -623,6 +629,21 @@ def test_pause_stops_streams_and_resume_preserves_source_offsets() -> None:
     stopped = harness.status("WORKER_STOPPED")
     assert stopped.payload["drained"] is True
     assert stopped.payload["writer_frames"] == 2
+
+
+def test_normal_stop_fences_writer_audio_before_reporting_stopped() -> None:
+    harness = AudioWorkerHarness()
+    harness.start_recording()
+    harness.backend.emit_me(bytes(1_920), at_ms=1_020)
+    harness.send("WORKER_STOP", {"worker": "AUDIO"})
+    writer_items = harness.drain_writer_items()
+    assert all(isinstance(item, AudioWriteCommand) for item in writer_items[:-1])
+    assert isinstance(writer_items[-1], AudioDrainFence)
+    assert sum(isinstance(item, AudioDrainFence) for item in writer_items) == 1
+    assert not any(isinstance(item, AudioDrainFence) for item in harness.asr_items())
+    assert harness.timeline.index("writer:AudioDrainFence") < harness.timeline.index(
+        "status:WORKER_STOPPED"
+    )
 ```
 
 Put the reusable `FakeCaptureBackend` and `AudioWorkerHarness` in the same test file with fully typed methods. Inject backend, normalizer factory, monotonic clock, and sleeper through a private `_audio_worker_loop(...)`; the public process entrypoint constructs production adapters.
@@ -641,9 +662,16 @@ On stop, execute this order:
 
 1. stop both streams so no callback can add audio;
 2. drain both raw queues;
-3. call each normalizer's `flush()` and dispatch complete frames only;
+3. call each normalizer's `flush()` and dispatch every remaining complete frame, putting every final `AudioWriteCommand` on the Writer queue;
 4. wait for the ASR pump spool to empty;
-5. emit `WORKER_STOPPED` with `worker="AUDIO"` and `drained=true`, then close streams/backend.
+5. put exactly one shared `AudioDrainFence()` on the Writer queue after the last Writer audio command;
+6. emit `WORKER_STOPPED` with `worker="AUDIO"` and `drained=true`, then close streams/backend.
+
+The Audio Worker must never put an `AudioWriteCommand` after the fence.
+Same-producer FIFO is the ordering proof consumed by the Writer Worker; queue
+emptiness is not. `WORKER_STOPPED/drained=true` therefore means the fence was
+already enqueued after all Writer audio. The fence is Writer-queue-only and is
+neither wrapped in `MessageEnvelope` nor copied to `asr_audio_out`.
 
 - [ ] **Step 4: Add disconnection/reconnection and fatal queue tests**
 
@@ -1389,5 +1417,5 @@ Hardware result evidence belongs in the implementation task report, not in sourc
 - [ ] Run both designated-PC smoke scripts with the IDs selected in preflight and the checksum-validated local model path.
 - [ ] Confirm no test, adapter, or worker passes a Hugging Face repository ID to faster-whisper at session runtime.
 - [ ] Confirm Writer queue failure safely stops both streams and emits the fatal error before shutdown.
-- [ ] Confirm Audio `WORKER_STOPPED/drained=true` precedes ASR finalization and that committed records precede ASR `WORKER_STOPPED/drained=true`.
+- [ ] Confirm Audio puts every final Writer command and exactly one `AudioDrainFence` before `WORKER_STOPPED/drained=true`, sends no audio after the fence, never sends the fence to ASR, and that committed records precede ASR `WORKER_STOPPED/drained=true`.
 - [ ] Confirm the full application integration plan consumes these exact worker entrypoints, commands, output payloads, and threshold semantics.
