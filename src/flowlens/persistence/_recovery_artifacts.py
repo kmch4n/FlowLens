@@ -2,11 +2,13 @@
 
 import os
 import stat
+import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO, TextIO, cast
 
 
 class RecoveryError(ValueError):
@@ -54,6 +56,130 @@ class OpenArtifact:
     inode: int
     mode: int
     link_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryAnchor:
+    """A verified directory kept open for a complete mutation transaction."""
+
+    identity: DirectoryIdentity
+    descriptor: int | None
+    windows_handle: int | None
+
+    def create_text_temp(self, target: Path) -> tuple[Path, TextIO]:
+        """Create a sibling text temporary through this anchor."""
+
+        self._require_child(target)
+        if self.descriptor is None:
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=self.identity.path,
+            )
+            return Path(name), os.fdopen(
+                descriptor,
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+            )
+        for attempt in range(256):
+            name = f".{target.name}.{os.getpid()}.{attempt}.tmp"
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=self.descriptor,
+                )
+            except FileExistsError:
+                continue
+            return self.identity.path / name, os.fdopen(
+                descriptor,
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+            )
+        raise FileExistsError(f"unable to allocate temporary file for {target}")
+
+    def create_binary_temp(self, target: Path) -> tuple[Path, BinaryIO]:
+        """Create a sibling binary temporary through this anchor."""
+
+        self._require_child(target)
+        if self.descriptor is None:
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                dir=self.identity.path,
+            )
+            return Path(name), os.fdopen(descriptor, mode="w+b")
+        for attempt in range(256):
+            name = f".{target.name}.{os.getpid()}.{attempt}.tmp"
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=self.descriptor,
+                )
+            except FileExistsError:
+                continue
+            return self.identity.path / name, os.fdopen(descriptor, mode="w+b")
+        raise FileExistsError(f"unable to allocate temporary file for {target}")
+
+    def replace(
+        self,
+        source: Path,
+        target: Path,
+        expected_target: ArtifactIdentity,
+    ) -> None:
+        """Atomically publish one sibling temporary relative to this anchor."""
+
+        self._require_child(source)
+        self._require_child(target)
+        if target != expected_target.path:
+            raise RecoveryError(
+                target,
+                f"atomic target identity is for {expected_target.path}",
+            )
+        opened = open_guarded_artifact(target)
+        primary_error: BaseException | None = None
+        try:
+            verify_artifact_identity(opened, expected_target)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                close_artifact(opened)
+            except BaseException as close_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    f"Atomic target verification cleanup failed for {target}: "
+                    f"{close_error}"
+                )
+        if self.descriptor is None:
+            os.replace(source, target)
+            return
+        os.replace(
+            source.name,
+            target.name,
+            src_dir_fd=self.descriptor,
+            dst_dir_fd=self.descriptor,
+        )
+
+    def remove(self, path: Path) -> None:
+        """Remove one sibling temporary relative to this anchor."""
+
+        self._require_child(path)
+        if self.descriptor is None:
+            path.unlink()
+            return
+        os.unlink(path.name, dir_fd=self.descriptor)
+
+    def _require_child(self, path: Path) -> None:
+        if Path(path).parent != self.identity.path:
+            raise RecoveryError(path, "path is outside the verified directory anchor")
 
 
 def require_safe_directory(path: Path) -> None:
@@ -222,6 +348,14 @@ def verify_artifact_identity(
         raise RecoveryError(opened.path, "artifact changed after inspection")
 
 
+def verify_opened_path_identity(opened: OpenArtifact) -> None:
+    """Require a mutated same-file handle to remain installed at its path."""
+
+    status = os.fstat(opened.descriptor)
+    require_opened_identity(opened, status)
+    _require_current_path_identity(opened)
+
+
 def with_verified_artifact[ResultT](
     identity: ArtifactIdentity,
     operation: Callable[[int], ResultT],
@@ -265,6 +399,92 @@ def capture_directory_identity(path: Path) -> DirectoryIdentity:
         raise RecoveryError(path, str(error)) from error
     require_safe_directory_status(path, status)
     return DirectoryIdentity(path, status.st_dev, status.st_ino, status.st_mode)
+
+
+def open_directory_anchor(identity: DirectoryIdentity) -> DirectoryAnchor:
+    """Open and verify a directory anchor without permitting path replacement."""
+
+    if sys.platform == "win32":
+        return _open_windows_directory_anchor(identity)
+    flags = os.O_RDONLY | cast(int, getattr(os, "O_DIRECTORY", 0))
+    flags |= cast(int, getattr(os, "O_NOFOLLOW", 0))
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(identity.path, flags)
+        status = os.fstat(descriptor)
+        require_safe_directory_status(identity.path, status)
+        if (
+            status.st_dev != identity.device
+            or status.st_ino != identity.inode
+            or status.st_mode != identity.mode
+        ):
+            raise RecoveryError(identity.path, "directory changed after inspection")
+        verify_directory_identity(identity)
+        return DirectoryAnchor(identity, descriptor, None)
+    except BaseException as primary_error:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as close_error:
+                primary_error.add_note(
+                    f"Directory anchor cleanup failed for {identity.path}: "
+                    f"{close_error}"
+                )
+        raise
+
+
+def close_directory_anchor(anchor: DirectoryAnchor) -> None:
+    """Close one directory anchor."""
+
+    if anchor.descriptor is not None:
+        os.close(anchor.descriptor)
+        return
+    if anchor.windows_handle is None:
+        return
+    import ctypes
+
+    if not ctypes.windll.kernel32.CloseHandle(anchor.windows_handle):
+        raise ctypes.WinError()
+
+
+def _open_windows_directory_anchor(identity: DirectoryIdentity) -> DirectoryAnchor:
+    """Hold a Windows directory handle with FILE_SHARE_DELETE intentionally absent."""
+
+    import ctypes
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = create_file(
+        str(identity.path),
+        0,
+        0x00000001 | 0x00000002,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == invalid_handle:
+        raise RecoveryError(identity.path, str(ctypes.WinError()))
+    try:
+        verify_directory_identity(identity)
+        return DirectoryAnchor(identity, None, cast(int, handle))
+    except BaseException as primary_error:
+        if not ctypes.windll.kernel32.CloseHandle(handle):
+            primary_error.add_note(
+                f"Directory anchor cleanup failed for {identity.path}: "
+                f"{ctypes.WinError()}"
+            )
+        raise
 
 
 def verify_directory_identity(identity: DirectoryIdentity) -> None:

@@ -5,17 +5,27 @@ import os
 import struct
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
 from flowlens.domain.discussion import DiscussionState, StateHistoryRecord
-from flowlens.domain.enums import AudioSource, SessionStatus
-from flowlens.domain.messages import EventRecord, TranscriptRecord
-from flowlens.domain.session import SessionManifest
+from flowlens.domain.enums import (
+    AudioSource,
+    EventType,
+    ProcessSource,
+    SessionStatus,
+)
+from flowlens.domain.messages import EventRecord, JsonValue, TranscriptRecord
+from flowlens.domain.session import PauseInterval, SessionManifest
 from flowlens.persistence._recovery_artifacts import (
     ArtifactIdentity as _ArtifactIdentity,
+)
+from flowlens.persistence._recovery_artifacts import (
+    DirectoryAnchor as _DirectoryAnchor,
 )
 from flowlens.persistence._recovery_artifacts import (
     DirectoryIdentity as _DirectoryIdentity,
@@ -39,7 +49,13 @@ from flowlens.persistence._recovery_artifacts import (
     close_artifact as _close_artifact_impl,
 )
 from flowlens.persistence._recovery_artifacts import (
+    close_directory_anchor as _close_directory_anchor,
+)
+from flowlens.persistence._recovery_artifacts import (
     is_reparse_point as _is_reparse_point,
+)
+from flowlens.persistence._recovery_artifacts import (
+    open_directory_anchor as _open_directory_anchor,
 )
 from flowlens.persistence._recovery_artifacts import (
     open_guarded_artifact as _open_guarded_artifact,
@@ -60,10 +76,15 @@ from flowlens.persistence._recovery_artifacts import (
     verify_directory_identity as _verify_directory_identity,
 )
 from flowlens.persistence._recovery_artifacts import (
+    verify_opened_path_identity as _verify_opened_path_identity,
+)
+from flowlens.persistence._recovery_artifacts import (
     with_verified_artifact as _run_with_verified_artifact,
 )
 from flowlens.persistence.json_files import (
+    AtomicJsonFile,
     JsonlRepairPlan,
+    encode_jsonl_record,
 )
 from flowlens.persistence.json_files import (
     _inspect_jsonl_tail_bytes as _inspect_jsonl_tail_bytes_impl,
@@ -133,6 +154,7 @@ class _WavRepairPlan:
     identity: _ArtifactIdentity
     expected_size: int
     expected_sha256: str
+    pcm_sha256: str
     original_pcm_bytes: int
     valid_pcm_bytes: int
     header_changed: bool
@@ -168,6 +190,799 @@ def _with_verified_artifact[ResultT](
     """Run a future mutation on its revalidated, no-follow descriptor."""
 
     return _run_with_verified_artifact(identity, operation)
+
+
+def recover_incomplete_sessions(
+    sessions_root: Path,
+    recovered_at: datetime,
+) -> tuple[RecoveryReport, ...]:
+    """Recover every incomplete session in deterministic filename order."""
+
+    _require_aware_recovery_time(recovered_at)
+    return tuple(
+        recover_incomplete_session(session_dir, recovered_at)
+        for session_dir in find_incomplete_sessions(sessions_root)
+    )
+
+
+def recover_incomplete_session(
+    session_dir: Path,
+    recovered_at: datetime,
+) -> RecoveryReport:
+    """Repair and durably finalize one inspected incomplete session."""
+
+    _require_aware_recovery_time(recovered_at)
+    inspection = inspect_incomplete_session(session_dir)
+    if recovered_at < inspection.manifest.started_at:
+        raise ValueError("recovered_at must not precede the session start")
+    return _run_recovery_transaction(inspection, recovered_at)
+
+
+def _require_aware_recovery_time(recovered_at: datetime) -> None:
+    if not isinstance(recovered_at, datetime):
+        raise TypeError("recovered_at must be a datetime")
+    try:
+        offset = recovered_at.utcoffset()
+    except (OverflowError, ValueError) as error:
+        raise ValueError("recovered_at timezone is invalid") from error
+    if recovered_at.tzinfo is None or offset is None:
+        raise ValueError("recovered_at must include a timezone")
+
+
+def _run_recovery_transaction(
+    inspection: _RecoveryInspection,
+    recovered_at: datetime,
+) -> RecoveryReport:
+    session_anchor: _DirectoryAnchor | None = None
+    parent_anchor: _DirectoryAnchor | None = None
+    opened: dict[str, _OpenArtifact] = {}
+    primary_error: BaseException | None = None
+    result: RecoveryReport | None = None
+    try:
+        parent_anchor = _open_directory_anchor(inspection.parent_directory_identity)
+        session_anchor = _open_directory_anchor(inspection.session_directory_identity)
+        opened = _open_transaction_artifacts(inspection)
+        result = _apply_recovery_transaction(
+            inspection,
+            recovered_at,
+            session_anchor,
+            opened,
+        )
+    except BaseException as error:
+        primary_error = error
+    finally:
+        primary_error = _run_transaction_post_validation(
+            inspection,
+            session_anchor,
+            parent_anchor,
+            primary_error,
+        )
+        primary_error = _cleanup_recovery_transaction(
+            tuple(opened.values()),
+            session_anchor,
+            parent_anchor,
+            primary_error,
+        )
+    if primary_error is not None:
+        raise primary_error
+    if result is None:
+        raise RuntimeError("recovery transaction produced no result")
+    return result
+
+
+def _open_transaction_artifacts(
+    inspection: _RecoveryInspection,
+) -> dict[str, _OpenArtifact]:
+    opened: dict[str, _OpenArtifact] = {}
+    try:
+        for identity in inspection.artifact_identities:
+            artifact = _open_guarded_artifact(identity.path, writable=True)
+            opened[identity.path.name] = artifact
+            _verify_artifact_identity(artifact, identity)
+    except BaseException as error:
+        _close_open_artifacts(tuple(opened.values()), error)
+        raise
+    return opened
+
+
+def _apply_recovery_transaction(
+    inspection: _RecoveryInspection,
+    recovered_at: datetime,
+    session_anchor: _DirectoryAnchor,
+    opened: dict[str, _OpenArtifact],
+) -> RecoveryReport:
+    existing_recovery = _existing_durable_recovery_event(inspection)
+    base_events = tuple(
+        event
+        for event in inspection.event_records
+        if event.event_type is not EventType.SESSION_RECOVERED
+    )
+    pause_intervals, pause_notes = _reconstruct_pause_intervals(
+        base_events,
+        inspection.active_duration_ms,
+        inspection.manifest_plan.identity.path,
+    )
+    if existing_recovery is None:
+        last_event_time = base_events[-1].session_time_ms if base_events else 0
+        recovery_event = EventRecord(
+            schema_version=1,
+            session_id=inspection.manifest.session_id,
+            sequence=len(base_events) + 1,
+            event_type=EventType.SESSION_RECOVERED,
+            source=ProcessSource.GUI,
+            session_time_ms=max(inspection.active_duration_ms, last_event_time),
+            created_at=recovered_at,
+            details=_recovery_event_details(inspection.report),
+        )
+        event_time = recovered_at
+        report = inspection.report
+    else:
+        recovery_event = existing_recovery
+        event_time = recovery_event.created_at
+        report = _report_from_recovery_event(inspection, recovery_event)
+        _validate_recovery_intent(inspection, report)
+
+    notes = _build_recovery_notes(inspection, report, pause_notes)
+    recovered_manifest = replace(
+        inspection.manifest,
+        status=SessionStatus.RECOVERED,
+        ended_at=event_time,
+        active_duration_ms=inspection.active_duration_ms,
+        pause_intervals=pause_intervals,
+        transcript_entry_count=inspection.transcript_entry_count,
+        final_discussion_state_revision=(inspection.final_discussion_state_revision),
+        recovery_notes=inspection.manifest.recovery_notes + notes,
+    )
+
+    if existing_recovery is None:
+        events_plan = next(
+            plan
+            for plan in inspection.jsonl_repair_plans
+            if plan.path.name == "events.jsonl"
+        )
+        _publish_repaired_event_intent(
+            session_anchor,
+            opened,
+            events_plan,
+            recovery_event,
+        )
+    for plan in inspection.jsonl_repair_plans:
+        if existing_recovery is None and plan.path.name == "events.jsonl":
+            continue
+        _apply_jsonl_plan_same_handle(opened[plan.path.name], plan)
+        _verify_opened_path_identity(opened[plan.path.name])
+    for wav_plan in inspection.wav_repair_plans:
+        _apply_wav_plan_same_handle(opened[wav_plan.path.name], wav_plan)
+        _verify_opened_path_identity(opened[wav_plan.path.name])
+    if inspection.snapshot_replacement is not None:
+        _release_atomic_target(opened, "discussion-state.json")
+        _replace_json_anchored(
+            session_anchor,
+            inspection.snapshot_plan.identity.path,
+            inspection.snapshot_replacement.to_dict(),
+            inspection.snapshot_plan.identity,
+        )
+    transcripts, state_history, events = _reparse_repaired_records(
+        inspection,
+        opened,
+    )
+    if (
+        len(transcripts) != inspection.transcript_entry_count
+        or (
+            state_history[-1].state.revision
+            if state_history
+            else inspection.snapshot_plan.value.revision
+        )
+        != inspection.final_discussion_state_revision
+        or not events
+        or events[-1] != recovery_event
+    ):
+        raise RecoveryError(
+            inspection.manifest_plan.identity.path,
+            "retained records changed after repair",
+        )
+    _post_validate_repaired_content(
+        inspection,
+        recovered_manifest,
+        recovery_event,
+    )
+    _release_atomic_target(opened, "session.json")
+    _replace_json_anchored(
+        session_anchor,
+        inspection.manifest_plan.identity.path,
+        recovered_manifest.to_dict(),
+        inspection.manifest_plan.identity,
+    )
+    _post_validate_recovered_manifest(inspection, recovered_manifest)
+    return replace(
+        report,
+        transcript_entry_count=inspection.transcript_entry_count,
+        final_discussion_state_revision=(inspection.final_discussion_state_revision),
+        active_duration_ms=inspection.active_duration_ms,
+    )
+
+
+def _post_validate_repaired_content(
+    inspection: _RecoveryInspection,
+    recovered_manifest: SessionManifest,
+    recovery_event: EventRecord,
+) -> None:
+    opened = _open_exact_artifacts(inspection.report.session_dir)
+    primary_error: BaseException | None = None
+    try:
+        manifest_bytes = _read_open_artifact(opened["session.json"])
+        if _load_manifest(opened["session.json"].path, manifest_bytes) != (
+            inspection.manifest
+        ):
+            raise RecoveryError(
+                opened["session.json"].path,
+                "incomplete manifest changed before final replacement",
+            )
+        snapshot_bytes = _read_open_artifact(opened["discussion-state.json"])
+        snapshot = _load_discussion_state(
+            opened["discussion-state.json"].path,
+            snapshot_bytes,
+        )
+        expected_snapshot = (
+            inspection.snapshot_replacement or inspection.snapshot_plan.value
+        )
+        if snapshot != expected_snapshot:
+            raise RecoveryError(
+                opened["discussion-state.json"].path,
+                "recovered discussion snapshot differs from retained history",
+            )
+
+        parsed: dict[str, tuple[object, ...]] = {}
+        parsers: tuple[tuple[str, Callable[[object], object]], ...] = (
+            ("transcript.jsonl", TranscriptRecord.from_dict),
+            ("state-history.jsonl", StateHistoryRecord.from_dict),
+            ("events.jsonl", EventRecord.from_dict),
+        )
+        for name, parser in parsers:
+            encoded = _read_open_artifact(opened[name])
+            plan = _inspect_jsonl_tail_bytes_impl(opened[name].path, encoded)
+            if plan.discarded_tail_bytes or plan.append_final_lf:
+                raise RecoveryError(
+                    opened[name].path, "recovered JSONL tail is invalid"
+                )
+            parsed[name] = _parse_jsonl_records(plan, encoded, parser)
+        if len(parsed["transcript.jsonl"]) != recovered_manifest.transcript_entry_count:
+            raise RecoveryError(
+                opened["transcript.jsonl"].path,
+                "recovered transcript count differs from the manifest",
+            )
+        events = cast(tuple[EventRecord, ...], parsed["events.jsonl"])
+        if not events or events[-1] != recovery_event:
+            raise RecoveryError(
+                opened["events.jsonl"].path,
+                "recovery intent is not the final durable event",
+            )
+        wav_samples: dict[str, int] = {}
+        for expected_wav in inspection.wav_repair_plans:
+            current_wav = _inspect_open_wav(opened[expected_wav.path.name])
+            if (
+                current_wav.header_changed
+                or current_wav.valid_pcm_bytes != expected_wav.valid_pcm_bytes
+                or current_wav.pcm_sha256 != expected_wav.pcm_sha256
+            ):
+                raise RecoveryError(
+                    current_wav.path,
+                    "recovered WAV content differs from the inspected PCM payload",
+                )
+            wav_samples[current_wav.path.name] = (
+                current_wav.valid_pcm_bytes // _WAV_SAMPLE_WIDTH
+            )
+        artifacts = {name: artifact.path for name, artifact in opened.items()}
+        transcripts = cast(tuple[TranscriptRecord, ...], parsed["transcript.jsonl"])
+        state_history = cast(
+            tuple[StateHistoryRecord, ...], parsed["state-history.jsonl"]
+        )
+        base_events = tuple(
+            event
+            for event in events
+            if event.event_type is not EventType.SESSION_RECOVERED
+        )
+        expected_base_events = tuple(
+            event
+            for event in inspection.event_records
+            if event.event_type is not EventType.SESSION_RECOVERED
+        )
+        if transcripts != inspection.transcript_records:
+            raise RecoveryError(
+                opened["transcript.jsonl"].path,
+                "retained transcript records changed after inspection",
+            )
+        if state_history != inspection.state_history_records:
+            raise RecoveryError(
+                opened["state-history.jsonl"].path,
+                "retained state history changed after inspection",
+            )
+        if base_events != expected_base_events:
+            raise RecoveryError(
+                opened["events.jsonl"].path,
+                "retained base events changed after inspection",
+            )
+        _validate_transcripts(transcripts, wav_samples, artifacts)
+        _validate_state_history(state_history, recovered_manifest, artifacts)
+        _validate_events(events, recovered_manifest, artifacts)
+        final_revision = (
+            state_history[-1].state.revision if state_history else snapshot.revision
+        )
+        if final_revision != recovered_manifest.final_discussion_state_revision:
+            raise RecoveryError(
+                opened["state-history.jsonl"].path,
+                "recovered final revision differs from the manifest",
+            )
+        pauses, _notes = _reconstruct_pause_intervals(
+            base_events,
+            recovered_manifest.active_duration_ms,
+            opened["events.jsonl"].path,
+        )
+        if pauses != recovered_manifest.pause_intervals:
+            raise RecoveryError(
+                opened["events.jsonl"].path,
+                "reconstructed pauses differ from the recovered manifest",
+            )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        close_error = _close_open_artifacts(tuple(opened.values()), primary_error)
+        if primary_error is None and close_error is not None:
+            raise close_error
+
+
+def _post_validate_recovered_manifest(
+    inspection: _RecoveryInspection,
+    recovered_manifest: SessionManifest,
+) -> None:
+    path = inspection.manifest_plan.identity.path
+    opened = _open_guarded_artifact(path)
+    primary_error: BaseException | None = None
+    try:
+        if _load_manifest(path, _read_open_artifact(opened)) != recovered_manifest:
+            raise RecoveryError(
+                path,
+                "recovered manifest content differs from the preflight document",
+            )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            _close_artifact(opened)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                f"Recovered manifest validation cleanup failed for {path}: "
+                f"{close_error}"
+            )
+
+
+def _validate_recovery_intent(
+    inspection: _RecoveryInspection,
+    intent_report: RecoveryReport,
+) -> None:
+    current_tails = {
+        plan.path.name: plan.discarded_tail_bytes
+        for plan in inspection.jsonl_repair_plans
+        if plan.discarded_tail_bytes
+    }
+    for name, count in current_tails.items():
+        if intent_report.discarded_jsonl_tail_bytes.get(name) != count:
+            raise RecoveryError(
+                inspection.manifest_plan.identity.path,
+                "durable recovery intent does not match pending JSONL repair",
+            )
+    pending_wavs = {
+        plan.path.name for plan in inspection.wav_repair_plans if plan.header_changed
+    }
+    if not pending_wavs.issubset(set(intent_report.repaired_wav_headers)):
+        raise RecoveryError(
+            inspection.manifest_plan.identity.path,
+            "durable recovery intent does not match pending WAV repair",
+        )
+
+
+def _release_atomic_target(
+    opened: dict[str, _OpenArtifact],
+    name: str,
+) -> None:
+    """Release a verified Windows replacement target before atomic publication."""
+
+    artifact = opened[name]
+    _close_artifact(artifact)
+    del opened[name]
+
+
+def _publish_repaired_event_intent(
+    anchor: _DirectoryAnchor,
+    opened: dict[str, _OpenArtifact],
+    plan: JsonlRepairPlan,
+    event: EventRecord,
+) -> None:
+    event_bytes = encode_jsonl_record(event.to_dict())
+    original = _read_open_artifact(opened["events.jsonl"])
+    retained = original[: plan.expected_size - plan.discarded_tail_bytes]
+    if plan.append_final_lf:
+        retained += b"\n"
+    encoded = retained + event_bytes
+    identity = _build_artifact_identity(opened["events.jsonl"], original)
+    _release_atomic_target(opened, "events.jsonl")
+    _replace_bytes_anchored(anchor, plan.path, encoded, identity)
+    opened["events.jsonl"] = _open_guarded_artifact(plan.path, writable=True)
+
+
+def _replace_bytes_anchored(
+    anchor: _DirectoryAnchor,
+    path: Path,
+    encoded: bytes,
+    expected_identity: _ArtifactIdentity,
+) -> None:
+    _verify_directory_identity(anchor.identity)
+    temp_path: Path | None = None
+    primary_error: BaseException | None = None
+    try:
+        temp_path, file = anchor.create_binary_temp(path)
+        file_error: BaseException | None = None
+        try:
+            remaining = memoryview(encoded)
+            while remaining:
+                written = file.write(remaining)
+                if written is None or written <= 0:
+                    raise OSError("binary temporary write made no progress")
+                remaining = remaining[written:]
+            file.flush()
+            os.fsync(file.fileno())
+        except BaseException as error:
+            file_error = error
+            raise
+        finally:
+            try:
+                file.close()
+            except BaseException as close_error:
+                if file_error is None:
+                    raise
+                file_error.add_note(
+                    f"Binary temporary cleanup failed for {temp_path}: {close_error}"
+                )
+        anchor.replace(temp_path, path, expected_identity)
+        temp_path = None
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if temp_path is not None:
+            try:
+                anchor.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    f"Binary temporary cleanup failed for {temp_path}: "
+                    f"{cleanup_error}"
+                )
+
+
+def _apply_jsonl_plan_same_handle(
+    opened: _OpenArtifact,
+    plan: JsonlRepairPlan,
+) -> None:
+    if not plan.discarded_tail_bytes and not plan.append_final_lf:
+        return
+    if plan.discarded_tail_bytes:
+        os.ftruncate(opened.descriptor, plan.expected_size - plan.discarded_tail_bytes)
+    else:
+        os.lseek(opened.descriptor, 0, os.SEEK_END)
+        _write_descriptor_all(opened.descriptor, b"\n")
+    os.fsync(opened.descriptor)
+
+
+def _apply_wav_plan_same_handle(
+    opened: _OpenArtifact,
+    plan: _WavRepairPlan,
+) -> None:
+    if not plan.header_changed:
+        return
+    os.lseek(opened.descriptor, 4, os.SEEK_SET)
+    _write_descriptor_all(
+        opened.descriptor, struct.pack("<I", 36 + plan.valid_pcm_bytes)
+    )
+    os.lseek(opened.descriptor, 40, os.SEEK_SET)
+    _write_descriptor_all(opened.descriptor, struct.pack("<I", plan.valid_pcm_bytes))
+    os.fsync(opened.descriptor)
+
+
+def _write_descriptor_all(descriptor: int, encoded: bytes) -> None:
+    remaining = memoryview(encoded)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("file write made no progress")
+        remaining = remaining[written:]
+
+
+def _replace_json_anchored(
+    anchor: _DirectoryAnchor,
+    path: Path,
+    value: object,
+    expected_identity: _ArtifactIdentity,
+) -> None:
+    _verify_directory_identity(anchor.identity)
+
+    def replace_if_unchanged(source: Path, target: Path) -> None:
+        anchor.replace(source, target, expected_identity)
+
+    atomic = AtomicJsonFile(
+        path,
+        _create_temp=anchor.create_text_temp,
+        _replace=replace_if_unchanged,
+        _remove_temp=anchor.remove,
+    )
+    atomic.replace(value)
+
+
+def _reparse_repaired_records(
+    inspection: _RecoveryInspection,
+    opened: dict[str, _OpenArtifact],
+) -> tuple[
+    tuple[TranscriptRecord, ...],
+    tuple[StateHistoryRecord, ...],
+    tuple[EventRecord, ...],
+]:
+    parsers: tuple[tuple[str, Callable[[object], object]], ...] = (
+        ("transcript.jsonl", TranscriptRecord.from_dict),
+        ("state-history.jsonl", StateHistoryRecord.from_dict),
+        ("events.jsonl", EventRecord.from_dict),
+    )
+    parsed: dict[str, tuple[object, ...]] = {}
+    for name, parser in parsers:
+        encoded = _read_open_artifact(opened[name])
+        plan = _inspect_jsonl_tail_bytes_impl(opened[name].path, encoded)
+        if plan.discarded_tail_bytes or plan.append_final_lf:
+            raise RecoveryError(
+                opened[name].path, "JSONL repair did not produce a durable tail"
+            )
+        parsed[name] = _parse_jsonl_records(plan, encoded, parser)
+    transcripts = cast(tuple[TranscriptRecord, ...], parsed["transcript.jsonl"])
+    state_history = cast(tuple[StateHistoryRecord, ...], parsed["state-history.jsonl"])
+    events = cast(tuple[EventRecord, ...], parsed["events.jsonl"])
+    artifacts = {
+        name: identity.path
+        for name, identity in (
+            (identity.path.name, identity)
+            for identity in inspection.artifact_identities
+        )
+    }
+    wav_samples = {
+        plan.path.name: plan.valid_pcm_bytes // _WAV_SAMPLE_WIDTH
+        for plan in inspection.wav_repair_plans
+    }
+    _validate_transcripts(transcripts, wav_samples, artifacts)
+    _validate_state_history(state_history, inspection.manifest, artifacts)
+    _validate_events(events, inspection.manifest, artifacts)
+    return transcripts, state_history, events
+
+
+def _recovery_event_details(report: RecoveryReport) -> dict[str, JsonValue]:
+    return {
+        "discarded_jsonl_tail_bytes": dict(report.discarded_jsonl_tail_bytes),
+        "repaired_wav_headers": list(report.repaired_wav_headers),
+    }
+
+
+def _existing_durable_recovery_event(
+    inspection: _RecoveryInspection,
+) -> EventRecord | None:
+    recovered = [
+        (index, event)
+        for index, event in enumerate(inspection.event_records)
+        if event.event_type is EventType.SESSION_RECOVERED
+    ]
+    if not recovered:
+        return None
+    index, event = recovered[-1]
+    if len(recovered) != 1 or index != len(inspection.event_records) - 1:
+        raise RecoveryError(
+            inspection.manifest_plan.identity.path,
+            "SESSION_RECOVERED must be the unique final event",
+        )
+    if event.source is not ProcessSource.GUI:
+        raise RecoveryError(
+            inspection.manifest_plan.identity.path,
+            "SESSION_RECOVERED source must be GUI",
+        )
+    _recovery_details_values(event, inspection.manifest_plan.identity.path)
+    return event
+
+
+def _recovery_details_values(
+    event: EventRecord,
+    path: Path,
+) -> tuple[dict[str, int], tuple[str, ...]]:
+    if set(event.details) != {
+        "discarded_jsonl_tail_bytes",
+        "repaired_wav_headers",
+    }:
+        raise RecoveryError(path, "SESSION_RECOVERED details have an invalid shape")
+    discarded_value = event.details["discarded_jsonl_tail_bytes"]
+    repaired_value = event.details["repaired_wav_headers"]
+    if not isinstance(discarded_value, dict) or not all(
+        isinstance(name, str)
+        and name in _JSONL_ARTIFACT_NAMES
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count > 0
+        for name, count in discarded_value.items()
+    ):
+        raise RecoveryError(
+            path, "SESSION_RECOVERED discarded-tail details are invalid"
+        )
+    if not isinstance(repaired_value, list) or not all(
+        isinstance(name, str) and name in _WAV_ARTIFACT_NAMES for name in repaired_value
+    ):
+        raise RecoveryError(path, "SESSION_RECOVERED WAV details are invalid")
+    repaired = tuple(cast(list[str], repaired_value))
+    if repaired != tuple(sorted(set(repaired))):
+        raise RecoveryError(
+            path, "SESSION_RECOVERED WAV details must be unique and sorted"
+        )
+    return cast(dict[str, int], discarded_value), repaired
+
+
+def _report_from_recovery_event(
+    inspection: _RecoveryInspection,
+    event: EventRecord,
+) -> RecoveryReport:
+    discarded, repaired = _recovery_details_values(
+        event, inspection.manifest_plan.identity.path
+    )
+    return replace(
+        inspection.report,
+        discarded_jsonl_tail_bytes=dict(discarded),
+        repaired_wav_headers=repaired,
+    )
+
+
+def _reconstruct_pause_intervals(
+    events: tuple[EventRecord, ...],
+    active_duration_ms: int,
+    path: Path,
+) -> tuple[tuple[PauseInterval, ...], tuple[str, ...]]:
+    intervals: list[PauseInterval] = []
+    open_pause: int | None = None
+    for event in events:
+        if event.event_type is EventType.PAUSE_START:
+            if open_pause is not None:
+                raise RecoveryError(path, "PAUSE_START occurred while already paused")
+            if event.session_time_ms > active_duration_ms:
+                raise RecoveryError(path, "PAUSE_START exceeds recovered duration")
+            open_pause = event.session_time_ms
+        elif event.event_type is EventType.PAUSE_END:
+            if open_pause is None:
+                raise RecoveryError(path, "PAUSE_END occurred without PAUSE_START")
+            if event.session_time_ms > active_duration_ms:
+                raise RecoveryError(path, "PAUSE_END exceeds recovered duration")
+            intervals.append(PauseInterval(open_pause, event.session_time_ms))
+            open_pause = None
+    notes: tuple[str, ...] = ()
+    if open_pause is not None:
+        intervals.append(PauseInterval(open_pause, active_duration_ms))
+        notes = (
+            f"Closed unmatched PAUSE_START at {open_pause} ms at recovery boundary "
+            f"{active_duration_ms} ms.",
+        )
+    return tuple(intervals), notes
+
+
+def _build_recovery_notes(
+    inspection: _RecoveryInspection,
+    report: RecoveryReport,
+    pause_notes: tuple[str, ...],
+) -> tuple[str, ...]:
+    notes = [
+        f"Discarded {count} torn JSONL tail bytes from {name}."
+        for name, count in sorted(report.discarded_jsonl_tail_bytes.items())
+    ]
+    wav_plans = {plan.path.name: plan for plan in inspection.wav_repair_plans}
+    notes.extend(
+        f"Repaired {name} WAV header for {wav_plans[name].valid_pcm_bytes} PCM bytes."
+        for name in report.repaired_wav_headers
+    )
+    notes.extend(pause_notes)
+    return tuple(notes)
+
+
+def _run_transaction_post_validation(
+    inspection: _RecoveryInspection,
+    session_anchor: _DirectoryAnchor | None,
+    parent_anchor: _DirectoryAnchor | None,
+    primary_error: BaseException | None,
+) -> BaseException | None:
+    operations: list[tuple[str, Callable[[], None]]] = []
+    if session_anchor is not None:
+        operations.append(
+            (
+                "session directory",
+                lambda: _verify_directory_identity(
+                    inspection.session_directory_identity
+                ),
+            )
+        )
+    if parent_anchor is not None:
+        operations.append(
+            (
+                "parent directory",
+                lambda: _verify_directory_identity(
+                    inspection.parent_directory_identity
+                ),
+            )
+        )
+    if session_anchor is not None:
+        operations.extend(
+            (
+                f"artifact {identity.path.name}",
+                partial(_validate_current_artifact_path, identity.path),
+            )
+            for identity in inspection.artifact_identities
+        )
+    surfaced = primary_error
+    for label, operation in operations:
+        try:
+            operation()
+        except BaseException as validation_error:
+            if surfaced is None:
+                surfaced = validation_error
+            else:
+                surfaced.add_note(
+                    f"Recovery post-validation failed for {label}: {validation_error}"
+                )
+    return surfaced
+
+
+def _validate_current_artifact_path(path: Path) -> None:
+    opened = _open_guarded_artifact(path)
+    primary_error: BaseException | None = None
+    try:
+        _verify_opened_path_identity(opened)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            _close_artifact(opened)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                f"Post-validation artifact cleanup failed for {path}: {close_error}"
+            )
+
+
+def _cleanup_recovery_transaction(
+    opened: tuple[_OpenArtifact, ...],
+    session_anchor: _DirectoryAnchor | None,
+    parent_anchor: _DirectoryAnchor | None,
+    primary_error: BaseException | None,
+) -> BaseException | None:
+    surfaced = _close_open_artifacts(opened, primary_error)
+    for anchor in (session_anchor, parent_anchor):
+        if anchor is None:
+            continue
+        try:
+            _close_directory_anchor(anchor)
+        except BaseException as close_error:
+            if surfaced is None:
+                surfaced = close_error
+            else:
+                surfaced.add_note(
+                    f"Directory anchor cleanup failed for {anchor.identity.path}: "
+                    f"{close_error}"
+                )
+    return surfaced
 
 
 def find_incomplete_sessions(sessions_root: Path) -> tuple[Path, ...]:
@@ -505,9 +1320,11 @@ def _inspect_open_wav(opened: _OpenArtifact) -> _WavRepairPlan:
             remaining_header -= len(chunk)
         header = b"".join(header_parts)
         digest = sha256(header)
+        pcm_digest = sha256()
         total_size = len(header)
         while chunk := os.read(opened.descriptor, 1024 * 1024):
             digest.update(chunk)
+            pcm_digest.update(chunk)
             total_size += len(chunk)
     except OSError as error:
         raise RecoveryError(path, str(error)) from error
@@ -530,6 +1347,7 @@ def _inspect_open_wav(opened: _OpenArtifact) -> _WavRepairPlan:
         identity=identity,
         expected_size=expected_size,
         expected_sha256=digest.hexdigest(),
+        pcm_sha256=pcm_digest.hexdigest(),
         original_pcm_bytes=original_pcm_bytes,
         valid_pcm_bytes=valid_pcm_bytes,
         header_changed=(
