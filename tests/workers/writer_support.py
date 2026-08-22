@@ -1,5 +1,6 @@
 """Shared helpers for Writer Worker process and in-process tests."""
 
+from collections import deque
 from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from pathlib import Path
@@ -131,6 +132,26 @@ class _DelayedFenceQueue:
         return AudioDrainFence()
 
 
+class _CrossQueueLagAudioQueue:
+    """Hide queued audio until the Writer performs one bounded wait."""
+
+    def __init__(self, *items: object) -> None:
+        self._items = deque(items)
+        self._released = False
+
+    def get_nowait(self) -> object:
+        if not self._released or not self._items:
+            raise Empty
+        return self._items.popleft()
+
+    def get(self, timeout: float | None = None) -> object:
+        del timeout
+        self._released = True
+        if not self._items:
+            raise Empty
+        return self._items.popleft()
+
+
 class _StopDuringFenceWaitQueue:
     """Audio queue that requests lifecycle stop while a fence is missing."""
 
@@ -211,11 +232,15 @@ def make_open_envelope(
     )
 
 
-def make_audio_command(source_start_sample: int) -> AudioWriteCommand:
+def make_audio_command(
+    source_start_sample: int,
+    *,
+    source: AudioSource = AudioSource.ME,
+) -> AudioWriteCommand:
     """Build one 800 ms microphone-audio write."""
 
     return AudioWriteCommand(
-        AudioSource.ME,
+        source,
         b"\x00\x00" * 12_800,
         source_start_sample,
         source_start_sample + 12_800,

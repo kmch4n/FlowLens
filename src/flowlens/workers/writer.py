@@ -8,7 +8,7 @@ from multiprocessing.queues import Queue
 from multiprocessing.synchronize import Event
 from queue import Empty
 
-from flowlens.domain.enums import MessageType, ProcessSource
+from flowlens.domain.enums import AudioSource, MessageType, ProcessSource
 from flowlens.domain.messages import (
     AudioDrainFence,
     AudioWriteCommand,
@@ -28,6 +28,7 @@ from flowlens.persistence.session_writer import SessionWriter
 
 _AUDIO_BATCH_LIMIT = 64
 _QUEUE_TIMEOUT_SECONDS = 0.1
+_TRANSCRIPT_AUDIO_TIMEOUT_SECONDS = 5.0
 _UNKNOWN_SESSION_ID = "00000000000000000000000000"
 _CONTROL_PAYLOAD_TYPES: dict[MessageType, type[object]] = {
     MessageType.WRITER_OPEN_SESSION: WriterOpenSession,
@@ -104,6 +105,11 @@ class _WriterWorker:
         self._failed_sequence = 0
         self._latest_successful_save_at: datetime | None = None
         self._pending_control: object | None = None
+        self._pending_transcript_deadline: float | None = None
+        self._persisted_audio_cursors = {
+            AudioSource.ME: 0,
+            AudioSource.OTHERS: 0,
+        }
         self._audio_drain_fence_seen = False
         self._cleanup_attempted = False
         self._finalized = False
@@ -139,20 +145,21 @@ class _WriterWorker:
                 self._close_incomplete_once()
                 return
 
-            wait_for_audio = (
-                self._pending_control is not None
-                and self._is_terminal_control(self._pending_control)
-                and not self._audio_drain_fence_seen
-            )
+            self._raise_if_pending_transcript_timed_out()
+            wait_for_audio = self._should_wait_for_audio()
             audio_processed = self._drain_audio_batch(wait_for_first=wait_for_audio)
             if self._lifecycle_exit_requested():
                 self._close_incomplete_once()
                 return
 
             if self._pending_control is not None:
-                item = self._pending_control
-                self._pending_control = None
-                self._process_or_defer_control(item)
+                if self._pending_transcript_waits_for_audio():
+                    self._raise_if_pending_transcript_timed_out()
+                else:
+                    item = self._pending_control
+                    self._pending_control = None
+                    self._pending_transcript_deadline = None
+                    self._process_or_defer_control(item)
             else:
                 try:
                     item = self._control_queue.get_nowait()
@@ -187,6 +194,23 @@ class _WriterWorker:
                 self._raise_control_gap(envelope.sequence)
             self._pending_control = envelope
             return
+        if self._is_transcript_control(item):
+            envelope = self._validate_control_metadata(item, opening=False)
+            if envelope.sequence < self._expected_control_sequence:
+                self._emit_ack(envelope.sequence, mutation_succeeded=False)
+                self._failed_sequence = 0
+                return
+            if envelope.sequence > self._expected_control_sequence:
+                self._raise_control_gap(envelope.sequence)
+            if self._transcript_requires_audio(envelope):
+                if self._audio_drain_fence_seen:
+                    self._handle_control(envelope, opening=False)
+                    return
+                self._pending_control = envelope
+                self._pending_transcript_deadline = (
+                    _monotonic() + _TRANSCRIPT_AUDIO_TIMEOUT_SECONDS
+                )
+                return
         self._handle_control(item, opening=False)
 
     @staticmethod
@@ -195,6 +219,55 @@ class _WriterWorker:
             MessageType.WRITER_FINALIZE,
             MessageType.WRITER_SHUTDOWN,
         }
+
+    @staticmethod
+    def _is_transcript_control(item: object) -> bool:
+        return (
+            isinstance(item, MessageEnvelope)
+            and item.message_type is MessageType.TRANSCRIPT_COMMITTED
+        )
+
+    def _should_wait_for_audio(self) -> bool:
+        return self._pending_transcript_deadline is not None or (
+            self._pending_control is not None
+            and self._is_terminal_control(self._pending_control)
+            and not self._audio_drain_fence_seen
+        )
+
+    def _pending_transcript_waits_for_audio(self) -> bool:
+        if self._pending_transcript_deadline is None:
+            return False
+        envelope = self._pending_control
+        if not isinstance(envelope, MessageEnvelope):
+            raise WriterWorkerProtocolError(
+                "pending transcript control must be a MessageEnvelope"
+            )
+        return not self._audio_drain_fence_seen and self._transcript_requires_audio(
+            envelope
+        )
+
+    def _transcript_requires_audio(
+        self,
+        envelope: MessageEnvelope[object],
+    ) -> bool:
+        payload = envelope.payload
+        if not isinstance(payload, TranscriptCommitted):
+            raise WriterWorkerProtocolError(
+                "transcript control payload must be TranscriptCommitted"
+            )
+        record = payload.record
+        return record.source_end_sample > self._persisted_audio_cursors[record.source]
+
+    def _raise_if_pending_transcript_timed_out(self) -> None:
+        deadline = self._pending_transcript_deadline
+        if deadline is None or _monotonic() < deadline:
+            return
+        envelope = self._pending_control
+        if isinstance(envelope, MessageEnvelope):
+            self._failed_sequence = envelope.sequence
+        raise WriterWorkerProtocolError(
+            "timed out waiting for transcript audio persistence"
+        )
 
     def _drain_audio_batch(self, *, wait_for_first: bool = False) -> int:
         writer = self._require_open_writer()
@@ -220,7 +293,13 @@ class _WriterWorker:
                         "audio command received after audio drain fence"
                     )
                 writer.append_audio(item)
+                self._persisted_audio_cursors[item.source] = item.source_end_sample
                 processed += 1
+                if (
+                    self._pending_transcript_deadline is not None
+                    and not self._pending_transcript_waits_for_audio()
+                ):
+                    break
                 continue
             if self._audio_drain_fence_seen:
                 raise WriterWorkerProtocolError(

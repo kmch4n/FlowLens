@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-from flowlens.domain.enums import MessageType
+from flowlens.domain.enums import AudioSource, MessageType
 from flowlens.domain.messages import (
     AudioDrainFence,
     MessageEnvelope,
@@ -16,11 +16,13 @@ from flowlens.domain.messages import (
     WriterFatal,
     WriterFlush,
 )
+from flowlens.persistence.session_writer import PersistenceInvariantError
 from flowlens.workers import writer as writer_module
 from flowlens.workers.writer import run_writer_worker
 from tests.workers.writer_support import (
     _as_process_event,
     _as_process_queue,
+    _CrossQueueLagAudioQueue,
     _DelayedFenceQueue,
     _FakeSessionWriter,
     _install_fake_writer,
@@ -32,7 +34,210 @@ from tests.workers.writer_support import (
     make_finalize_envelope,
     make_open_envelope,
     make_shutdown_envelope,
+    make_transcript_envelope,
 )
+
+
+def test_transcript_waits_for_cross_queue_audio_visibility(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ready transcript must not overtake its earlier audio command."""
+
+    fake = _FakeSessionWriter()
+    _install_fake_writer(monkeypatch, fake)
+    monkeypatch.setattr(writer_module, "_monotonic", lambda: 10.0)
+    control: ThreadQueue[object] = ThreadQueue()
+    responses = _RecordingResponseQueue()
+    stop = ThreadEvent()
+    audio = _CrossQueueLagAudioQueue(
+        make_audio_command(source_start_sample=0),
+        AudioDrainFence(),
+    )
+    control.put(make_open_envelope(tmp_path / "session", sequence=1))
+    control.put(make_transcript_envelope(sequence=2))
+    control.put(make_shutdown_envelope(sequence=3))
+
+    run_writer_worker(
+        _as_process_queue(control),
+        _as_process_queue(audio),
+        _as_process_queue(responses),
+        _as_process_event(stop),
+    )
+
+    audio_index = fake.operations.index(("audio", 0))
+    transcript_index = fake.operations.index(("transcript", 1))
+    assert audio_index < transcript_index
+
+
+def test_pending_transcript_runs_when_its_exact_audio_cursor_is_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Later audio must not delay a transcript whose dependency is satisfied."""
+
+    fake = _FakeSessionWriter()
+    _install_fake_writer(monkeypatch, fake)
+    monkeypatch.setattr(writer_module, "_monotonic", lambda: 10.0)
+    control: ThreadQueue[object] = ThreadQueue()
+    responses = _RecordingResponseQueue()
+    stop = ThreadEvent()
+    audio = _CrossQueueLagAudioQueue(
+        make_audio_command(source_start_sample=0),
+        make_audio_command(source_start_sample=12_800),
+        AudioDrainFence(),
+    )
+    control.put(make_open_envelope(tmp_path / "session", sequence=1))
+    control.put(make_transcript_envelope(sequence=2))
+    control.put(make_shutdown_envelope(sequence=3))
+
+    run_writer_worker(
+        _as_process_queue(control),
+        _as_process_queue(audio),
+        _as_process_queue(responses),
+        _as_process_event(stop),
+    )
+
+    transcript_index = fake.operations.index(("transcript", 1))
+    later_audio_index = fake.operations.index(("audio", 12_800))
+    assert transcript_index < later_audio_index
+
+
+def test_other_source_audio_does_not_release_a_pending_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Each transcript dependency must use its own persisted source cursor."""
+
+    fake = _FakeSessionWriter()
+    _install_fake_writer(monkeypatch, fake)
+    monkeypatch.setattr(writer_module, "_monotonic", lambda: 10.0)
+    control: ThreadQueue[object] = ThreadQueue()
+    responses = _RecordingResponseQueue()
+    stop = ThreadEvent()
+    audio = _CrossQueueLagAudioQueue(
+        make_audio_command(source_start_sample=0, source=AudioSource.OTHERS),
+        make_audio_command(source_start_sample=0, source=AudioSource.ME),
+        AudioDrainFence(),
+    )
+    control.put(make_open_envelope(tmp_path / "session", sequence=1))
+    control.put(make_transcript_envelope(sequence=2))
+    control.put(make_shutdown_envelope(sequence=3))
+
+    run_writer_worker(
+        _as_process_queue(control),
+        _as_process_queue(audio),
+        _as_process_queue(responses),
+        _as_process_event(stop),
+    )
+
+    transcript_index = fake.operations.index(("transcript", 1))
+    audio_before_transcript = [
+        operation
+        for operation in fake.operations[:transcript_index]
+        if operation[0] == "audio"
+    ]
+    assert len(audio_before_transcript) == 2
+
+
+def test_pending_transcript_audio_deadline_is_fatal_and_fixed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A missing audio dependency must not wait forever or consume its fence."""
+
+    fake = _FakeSessionWriter()
+    _install_fake_writer(monkeypatch, fake)
+    monkeypatch.setattr(writer_module, "_monotonic", lambda: 10.0)
+    monkeypatch.setattr(writer_module, "_TRANSCRIPT_AUDIO_TIMEOUT_SECONDS", 0.0)
+    control: ThreadQueue[object] = ThreadQueue()
+    responses = _RecordingResponseQueue()
+    stop = ThreadEvent()
+    audio = _CrossQueueLagAudioQueue(AudioDrainFence())
+    control.put(make_open_envelope(tmp_path / "session", sequence=1))
+    control.put(make_transcript_envelope(sequence=2))
+    control.put(make_shutdown_envelope(sequence=3))
+
+    with pytest.raises(
+        writer_module.WriterWorkerProtocolError,
+        match="timed out waiting for transcript audio persistence",
+    ):
+        run_writer_worker(
+            _as_process_queue(control),
+            _as_process_queue(audio),
+            _as_process_queue(responses),
+            _as_process_event(stop),
+        )
+
+    fatal = cast(MessageEnvelope[object], responses.items[-1])
+    assert isinstance(fatal.payload, WriterFatal)
+    assert fatal.payload.failed_sequence == 2
+    assert audio.get() == AudioDrainFence()
+    assert ("transcript", 1) not in fake.operations
+    assert ("close", 1) in fake.operations
+
+
+def test_audio_fence_exposes_a_genuinely_missing_transcript_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A fence must preserve the persistence invariant for absent audio."""
+
+    monkeypatch.setattr(writer_module, "_monotonic", lambda: 10.0)
+    control: ThreadQueue[object] = ThreadQueue()
+    responses = _RecordingResponseQueue()
+    stop = ThreadEvent()
+    audio = _CrossQueueLagAudioQueue(AudioDrainFence())
+    session_dir = tmp_path / "session"
+    control.put(make_open_envelope(session_dir, sequence=1))
+    control.put(make_transcript_envelope(sequence=2))
+
+    with pytest.raises(
+        PersistenceInvariantError,
+        match="exceeds persisted audio cursor 0 for ME",
+    ):
+        run_writer_worker(
+            _as_process_queue(control),
+            _as_process_queue(audio),
+            _as_process_queue(responses),
+            _as_process_event(stop),
+        )
+
+    fatal = cast(MessageEnvelope[object], responses.items[-1])
+    assert isinstance(fatal.payload, WriterFatal)
+    assert fatal.payload.failed_sequence == 2
+    assert fatal.payload.error_type == "PersistenceInvariantError"
+    assert '"status": "incomplete"' in (session_dir / "session.json").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_pending_transcript_remains_responsive_to_lifecycle_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stop during the bounded audio wait must leave the session incomplete."""
+
+    fake = _FakeSessionWriter()
+    _install_fake_writer(monkeypatch, fake)
+    monkeypatch.setattr(writer_module, "_monotonic", lambda: 10.0)
+    control: ThreadQueue[object] = ThreadQueue()
+    responses = _RecordingResponseQueue()
+    stop = ThreadEvent()
+    audio = _StopDuringFenceWaitQueue(stop)
+    control.put(make_open_envelope(tmp_path / "session", sequence=1))
+    control.put(make_transcript_envelope(sequence=2))
+
+    run_writer_worker(
+        _as_process_queue(control),
+        _as_process_queue(audio),
+        _as_process_queue(responses),
+        _as_process_event(stop),
+    )
+
+    assert len(responses.items) == 1
+    assert ("transcript", 1) not in fake.operations
+    assert fake.close_calls == 1
 
 
 def test_duplicate_control_reuses_latest_successful_save_timestamp(
