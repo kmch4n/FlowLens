@@ -20,6 +20,15 @@ class AsrSpoolFull(RuntimeError):
     """Raised when the bounded in-process ASR spool is exhausted."""
 
 
+class AsrPumpFailed(RuntimeError):
+    """Raised when the ASR queue pump terminates before draining its spool."""
+
+    def __init__(self, failure: Exception) -> None:
+        self.failure = failure
+        detail = str(failure).strip() or type(failure).__name__
+        super().__init__(f"ASR pump failed: {detail}")
+
+
 class _WriterAudioOut(Protocol):
     def put_nowait(self, item: AudioWriteCommand | AudioDrainFence) -> None: ...
 
@@ -59,6 +68,9 @@ class AudioDispatcher:
         self._dispatch_lock = threading.Lock()
         self._condition = threading.Condition()
         self._last_submitted_frame: AudioFrame | None = None
+        self._aborted = False
+        self._pump_in_flight = False
+        self._pump_failure: Exception | None = None
 
     def dispatch(self, frame: AudioFrame) -> None:
         """Send one frame to Writer before accepting it into the ASR spool."""
@@ -90,21 +102,39 @@ class AudioDispatcher:
 
         while True:
             with self._condition:
+                if self._aborted:
+                    return
                 while not self._spool:
                     if stop_event.is_set():
                         return
                     self._condition.wait(timeout=0.1)
+                    if self._aborted:
+                        return
                 frame = self._spool[0]
+                self._pump_in_flight = True
             try:
                 self._asr_audio_out.put(frame, timeout=0.1)
             except queue.Full:
+                with self._condition:
+                    self._pump_in_flight = False
+                    self._condition.notify_all()
                 continue
+            except Exception as exc:
+                with self._condition:
+                    if self._pump_failure is None:
+                        self._pump_failure = exc
+                    self._pump_in_flight = False
+                    self._condition.notify_all()
+                return
             with self._condition:
-                if not self._spool or self._spool[0] is not frame:
-                    raise RuntimeError("ASR spool order changed while submitting")
-                self._spool.popleft()
-                self._last_submitted_frame = frame
-                self._condition.notify_all()
+                try:
+                    if not self._spool or self._spool[0] is not frame:
+                        raise RuntimeError("ASR spool order changed while submitting")
+                    self._spool.popleft()
+                    self._last_submitted_frame = frame
+                finally:
+                    self._pump_in_flight = False
+                    self._condition.notify_all()
 
     def asr_backlog_ms(self, now_monotonic_ms: int) -> int:
         """Estimate backlog age from the spool and last ASR submission."""
@@ -134,10 +164,26 @@ class AudioDispatcher:
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must be nonnegative")
         with self._condition:
-            return self._condition.wait_for(lambda: not self._spool, timeout=timeout)
+            completed = self._condition.wait_for(
+                lambda: not self._spool or self._pump_failure is not None,
+                timeout=timeout,
+            )
+            if self._pump_failure is not None:
+                raise AsrPumpFailed(self._pump_failure)
+            return completed and not self._spool
 
     def wake_asr_pump(self) -> None:
         """Wake a pump waiting on an empty spool after its stop event changes."""
 
         with self._condition:
+            self._condition.notify_all()
+
+    def abort_asr_pump(self) -> None:
+        """Discard pending ASR work only after a fatal worker shutdown."""
+
+        with self._condition:
+            self._aborted = True
+            self._condition.notify_all()
+            self._condition.wait_for(lambda: not self._pump_in_flight)
+            self._spool.clear()
             self._condition.notify_all()

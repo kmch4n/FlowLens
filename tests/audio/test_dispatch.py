@@ -7,6 +7,7 @@ import time
 import pytest
 
 from flowlens.audio.dispatch import (
+    AsrPumpFailed,
     AsrSpoolFull,
     AudioDispatcher,
     WriterQueueFull,
@@ -121,6 +122,101 @@ def test_pump_stop_waits_for_accepted_spool_instead_of_dropping() -> None:
     pump.join(timeout=1)
 
     assert not pump.is_alive()
+
+
+def test_abort_waits_for_in_flight_put_and_prevents_late_submission() -> None:
+    class InterleavingAsrOut:
+        def __init__(self) -> None:
+            self.put_entered = threading.Event()
+            self.release_put = threading.Event()
+            self.items: list[AudioFrame] = []
+
+        def put(
+            self,
+            item: AudioFrame,
+            block: bool = True,
+            timeout: float | None = None,
+        ) -> None:
+            del block, timeout
+            self.put_entered.set()
+            assert self.release_put.wait(timeout=2)
+            self.items.append(item)
+
+    writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=1)
+    asr = InterleavingAsrOut()
+    dispatcher = AudioDispatcher(
+        asr_audio_out=asr,
+        writer_audio_out=writer,
+        asr_spool_max_frames=1,
+    )
+    frame = _frame()
+    dispatcher.dispatch(frame)
+    stop = threading.Event()
+    pump_errors: list[BaseException] = []
+
+    def pump_target() -> None:
+        try:
+            dispatcher.run_asr_pump(stop)
+        except BaseException as exc:
+            pump_errors.append(exc)
+
+    pump = threading.Thread(target=pump_target)
+    pump.start()
+    assert asr.put_entered.wait(timeout=1)
+    abort_done = threading.Event()
+
+    def abort_target() -> None:
+        dispatcher.abort_asr_pump()
+        abort_done.set()
+
+    abort = threading.Thread(target=abort_target)
+    abort.start()
+    assert not abort_done.wait(timeout=0.05)
+    asr.release_put.set()
+    abort.join(timeout=1)
+    pump.join(timeout=1)
+
+    assert not abort.is_alive()
+    assert not pump.is_alive()
+    assert abort_done.is_set()
+    assert pump_errors == []
+    assert asr.items == [frame]
+    assert dispatcher.pending_asr_frames == 0
+
+
+def test_terminal_asr_put_failure_wakes_drain_waiter_with_typed_error() -> None:
+    class ClosedAsrOut:
+        def __init__(self) -> None:
+            self.put_called = threading.Event()
+
+        def put(
+            self,
+            item: AudioFrame,
+            block: bool = True,
+            timeout: float | None = None,
+        ) -> None:
+            del item, block, timeout
+            self.put_called.set()
+            raise EOFError("ASR queue is closed")
+
+    writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=1)
+    asr = ClosedAsrOut()
+    dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=1)
+    dispatcher.dispatch(_frame())
+    stop = threading.Event()
+    pump = threading.Thread(target=dispatcher.run_asr_pump, args=(stop,))
+    pump.start()
+    assert asr.put_called.wait(timeout=1)
+
+    with pytest.raises(AsrPumpFailed, match="ASR queue is closed") as failure:
+        dispatcher.wait_for_asr_spool_empty(timeout=1)
+
+    assert isinstance(failure.value.failure, EOFError)
+    pump.join(timeout=1)
+    assert not pump.is_alive()
+    assert dispatcher.pending_asr_frames == 1
+    dispatcher.abort_asr_pump()
+    assert dispatcher.pending_asr_frames == 0
 
 
 def test_concurrent_dispatch_preserves_same_writer_and_asr_order() -> None:
