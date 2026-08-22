@@ -205,6 +205,7 @@ class AsrWorkerHarness:
         assert ready_status.payload == {
             "state": "READY",
             "backlog_ms": 0,
+            "maximum_backlog_ms": 0,
             "analysis_paused": False,
         }
 
@@ -295,6 +296,7 @@ def test_stop_drains_audio_then_finalizes_uncommitted_text() -> None:
     assert running_status.payload == {
         "state": "RUNNING",
         "backlog_ms": 0,
+        "maximum_backlog_ms": 0,
         "analysis_paused": False,
     }
     for index in range(10):
@@ -317,6 +319,7 @@ def test_stop_drains_audio_then_finalizes_uncommitted_text() -> None:
     assert status.payload == {
         "state": "STOPPED",
         "backlog_ms": 0,
+        "maximum_backlog_ms": 0,
         "analysis_paused": False,
     }
     assert harness.engine.accepted == [_frame(index) for index in range(10)]
@@ -383,6 +386,7 @@ def test_delayed_transition_is_strictly_above_two_seconds_and_emitted_once() -> 
     assert delayed.payload == {
         "state": "DELAYED",
         "backlog_ms": 2_001,
+        "maximum_backlog_ms": 2_001,
         "analysis_paused": False,
     }
     baseline = harness.engine.process_calls
@@ -392,6 +396,34 @@ def test_delayed_transition_is_strictly_above_two_seconds_and_emitted_once() -> 
     harness.audio_in.put_nowait(AudioDrainFence())
     harness.output(MessageType.WORKER_STOPPED)
     harness.join()
+
+
+def test_stopped_status_reports_maximum_backlog_without_extra_transitions() -> None:
+    harness = AsrWorkerHarness()
+    harness.start()
+    harness.send(MessageType.WORKER_START, {"worker": "ASR"})
+    harness.output(MessageType.ASR_STATUS)
+
+    harness.engine.backlog = 2_100
+    delayed = harness.output(MessageType.ASR_STATUS)
+    assert delayed.payload["backlog_ms"] == 2_100  # type: ignore[index]
+    harness.engine.backlog = 4_900
+    baseline = harness.engine.process_calls
+    harness.engine.wait_for_process_calls(baseline + 2)
+    assert harness.snapshot() == []
+
+    harness.send(MessageType.WORKER_STOP, {"worker": "ASR", "finalize": True})
+    harness.audio_in.put_nowait(AudioDrainFence())
+    harness.output(MessageType.WORKER_STOPPED)
+    stopped = harness.output(MessageType.ASR_STATUS)
+    harness.join()
+
+    assert stopped.payload == {
+        "state": "STOPPED",
+        "backlog_ms": 0,
+        "maximum_backlog_ms": 4_900,
+        "analysis_paused": False,
+    }
 
 
 def test_analysis_pause_and_resume_thresholds_are_strict_and_transition_only() -> None:
@@ -413,6 +445,7 @@ def test_analysis_pause_and_resume_thresholds_are_strict_and_transition_only() -
     assert paused.payload == {
         "state": "DELAYED",
         "backlog_ms": 5_001,
+        "maximum_backlog_ms": 5_001,
         "analysis_paused": True,
     }
     harness.engine.backlog = 2_000
@@ -425,6 +458,7 @@ def test_analysis_pause_and_resume_thresholds_are_strict_and_transition_only() -
     assert resumed.payload == {
         "state": "RUNNING",
         "backlog_ms": 1_999,
+        "maximum_backlog_ms": 5_001,
         "analysis_paused": False,
     }
     baseline = harness.engine.process_calls

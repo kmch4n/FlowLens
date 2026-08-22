@@ -107,8 +107,10 @@ class _LagTracker:
         self._analysis_pause_threshold_ms = config.analysis_pause_threshold_ms
         self.state = "RUNNING"
         self.analysis_paused = False
+        self.maximum_backlog_ms = 0
 
     def observe(self, backlog_ms: int) -> bool:
+        self.maximum_backlog_ms = max(self.maximum_backlog_ms, backlog_ms)
         previous = (self.state, self.analysis_paused)
         if backlog_ms > self._analysis_pause_threshold_ms:
             self.state = "DELAYED"
@@ -162,7 +164,7 @@ def _asr_worker_loop(
     boundary_started_ms: int | None = None
     resume_pending = False
     emitter.emit(MessageType.WORKER_READY, {"worker": "ASR"})
-    _emit_status(emitter, "READY", 0, False)
+    _emit_status(emitter, "READY", 0, False, lag.maximum_backlog_ms)
 
     def emit_batch(batch: AsrBatch) -> None:
         nonlocal committed_count
@@ -188,6 +190,7 @@ def _asr_worker_loop(
                 lag.state,
                 backlog_ms,
                 lag.analysis_paused,
+                lag.maximum_backlog_ms,
             )
 
     def accept_audio_item(value: object) -> bool:
@@ -260,7 +263,7 @@ def _asr_worker_loop(
                 and boundary is None
             ):
                 state = "RUNNING"
-                _emit_status(emitter, "RUNNING", 0, False)
+                _emit_status(emitter, "RUNNING", 0, False, lag.maximum_backlog_ms)
             elif (
                 command is MessageType.WORKER_PAUSE
                 and state == "RUNNING"
@@ -302,7 +305,7 @@ def _asr_worker_loop(
                     "committed_count": committed_count,
                 },
             )
-            _emit_status(emitter, "STOPPED", 0, False)
+            _emit_status(emitter, "STOPPED", 0, False, lag.maximum_backlog_ms)
             return 0
     except BaseException as exc:
         emitter.emit(
@@ -390,12 +393,14 @@ def _emit_status(
     state: str,
     backlog_ms: int,
     analysis_paused: bool,
+    maximum_backlog_ms: int,
 ) -> None:
     emitter.emit(
         MessageType.ASR_STATUS,
         {
             "state": state,
             "backlog_ms": backlog_ms,
+            "maximum_backlog_ms": maximum_backlog_ms,
             "analysis_paused": analysis_paused,
         },
     )

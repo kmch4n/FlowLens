@@ -764,6 +764,9 @@ Rules:
   ordered ASR fence after every pause or stop boundary's preceding frames.
 - ASR pause or stop completion is proven by consuming its corresponding fence
   from the same queue as the audio frames, never by observing queue emptiness.
+- Every `ASR_STATUS` carries current `backlog_ms` and cumulative
+  `maximum_backlog_ms`. Status emission remains transition-only, while the final
+  `STOPPED` status reports the authoritative maximum observed on every ASR poll.
 
 ## 22. Persistence
 

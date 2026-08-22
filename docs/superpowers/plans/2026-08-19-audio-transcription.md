@@ -1184,7 +1184,7 @@ Commands use shared `WORKER_START`, `WORKER_PAUSE`, `WORKER_RESUME`, and `WORKER
 WORKER_READY         {"worker": "ASR"}
 TRANSCRIPT_PARTIAL   {"source", "text", "session_start_ms", "session_end_ms", "source_start_sample", "source_end_sample"}
 TRANSCRIPT_COMMITTED {all TranscriptRecord fields, with "source" and "committed_at" serialized}
-ASR_STATUS           {"state": "READY"|"RUNNING"|"DELAYED"|"STOPPED", "backlog_ms": int, "analysis_paused": bool}
+ASR_STATUS           {"state": "READY"|"RUNNING"|"DELAYED"|"STOPPED", "backlog_ms": int, "maximum_backlog_ms": int, "analysis_paused": bool}
 WORKER_STOPPED       {"worker": "ASR", "drained": true, "committed_count": int}
 WORKER_ERROR         {"worker": "ASR", "code": "MODEL_LOAD_FAILED"|"DECODE_FAILED", "detail": str}
 ```
@@ -1277,6 +1277,10 @@ def test_decode_failure_does_not_mutate_prior_commits() -> None:
 Define the harness and fake factories in the same test file; inject decoder/engine factories into `_asr_worker_loop()` so no test imports or patches faster-whisper.
 
 State thresholds are strict: backlog `> 2_000` changes the state to delayed, backlog `> 5_000` changes `ASR_STATUS.analysis_paused` to true, and only backlog `< 2_000` changes it back to false and returns to running. Exactly 2,000 ms and 5,000 ms do not enter the higher degradation state; exactly 2,000 ms also does not resume an already degraded state. Emit `ASR_STATUS` once per boundary crossing, not on every poll; the Session Controller owns any corresponding persisted operational events.
+Every emitted status also carries `maximum_backlog_ms`, the cumulative maximum
+observed on every processing poll, including polls that do not cross a state
+boundary. The final `STOPPED` status therefore exposes the authoritative session
+maximum without changing transition-only status emission.
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/asr/test_worker.py -v`
 
@@ -1390,7 +1394,7 @@ Expected: FAIL with `FileNotFoundError`.
 
 `smoke_audio.ps1` accepts mandatory `MicrophoneId`, `LoopbackOutputId`, and `OutputDirectory` plus `[ValidateSet(60)][int]$DurationSeconds = 60`, invokes `.\.venv\Scripts\python.exe -m flowlens.smoke.audio` with those four explicit arguments, and exits with the Python process exit code.
 
-`flowlens.smoke.asr.main()` adds exact `--model-path`, connects the production Audio, ASR, and Writer workers, collects control messages for 120 seconds, and performs the generic Audio-stop then ASR-finalize handshake. It records monotonic speech-start, partial-emission, detected utterance-end, and commit-emission times, then calculates partial and commit p95 with the nearest-rank method. `smoke_asr.ps1` exposes `[ValidateSet(120)][int]$DurationSeconds = 120` and invokes that module. Its summary prints the resolved model path, `device=cuda`, `compute_type=float16`, partial count, committed count per source, partial p95, commit-after-end p95, maximum backlog, and whether an instructed overlapping section produced separate ME/OTHERS records. Both entrypoints return nonzero on a substituted device, wrong format, empty source, wrong model configuration, queue overflow, partial p95 above 2,000 ms, or commit p95 above 3,000 ms.
+`flowlens.smoke.asr.main()` adds exact `--model-path`, connects the production Audio, ASR, and Writer workers, collects control messages for 120 seconds, and performs the generic Audio-stop then ASR-finalize handshake. Partial availability records only the first nonempty partial for each stable `(source, source_start_sample)` utterance key; later refreshes and the empty partial-clear message do not become additional latency samples. It records the ASR envelope emission timestamp and uses the transcript/audio end as the explicitly labeled conservative commit-end proxy, then calculates partial and commit p95 with the nearest-rank method. `smoke_asr.ps1` exposes `[ValidateSet(120)][int]$DurationSeconds = 120` and invokes that module. Its summary prints the resolved model path, `device=cuda`, `compute_type=float16`, partial count, committed count per source, partial p95, commit-after-end p95, the authoritative cumulative `maximum_backlog_ms`, and whether an instructed overlapping section produced separate ME/OTHERS records. Both entrypoints return nonzero on a substituted device, wrong format, empty source, wrong model configuration, malformed or undrained worker acknowledgement, queue overflow, a missing cumulative-backlog field, partial p95 above 2,000 ms, or commit p95 above 3,000 ms.
 
 - [ ] **Step 4: Run static gates, then the designated-PC gates**
 
