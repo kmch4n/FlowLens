@@ -587,7 +587,7 @@ class AudioWriteCommand:
 
 @dataclass(frozen=True, slots=True)
 class AudioDrainFence:
-    """Dedicated-audio-queue marker following the final audio command."""
+    """Repeatable ordered pause/stop marker on a dedicated audio queue."""
 
 
 @dataclass(frozen=True, slots=True)

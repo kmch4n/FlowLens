@@ -68,10 +68,11 @@ TranscriptRecord(
 
 Every control/status `MessageEnvelope` has the exact section 21 fields: `schema_version`, `session_id`, `message_type`, sender-local `sequence`, `source`, `created_monotonic_ms`, and a JSON-serializable `payload` dictionary. The envelope sequence is not the transcript `TranscriptRecord.sequence`.
 
-`AudioDrainFence` is the foundation-owned, empty immutable marker for the
-dedicated Audio-to-Writer queue. It is not a general `MessageEnvelope`, never
-enters a control queue, and is not sent to the ASR audio queue unless a separate
-future contract explicitly introduces an ASR fence.
+`AudioDrainFence` is the foundation-owned, empty immutable marker used on both
+dedicated Audio output queues. On the Writer queue it terminates the session's
+audio stream. On the ASR queue it marks each pause or stop boundary after every
+preceding frame. It is never wrapped in a `MessageEnvelope` or put on a general
+control queue.
 
 ## File Map
 
@@ -533,7 +534,7 @@ def make_frame() -> AudioFrame:
 
 def test_dispatches_writer_command_before_asr_frame() -> None:
     writer: Queue[AudioWriteCommand | AudioDrainFence] = Queue(maxsize=1)
-    asr: Queue[AudioFrame] = Queue(maxsize=1)
+    asr: Queue[AudioFrame | AudioDrainFence] = Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=3_000)
     dispatcher.dispatch(make_frame())
     command = cast(AudioWriteCommand, writer.get_nowait())
@@ -544,7 +545,7 @@ def test_dispatches_writer_command_before_asr_frame() -> None:
 def test_full_writer_queue_is_fatal_before_asr_dispatch() -> None:
     writer: Queue[AudioWriteCommand | AudioDrainFence] = Queue(maxsize=1)
     writer.put_nowait(AudioWriteCommand(AudioSource.ME, bytes(640), 0, 320, 100, 1_100))
-    asr: Queue[AudioFrame] = Queue(maxsize=1)
+    asr: Queue[AudioFrame | AudioDrainFence] = Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=3_000)
     try:
         dispatcher.dispatch(make_frame())
@@ -593,7 +594,7 @@ def run_audio_worker(
     control_in: "multiprocessing.Queue[MessageEnvelope]",
     control_out: "multiprocessing.Queue[MessageEnvelope]",
     writer_audio_out: "multiprocessing.Queue[AudioWriteCommand | AudioDrainFence]",
-    asr_audio_out: "multiprocessing.Queue[AudioFrame]",
+    asr_audio_out: "multiprocessing.Queue[AudioFrame | AudioDrainFence]",
 ) -> None: ...
 ```
 
@@ -640,7 +641,7 @@ def test_normal_stop_fences_writer_audio_before_reporting_stopped() -> None:
     assert all(isinstance(item, AudioWriteCommand) for item in writer_items[:-1])
     assert isinstance(writer_items[-1], AudioDrainFence)
     assert sum(isinstance(item, AudioDrainFence) for item in writer_items) == 1
-    assert not any(isinstance(item, AudioDrainFence) for item in harness.asr_items())
+    assert isinstance(harness.asr_items()[-1], AudioDrainFence)
     assert harness.timeline.index("writer:AudioDrainFence") < harness.timeline.index(
         "status:WORKER_STOPPED"
     )
@@ -656,22 +657,24 @@ Expected: FAIL because the worker loop is absent.
 
 - [ ] **Step 3: Implement command handling and drain ordering**
 
-Use a bounded `queue.Queue[RawAudioChunk](maxsize=256)` per callback. Callback code only calls `put_nowait`; overflow sets a fatal event and returns. During initialization, resolve and open both exact configured devices with streams stopped; emit `WORKER_READY` only after both opens succeed. `WORKER_START` starts both streams together. The worker loop drains raw chunks, calls the matching source normalizer, calculates peak dBFS from canonical samples, and dispatches each frame. On pause, stop both streams and finish already-captured callback chunks before acknowledging; do not call normalizer `flush()`. On resume, restart the same stream objects, or reopen only the exact configured ID if a stream disconnected.
+Use a bounded `queue.Queue[RawAudioChunk](maxsize=256)` per callback. Callback code only calls `put_nowait`; overflow sets a fatal event and returns. During initialization, resolve and open both exact configured devices with streams stopped; emit `WORKER_READY` only after both opens succeed. `WORKER_START` starts both streams together. The worker loop drains raw chunks, calls the matching source normalizer, calculates peak dBFS from canonical samples, and dispatches each frame. On pause, stop both streams, finish already-captured callback chunks, append an ASR `AudioDrainFence` through the same pump, and wait for its submission before entering the paused state; do not call normalizer `flush()`. On resume, restart the same stream objects, or reopen only the exact configured ID if a stream disconnected.
 
 On stop, execute this order:
 
 1. stop both streams so no callback can add audio;
 2. drain both raw queues;
 3. call each normalizer's `flush()` and dispatch every remaining complete frame, putting every final `AudioWriteCommand` on the Writer queue;
-4. wait for the ASR pump spool to empty;
+4. append one `AudioDrainFence()` to the ASR pump spool and wait until that same
+   pump has put it after every preceding ASR frame;
 5. put exactly one shared `AudioDrainFence()` on the Writer queue after the last Writer audio command;
 6. emit `WORKER_STOPPED` with `worker="AUDIO"` and `drained=true`, then close streams/backend.
 
 The Audio Worker must never put an `AudioWriteCommand` after the fence.
 Same-producer FIFO is the ordering proof consumed by the Writer Worker; queue
 emptiness is not. `WORKER_STOPPED/drained=true` therefore means the fence was
-already enqueued after all Writer audio. The fence is Writer-queue-only and is
-neither wrapped in `MessageEnvelope` nor copied to `asr_audio_out`.
+already enqueued after all Writer audio. The separate ASR-queue fence is sent by
+the ASR pump after all preceding ASR frames and is consumed only by the ASR
+Worker before it completes the corresponding pause or stop command.
 
 - [ ] **Step 4: Add disconnection/reconnection and fatal queue tests**
 
@@ -1169,7 +1172,7 @@ Expected: all ASR engine tests pass using only fake VAD/decoder/clock.
 ```python
 def run_asr_worker(
     config: AsrWorkerConfig,
-    audio_in: "multiprocessing.Queue[AudioFrame]",
+    audio_in: "multiprocessing.Queue[AudioFrame | AudioDrainFence]",
     control_in: "multiprocessing.Queue[MessageEnvelope]",
     control_out: "multiprocessing.Queue[MessageEnvelope]",
 ) -> None: ...
@@ -1215,7 +1218,7 @@ Construct the decoder before `WORKER_READY`; convert any path/CUDA/model-load ex
 
 If `decoder.decode()` raises after readiness, emit `WORKER_ERROR/DECODE_FAILED`, leave all previously emitted `TranscriptRecord` objects unchanged, and exit nonzero. The Session Controller owns the specification's single ASR restart and transcript-gap event; this worker must not retry or switch models internally.
 
-While running, alternate short timed reads from `control_in` and `audio_in`, drain all immediately available frames, call `engine.process_ready(monotonic_ms())`, and emit one envelope per partial/record. Serialize `AudioSource` as `ME`/`OTHERS` and `committed_at` as ISO 8601 with timezone. Envelope sequence increments independently for every ASR envelope. Pause stops accepting new audio after already-queued frames drain; resume continues with the same engine. Stop drains `audio_in`, calls `engine.finalize()` exactly once, emits records before `WORKER_STOPPED`, then emits `ASR_STATUS/STOPPED`.
+While running, alternate short timed reads from `control_in` and `audio_in`, drain all immediately available frames, call `engine.process_ready(monotonic_ms())`, and emit one envelope per partial/record. Serialize `AudioSource` as `ME`/`OTHERS` and `committed_at` as ISO 8601 with timezone. Envelope sequence increments independently for every ASR envelope. Pause keeps accepting ordered audio through its ASR-queue `AudioDrainFence`, then accepts no new audio until resume and continues with the same engine. Stop likewise waits for its ordered fence, calls `engine.finalize()` exactly once, emits records before `WORKER_STOPPED`, then emits `ASR_STATUS/STOPPED`. Queue emptiness is never a pause/stop completion proof.
 
 - [ ] **Step 4: Add lag hysteresis and error tests**
 
@@ -1417,5 +1420,5 @@ Hardware result evidence belongs in the implementation task report, not in sourc
 - [ ] Run both designated-PC smoke scripts with the IDs selected in preflight and the checksum-validated local model path.
 - [ ] Confirm no test, adapter, or worker passes a Hugging Face repository ID to faster-whisper at session runtime.
 - [ ] Confirm Writer queue failure safely stops both streams and emits the fatal error before shutdown.
-- [ ] Confirm Audio puts every final Writer command and exactly one `AudioDrainFence` before `WORKER_STOPPED/drained=true`, sends no audio after the fence, never sends the fence to ASR, and that committed records precede ASR `WORKER_STOPPED/drained=true`.
+- [ ] Confirm Audio puts every final Writer command and exactly one Writer `AudioDrainFence` before `WORKER_STOPPED/drained=true`, sends an ordered ASR fence for every pause/stop boundary, sends no pre-boundary audio after either fence, and that committed records precede ASR `WORKER_STOPPED/drained=true`.
 - [ ] Confirm the full application integration plan consumes these exact worker entrypoints, commands, output payloads, and threshold semantics.

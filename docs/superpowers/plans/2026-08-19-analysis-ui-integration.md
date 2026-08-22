@@ -51,12 +51,12 @@ def run_audio_worker(
     control_in: Queue[MessageEnvelope[object]],
     control_out: Queue[MessageEnvelope[object]],
     writer_audio_out: Queue[AudioWriteCommand | AudioDrainFence],
-    asr_audio_out: Queue[AudioFrame],
+    asr_audio_out: Queue[AudioFrame | AudioDrainFence],
 ) -> None: ...
 
 def run_asr_worker(
     config: AsrWorkerConfig,
-    audio_in: Queue[AudioFrame],
+    audio_in: Queue[AudioFrame | AudioDrainFence],
     control_in: Queue[MessageEnvelope[object]],
     control_out: Queue[MessageEnvelope[object]],
 ) -> None: ...
@@ -64,7 +64,7 @@ def run_asr_worker(
 
 This plan consumes `AudioWorkerConfig`, `AsrWorkerConfig`, `AudioFrame`, Audio readiness/level/disconnect/drain messages, ASR partial/committed/status/drain messages, and their exact `MessageType` members. A committed ASR payload contains the shared `TranscriptRecord`; its order field is `sequence`.
 
-Control messages use shared `WORKER_START`, `WORKER_PAUSE`, `WORKER_RESUME`, and `WORKER_STOP` with a typed payload naming the target worker. Drain acknowledgements use `WORKER_STOPPED`: Audio reports `writer_frames` and `asr_frames`, ASR reports `committed_count`, and Discussion reports `final_revision` and `pending_count`, with every payload also carrying `worker` and `drained=true`. Audio `WORKER_STOPPED/drained=true` specifically means Audio has stopped capture, put every final `AudioWriteCommand`, and then put exactly one shared `AudioDrainFence` on the dedicated Writer audio queue. Runtime status uses shared `AUDIO_LEVEL`, `SOURCE_DISCONNECTED`, `SOURCE_RECONNECTED`, `ASR_STATUS`, and `DISCUSSION_STATUS`. `ASR_STATUS` is authoritative and carries `state`, `backlog_ms`, and `analysis_paused`. A discussion failure is a `DISCUSSION_STATUS` runtime message and a persisted `EventType.ANALYSIS_FAILED`; there is no separate failure-only message type.
+Control messages use shared `WORKER_START`, `WORKER_PAUSE`, `WORKER_RESUME`, and `WORKER_STOP` with a typed payload naming the target worker. Drain acknowledgements use `WORKER_STOPPED`: Audio reports `writer_frames` and `asr_frames`, ASR reports `committed_count`, and Discussion reports `final_revision` and `pending_count`, with every payload also carrying `worker` and `drained=true`. Audio `WORKER_STOPPED/drained=true` specifically means Audio has stopped capture, put every final `AudioWriteCommand`, put exactly one shared `AudioDrainFence` on the dedicated Writer audio queue, and put the stop-boundary fence after all preceding frames on the dedicated ASR queue. Each pause also produces one ordered ASR fence. Runtime status uses shared `AUDIO_LEVEL`, `SOURCE_DISCONNECTED`, `SOURCE_RECONNECTED`, `ASR_STATUS`, and `DISCUSSION_STATUS`. `ASR_STATUS` is authoritative and carries `state`, `backlog_ms`, and `analysis_paused`. A discussion failure is a `DISCUSSION_STATUS` runtime message and a persisted `EventType.ANALYSIS_FAILED`; there is no separate failure-only message type.
 
 ## File Map
 
@@ -722,9 +722,10 @@ def test_writer_rewrap_uses_one_gui_local_sequence_after_open() -> None:
 
 - [ ] **Step 5: Implement message routing and operational-only gap events**
 
-Route `AudioWriteCommand` and `AudioDrainFence` only on the dedicated
-Writer-audio queue; neither is a general control envelope. General envelopes
-stay small. The controller validates each sender-local input sequence, but it
+Route `AudioWriteCommand` only on the dedicated Writer-audio queue. Route
+`AudioDrainFence` only on the dedicated Writer- or ASR-audio queue appropriate
+to its boundary; neither is a general control envelope. General envelopes stay
+small. The controller validates each sender-local input sequence, but it
 never forwards a raw ASR or Discussion envelope to Writer. For every
 Writer-bound transcript, discussion-state replacement, and persisted event, it
 creates a fresh envelope that preserves the typed payload and its embedded
@@ -847,9 +848,11 @@ Expected: collection fails because `FinalizationCoordinator` is absent.
 
 Audio stop means no new capture and drain to both Writer and ASR. Audio
 `WORKER_STOPPED/drained=true` means its `AudioDrainFence` was already enqueued
-after every Writer audio command. ASR stop uses `{"worker": "ASR", "finalize":
-true}`. Discussion stop uses `{"worker": "DISCUSSION", "finalize": true}` only
-after the ASR `WORKER_STOPPED` drain acknowledgement. The controller may send
+after every Writer audio command and its separate ASR fence was enqueued after
+every ASR frame. ASR stop uses `{"worker": "ASR", "finalize": true}` and cannot
+finalize until it consumes that ordered ASR fence. Discussion stop uses
+`{"worker": "DISCUSSION", "finalize": true}` only after the ASR
+`WORKER_STOPPED` drain acknowledgement. The controller may send
 `WriterFinalize` later in its dedicated GUI sequence; the Writer keeps that
 terminal control pending until it consumes the explicit fence and never guesses
 drain completion from queue emptiness. It then performs JSONL flushes, WAV
@@ -1358,7 +1361,7 @@ Expected: all tests pass.
 
 **Interfaces:**
 - `MultiprocessingWorkerRuntime(context, worker_targets)` implements controller `WorkerRuntime`.
-- `AudioQueueBindings(writer_audio_out, asr_audio_out)` exposes the dedicated `Queue[AudioWriteCommand | AudioDrainFence]` Writer path and `Queue[AudioFrame]` ASR path passed only to Audio, Writer, and ASR process arguments.
+- `AudioQueueBindings(writer_audio_out, asr_audio_out)` exposes the dedicated `Queue[AudioWriteCommand | AudioDrainFence]` Writer path and `Queue[AudioFrame | AudioDrainFence]` ASR path passed only to Audio, Writer, and ASR process arguments.
 - Production targets are `run_audio_worker`, `run_asr_worker`, `run_discussion_worker`, and foundation `run_writer_worker(control_queue, audio_queue, response_queue, stop_event)`.
 - Queue graph: GUI control-out per worker; one shared worker-to-GUI event queue; bounded Audio-to-Writer queue; bounded Audio-to-ASR queue. There is no socket or server.
 - `build_application(paths, options) -> ApplicationGraph` is the only production composition function.
@@ -1384,9 +1387,10 @@ def test_audio_payload_and_writer_fence_never_enter_general_control_queue() -> N
     frame = make_audio_frame()
     bindings = runtime.audio_bindings()
     bindings.asr_audio_out.put(frame)
+    bindings.asr_audio_out.put(AudioDrainFence())
     bindings.writer_audio_out.put(make_audio_write_command(frame))
     bindings.writer_audio_out.put(AudioDrainFence())
-    assert runtime.asr_audio_queue.items == [frame]
+    assert runtime.asr_audio_queue.items == [frame, AudioDrainFence()]
     assert runtime.writer_audio_queue.items[0].pcm_s16le == frame.pcm_s16le
     assert isinstance(runtime.writer_audio_queue.items[1], AudioDrainFence)
     assert runtime.general_queues_contain_bytes() is False
@@ -1401,7 +1405,7 @@ Expected: collection fails because runtime is absent.
 
 - [ ] **Step 3: Implement process creation, routing, health, restart, and shutdown**
 
-Create queues before processes. `audio_bindings() -> AudioQueueBindings(writer_audio_out, asr_audio_out)` exposes only the two dedicated queue objects used to construct Audio worker arguments; the GUI/controller never places PCM or `AudioDrainFence` on them. Audio alone appends the foundation-owned fence to the Writer path after its final command; the fence never enters the ASR or general queues. Use `multiprocessing.get_context("spawn")`. Do not make children daemons because they must flush on parent loss. `poll()` uses non-blocking drains with a fixed per-tick budget so Qt remains responsive. `restart(ASR|DISCUSSION)` closes and joins the old process, creates a fresh process with the same local model config and queues, and relies on controller restart limits. `shutdown()` sends typed controls, joins with bounded waits, and reports any process requiring termination; it never marks a session completed.
+Create queues before processes. `audio_bindings() -> AudioQueueBindings(writer_audio_out, asr_audio_out)` exposes only the two dedicated queue objects used to construct Audio worker arguments; the GUI/controller never places PCM or `AudioDrainFence` on them. Audio alone appends the foundation-owned fence to the Writer path at stop and to the ASR path at every pause/stop boundary; the fence never enters general control queues. Use `multiprocessing.get_context("spawn")`. Do not make children daemons because they must flush on parent loss. `poll()` uses non-blocking drains with a fixed per-tick budget so Qt remains responsive. `restart(ASR|DISCUSSION)` closes and joins the old process, creates a fresh process with the same local model config and queues, and relies on controller restart limits. `shutdown()` sends typed controls, joins with bounded waits, and reports any process requiring termination; it never marks a session completed.
 
 - [ ] **Step 4: Write composition/local-only tests**
 

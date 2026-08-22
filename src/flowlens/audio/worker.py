@@ -44,6 +44,7 @@ NormalizerFactory = Callable[[AudioSource, int, int, int], StreamingNormalizerPo
 MonotonicClock = Callable[[], int]
 Sleeper = Callable[[float], None]
 _ERROR_DETAIL_MAX_CHARS = 512
+_ASR_FENCE_TIMEOUT_SECONDS = 10.0
 
 
 class _ControlIn(Protocol):
@@ -61,7 +62,7 @@ class _WriterAudioOut(Protocol):
 class _AsrAudioOut(Protocol):
     def put(
         self,
-        item: AudioFrame,
+        item: AudioFrame | AudioDrainFence,
         block: bool = True,
         timeout: float | None = None,
     ) -> None: ...
@@ -130,6 +131,7 @@ def _audio_worker_loop(
     monotonic_ms: MonotonicClock,
     sleeper: Sleeper,
     raw_queue_factory: RawQueueFactory = _default_raw_queue,
+    asr_fence_timeout_seconds: float = _ASR_FENCE_TIMEOUT_SECONDS,
 ) -> None:
     """Run the hardware-independent Audio Worker state machine."""
 
@@ -246,6 +248,20 @@ def _audio_worker_loop(
                 for frame in normalizers[source].push(chunk):
                     dispatch_frame(frame)
 
+    def fence_asr() -> None:
+        try:
+            completed = dispatcher.enqueue_asr_fence(timeout=asr_fence_timeout_seconds)
+        except AsrPumpFailed as exc:
+            raise _FatalWorkerError(
+                "ASR_QUEUE_STALLED",
+                _detail(exc.failure),
+            ) from exc
+        if not completed:
+            raise _FatalWorkerError(
+                "ASR_QUEUE_STALLED",
+                "timed out submitting ASR drain fence",
+            )
+
     def process_control(envelope: object) -> None:
         nonlocal state, normal_stop
         if not _is_target_control(envelope, config, sequence_tracker):
@@ -262,6 +278,7 @@ def _audio_worker_loop(
         elif envelope.message_type is MessageType.WORKER_PAUSE and state == "RUNNING":
             stop_streams()
             drain_raw()
+            fence_asr()
             state = "PAUSED"
         elif envelope.message_type is MessageType.WORKER_RESUME and state == "PAUSED":
             accept_callbacks()
@@ -343,13 +360,7 @@ def _audio_worker_loop(
         for source in AudioSource:
             for frame in normalizers[source].flush():
                 dispatch_frame(frame)
-        try:
-            dispatcher.wait_for_asr_spool_empty()
-        except AsrPumpFailed as exc:
-            raise _FatalWorkerError(
-                "ASR_QUEUE_STALLED",
-                _detail(exc.failure),
-            ) from exc
+        fence_asr()
         pump_stop.set()
         dispatcher.wake_asr_pump()
         if pump is not None:

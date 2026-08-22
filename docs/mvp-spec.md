@@ -759,6 +759,11 @@ Rules:
 - Unknown schema versions are rejected and logged.
 - Large audio payloads use dedicated audio queues, not general control queues.
 - Control messages remain small and serializable.
+- The empty immutable `AudioDrainFence` marker is used only on dedicated audio
+  queues. Audio puts one fence after the final Writer audio command and one
+  ordered ASR fence after every pause or stop boundary's preceding frames.
+- ASR pause or stop completion is proven by consuming its corresponding fence
+  from the same queue as the audio frames, never by observing queue emptiness.
 
 ## 22. Persistence
 

@@ -36,7 +36,7 @@ class _WriterAudioOut(Protocol):
 class _AsrAudioOut(Protocol):
     def put(
         self,
-        item: AudioFrame,
+        item: AudioFrame | AudioDrainFence,
         block: bool = True,
         timeout: float | None = None,
     ) -> None: ...
@@ -64,7 +64,7 @@ class AudioDispatcher:
         self._writer_audio_out = writer_audio_out
         self._asr_audio_out = asr_audio_out
         self._asr_spool_max_frames = asr_spool_max_frames
-        self._spool: deque[AudioFrame] = deque()
+        self._spool: deque[AudioFrame | AudioDrainFence] = deque()
         self._dispatch_lock = threading.Lock()
         self._condition = threading.Condition()
         self._last_submitted_frame: AudioFrame | None = None
@@ -110,10 +110,10 @@ class AudioDispatcher:
                     self._condition.wait(timeout=0.1)
                     if self._aborted:
                         return
-                frame = self._spool[0]
+                item = self._spool[0]
                 self._pump_in_flight = True
             try:
-                self._asr_audio_out.put(frame, timeout=0.1)
+                self._asr_audio_out.put(item, timeout=0.1)
             except queue.Full:
                 with self._condition:
                     self._pump_in_flight = False
@@ -128,10 +128,11 @@ class AudioDispatcher:
                 return
             with self._condition:
                 try:
-                    if not self._spool or self._spool[0] is not frame:
+                    if not self._spool or self._spool[0] is not item:
                         raise RuntimeError("ASR spool order changed while submitting")
                     self._spool.popleft()
-                    self._last_submitted_frame = frame
+                    if isinstance(item, AudioFrame):
+                        self._last_submitted_frame = item
                 finally:
                     self._pump_in_flight = False
                     self._condition.notify_all()
@@ -145,7 +146,9 @@ class AudioDispatcher:
             if self._last_submitted_frame is not None:
                 candidates.append(self._last_submitted_frame)
             if self._spool:
-                candidates.append(self._spool[0])
+                candidates.extend(
+                    item for item in self._spool if isinstance(item, AudioFrame)
+                )
             if not candidates:
                 return 0
             oldest_ms = min(frame.captured_monotonic_ms for frame in candidates)
@@ -156,7 +159,28 @@ class AudioDispatcher:
         """Return the number of frames still held in the in-process spool."""
 
         with self._condition:
-            return len(self._spool)
+            return sum(isinstance(item, AudioFrame) for item in self._spool)
+
+    def enqueue_asr_fence(self, timeout: float | None = None) -> bool:
+        """Submit an ordered ASR boundary after all preceding frames."""
+
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be nonnegative")
+        with self._dispatch_lock:
+            with self._condition:
+                if self._aborted:
+                    raise AsrPumpFailed(RuntimeError("ASR pump is aborted"))
+                if self._pump_failure is not None:
+                    raise AsrPumpFailed(self._pump_failure)
+                self._spool.append(AudioDrainFence())
+                self._condition.notify_all()
+                completed = self._condition.wait_for(
+                    lambda: not self._spool or self._pump_failure is not None,
+                    timeout=timeout,
+                )
+                if self._pump_failure is not None:
+                    raise AsrPumpFailed(self._pump_failure)
+                return completed and not self._spool
 
     def wait_for_asr_spool_empty(self, timeout: float | None = None) -> bool:
         """Wait until every accepted frame has reached the ASR process queue."""

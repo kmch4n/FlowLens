@@ -29,9 +29,14 @@ def _frame(index: int = 0, *, captured_ms: int | None = None) -> AudioFrame:
     )
 
 
+def _require_frame(item: AudioFrame | AudioDrainFence) -> AudioFrame:
+    assert isinstance(item, AudioFrame)
+    return item
+
+
 def test_dispatches_writer_command_before_same_asr_frame() -> None:
     writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=1)
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=1)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=3_000)
     frame = _frame()
 
@@ -53,7 +58,7 @@ def test_dispatches_writer_command_before_same_asr_frame() -> None:
 def test_full_writer_queue_is_fatal_before_asr_dispatch() -> None:
     writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=1)
     writer.put_nowait(AudioWriteCommand(AudioSource.ME, bytes(640), 0, 320, 100, 1_100))
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=1)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=3_000)
 
     with pytest.raises(WriterQueueFull):
@@ -65,7 +70,7 @@ def test_full_writer_queue_is_fatal_before_asr_dispatch() -> None:
 
 def test_full_asr_spool_raises_after_writer_accepts_without_silent_drop() -> None:
     writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=2)
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=1)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=1)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=1)
     dispatcher.dispatch(_frame(0))
 
@@ -79,7 +84,7 @@ def test_full_asr_spool_raises_after_writer_accepts_without_silent_drop() -> Non
 
 def test_blocked_asr_consumer_never_delays_writer_dispatch_and_pump_drains() -> None:
     writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=10)
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=1)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=1)
     asr.put_nowait(_frame(99))
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=10)
     stop = threading.Event()
@@ -90,8 +95,8 @@ def test_blocked_asr_consumer_never_delays_writer_dispatch_and_pump_drains() -> 
         dispatcher.dispatch(_frame(index))
 
     assert writer.qsize() == 10
-    assert asr.get(timeout=1).source_start_sample == 99 * 320
-    submitted = [asr.get(timeout=1) for _ in range(10)]
+    assert _require_frame(asr.get(timeout=1)).source_start_sample == 99 * 320
+    submitted = [_require_frame(asr.get(timeout=1)) for _ in range(10)]
     assert [frame.source_start_sample for frame in submitted] == [
         index * 320 for index in range(10)
     ]
@@ -105,7 +110,7 @@ def test_blocked_asr_consumer_never_delays_writer_dispatch_and_pump_drains() -> 
 
 def test_pump_stop_waits_for_accepted_spool_instead_of_dropping() -> None:
     writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=1)
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=1)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=1)
     asr.put_nowait(_frame(99))
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=2)
     accepted = _frame()
@@ -124,16 +129,55 @@ def test_pump_stop_waits_for_accepted_spool_instead_of_dropping() -> None:
     assert not pump.is_alive()
 
 
+def test_asr_fence_is_pumped_after_every_preceding_frame() -> None:
+    writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=2)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=3)
+    dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=2)
+    dispatcher.dispatch(_frame(0))
+    dispatcher.dispatch(_frame(1))
+    stop = threading.Event()
+    pump = threading.Thread(target=dispatcher.run_asr_pump, args=(stop,))
+    pump.start()
+
+    assert dispatcher.enqueue_asr_fence(timeout=1)
+    items = [asr.get(timeout=1) for _ in range(3)]
+    stop.set()
+    dispatcher.wake_asr_pump()
+    pump.join(timeout=1)
+
+    assert items == [_frame(0), _frame(1), AudioDrainFence()]
+    assert not pump.is_alive()
+
+
+def test_asr_fence_submission_times_out_on_full_queue_without_hanging() -> None:
+    writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=1)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=1)
+    asr.put_nowait(_frame(99))
+    dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=1)
+    stop = threading.Event()
+    pump = threading.Thread(target=dispatcher.run_asr_pump, args=(stop,))
+    pump.start()
+
+    assert dispatcher.enqueue_asr_fence(timeout=0.01) is False
+    dispatcher.abort_asr_pump()
+    stop.set()
+    dispatcher.wake_asr_pump()
+    pump.join(timeout=1)
+
+    assert not pump.is_alive()
+    assert dispatcher.pending_asr_frames == 0
+
+
 def test_abort_waits_for_in_flight_put_and_prevents_late_submission() -> None:
     class InterleavingAsrOut:
         def __init__(self) -> None:
             self.put_entered = threading.Event()
             self.release_put = threading.Event()
-            self.items: list[AudioFrame] = []
+            self.items: list[AudioFrame | AudioDrainFence] = []
 
         def put(
             self,
-            item: AudioFrame,
+            item: AudioFrame | AudioDrainFence,
             block: bool = True,
             timeout: float | None = None,
         ) -> None:
@@ -191,7 +235,7 @@ def test_terminal_asr_put_failure_wakes_drain_waiter_with_typed_error() -> None:
 
         def put(
             self,
-            item: AudioFrame,
+            item: AudioFrame | AudioDrainFence,
             block: bool = True,
             timeout: float | None = None,
         ) -> None:
@@ -235,7 +279,7 @@ def test_concurrent_dispatch_preserves_same_writer_and_asr_order() -> None:
                 assert release_first.wait(timeout=1)
 
     writer = InterleavingWriter()
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=2)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=2)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=2)
     first = threading.Thread(target=dispatcher.dispatch, args=(_frame(0),))
     second = threading.Thread(target=dispatcher.dispatch, args=(_frame(1),))
@@ -252,7 +296,9 @@ def test_concurrent_dispatch_preserves_same_writer_and_asr_order() -> None:
     stop = threading.Event()
     pump = threading.Thread(target=dispatcher.run_asr_pump, args=(stop,))
     pump.start()
-    asr_order = [asr.get(timeout=1).source_start_sample for _ in range(2)]
+    asr_order = [
+        _require_frame(asr.get(timeout=1)).source_start_sample for _ in range(2)
+    ]
     assert dispatcher.wait_for_asr_spool_empty(timeout=1)
     stop.set()
     dispatcher.wake_asr_pump()
@@ -264,7 +310,7 @@ def test_concurrent_dispatch_preserves_same_writer_and_asr_order() -> None:
 
 def test_backlog_uses_oldest_submitted_or_spooled_frame_and_clamps() -> None:
     writer: queue.Queue[AudioWriteCommand | AudioDrainFence] = queue.Queue(maxsize=2)
-    asr: queue.Queue[AudioFrame] = queue.Queue(maxsize=2)
+    asr: queue.Queue[AudioFrame | AudioDrainFence] = queue.Queue(maxsize=2)
     dispatcher = AudioDispatcher(writer, asr, asr_spool_max_frames=2)
     dispatcher.dispatch(_frame(0, captured_ms=1_100))
     stop = threading.Event()

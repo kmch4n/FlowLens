@@ -251,7 +251,7 @@ class InterleavingRawQueue:
         return self._items.qsize()
 
 
-class ClosedAsrQueue(queue.Queue[AudioFrame]):
+class ClosedAsrQueue(queue.Queue[AudioFrame | AudioDrainFence]):
     """ASR process queue probe that fails every terminal put."""
 
     def __init__(self) -> None:
@@ -260,7 +260,7 @@ class ClosedAsrQueue(queue.Queue[AudioFrame]):
 
     def put(
         self,
-        item: AudioFrame,
+        item: AudioFrame | AudioDrainFence,
         block: bool = True,
         timeout: float | None = None,
     ) -> None:
@@ -273,7 +273,7 @@ def _standard_raw_queue(maxsize: int) -> queue.Queue[RawAudioChunk]:
     return queue.Queue(maxsize=maxsize)
 
 
-def _standard_asr_queue() -> queue.Queue[AudioFrame]:
+def _standard_asr_queue() -> queue.Queue[AudioFrame | AudioDrainFence]:
     return queue.Queue(maxsize=32)
 
 
@@ -285,10 +285,13 @@ class AudioWorkerHarness:
     writer_queue_max_frames: int = 32
     asr_spool_max_frames: int = 32
     loopback_output_device_id: str = "wasapi-output:7"
+    asr_fence_timeout_seconds: float = 10.0
     raw_queue_factory: Callable[
         [int], InterleavingRawQueue | queue.Queue[RawAudioChunk]
     ] = _standard_raw_queue
-    asr_queue_factory: Callable[[], queue.Queue[AudioFrame]] = _standard_asr_queue
+    asr_queue_factory: Callable[[], queue.Queue[AudioFrame | AudioDrainFence]] = (
+        _standard_asr_queue
+    )
 
     def __post_init__(self) -> None:
         self.backend = self.backend or FakeCaptureBackend()
@@ -359,6 +362,7 @@ class AudioWorkerHarness:
                 "monotonic_ms": self.clock,
                 "sleeper": sleeper,
                 "raw_queue_factory": self.raw_queue_factory,
+                "asr_fence_timeout_seconds": self.asr_fence_timeout_seconds,
             },
             name="test-audio-worker",
         )
@@ -482,9 +486,10 @@ def test_normal_stop_fences_writer_audio_before_reporting_stopped() -> None:
     assert isinstance(items[0], AudioWriteCommand)
     assert isinstance(items[-1], AudioDrainFence)
     assert sum(isinstance(item, AudioDrainFence) for item in items) == 1
-    assert not any(
-        isinstance(item, AudioDrainFence) for item in list(harness.asr_out.queue)
-    )
+    asr_items = list(harness.asr_out.queue)
+    assert isinstance(asr_items[0], AudioFrame)
+    assert isinstance(asr_items[-1], AudioDrainFence)
+    assert sum(isinstance(item, AudioDrainFence) for item in asr_items) == 1
     assert _worker_stopped_payload(stopped)["drained"] is True
 
 
@@ -498,8 +503,12 @@ def test_pause_drains_chunks_already_accepted_by_callbacks() -> None:
     harness.send(MessageType.WORKER_PAUSE, {"worker": "AUDIO"})
     harness.release_polling.set()
     command = harness.writer_out.get(timeout=1)
+    asr_frame = harness.asr_out.get(timeout=1)
+    asr_fence = harness.asr_out.get(timeout=1)
 
     assert isinstance(command, AudioWriteCommand)
+    assert isinstance(asr_frame, AudioFrame)
+    assert isinstance(asr_fence, AudioDrainFence)
     harness.wait_until(lambda: backend.stream(AudioSource.ME).stop_calls == 1)
     harness.stop()
 
@@ -654,6 +663,26 @@ def test_closed_asr_queue_reports_fatal_without_hanging_normal_stop() -> None:
     assert backend.close_calls == 1
     assert not any(
         thread.name == "flowlens-audio-asr-pump" for thread in threading.enumerate()
+    )
+
+
+def test_full_asr_queue_times_out_fence_without_reporting_drained() -> None:
+    harness = AudioWorkerHarness(asr_fence_timeout_seconds=0.01)
+    harness.asr_out = queue.Queue(maxsize=1)
+    harness.asr_out.put_nowait(AudioFrame(AudioSource.ME, bytes(640), 0, 320, 0, 1_000))
+    harness.start()
+    harness.send(MessageType.WORKER_STOP, {"worker": "AUDIO"})
+    error = harness.status(MessageType.WORKER_ERROR)
+    harness.join()
+
+    assert _worker_error_payload(error) == {
+        "worker": "AUDIO",
+        "code": "ASR_QUEUE_STALLED",
+        "detail": "timed out submitting ASR drain fence",
+    }
+    assert not any(
+        item.message_type is MessageType.WORKER_STOPPED
+        for item in harness.control_out.queue
     )
 
 
