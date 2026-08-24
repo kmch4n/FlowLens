@@ -719,6 +719,9 @@ def test_force_close_losing_finalize_race_resolves_completed(tmp_path: Path) -> 
     assert len(sent_to(runtime, ProcessSource.WRITER)) == writer_before
     assert controller_state(controller) is SessionState.COMPLETED
     assert controller.snapshot().recording_status == "Completed"
+    completion = controller.snapshot().completion
+    assert completion is not None
+    assert completion.save_path == tmp_path.resolve() / SESSION_ID
     assert runtime.shutdown_count == 1
 
 

@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (
 )
 
 from flowlens.config.model import WindowPreferences
-from flowlens.controller.models import PreflightSelection
-from flowlens.ui.completion_page import CompletionPage, CompletionSummary
+from flowlens.controller.models import CompletionSummary, PreflightSelection
+from flowlens.ui.completion_page import CompletionPage
 from flowlens.ui.dialogs import SlowFinalizationDialog, StopConfirmationDialog
 from flowlens.ui.live_page import LivePage
 from flowlens.ui.preflight_page import PreflightPage
@@ -301,10 +301,7 @@ class MainWindow(QMainWindow):
                 self.start_requested.emit()
             event.accept()
             return True
-        if (
-            key == Qt.Key.Key_Space
-            and modifiers == Qt.KeyboardModifier.NoModifier
-        ):
+        if key == Qt.Key.Key_Space and modifiers == Qt.KeyboardModifier.NoModifier:
             if self._space_is_blocked_by_focus():
                 return False
             self.pause_resume_requested.emit()
@@ -316,13 +313,8 @@ class MainWindow(QMainWindow):
             self.always_on_top_changed.emit(next_value)
             event.accept()
             return True
-        if (
-            key == Qt.Key.Key_S
-            and modifiers
-            == (
-                Qt.KeyboardModifier.ControlModifier
-                | Qt.KeyboardModifier.ShiftModifier
-            )
+        if key == Qt.Key.Key_S and modifiers == (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
         ):
             self.stop_requested.emit()
             event.accept()
@@ -341,8 +333,7 @@ class MainWindow(QMainWindow):
             )
             or (key == Qt.Key.Key_Space and modifiers == Qt.KeyboardModifier.NoModifier)
             or (
-                key == Qt.Key.Key_T
-                and modifiers == Qt.KeyboardModifier.ControlModifier
+                key == Qt.Key.Key_T and modifiers == Qt.KeyboardModifier.ControlModifier
             )
             or (
                 key == Qt.Key.Key_S

@@ -13,6 +13,7 @@ from pytestqt.qtbot import QtBot
 from flowlens.config.model import AppConfig, DevicePreferences, WindowPreferences
 from flowlens.controller.models import (
     BlockingIssue,
+    CompletionSummary,
     DeviceOption,
     ModelCheck,
     PreflightReport,
@@ -57,10 +58,12 @@ class ConfigurableController:
         loopback_ids: tuple[str, ...] = ("out-1",),
     ) -> None:
         self.state = state
+        self.request_stop_count = 0
         self.microphone_ids = microphone_ids
         self.loopback_ids = loopback_ids
         self.selection = PreflightSelection(SessionMode.MEETING, None, None)
         self.stop_confirmation_visible = False
+        self.slow_finalization_visible = False
 
     def snapshot(self) -> ControllerSnapshot:
         return ControllerSnapshot(
@@ -91,7 +94,8 @@ class ConfigurableController:
             ),
             fatal_error=None,
             stop_confirmation_visible=self.stop_confirmation_visible,
-            slow_finalization_visible=False,
+            slow_finalization_visible=self.slow_finalization_visible,
+            completion=self._completion_summary(),
         )
 
     def enter_preflight(self) -> None:
@@ -112,6 +116,7 @@ class ConfigurableController:
         self.state = SessionState.RECORDING
 
     def request_stop(self) -> None:
+        self.request_stop_count += 1
         self.stop_confirmation_visible = True
 
     def cancel_stop(self) -> None:
@@ -164,6 +169,15 @@ class ConfigurableController:
             can_start=not issues,
         )
 
+    def _completion_summary(self) -> CompletionSummary | None:
+        if self.state is not SessionState.COMPLETED:
+            return None
+        return CompletionSummary(
+            30_000,
+            0,
+            Path("C:/FlowLens/sessions/session-1").resolve(strict=False),
+        )
+
 
 def test_saved_geometry_is_clamped_to_available_screens() -> None:
     screens = [QRect(0, 0, 1920, 1080), QRect(1920, 0, 1920, 1080)]
@@ -189,6 +203,67 @@ def test_active_close_uses_stop_confirmation(qtbot: QtBot) -> None:
     assert window.stop_dialog.isVisible() is True
     assert controller.state is SessionState.RECORDING
     assert presenter.render_count >= 1
+
+
+def test_starting_close_keeps_window_open_with_progress_banner(
+    qtbot: QtBot,
+) -> None:
+    announcer = FakeStatusAnnouncer()
+    controller = ConfigurableController(state=SessionState.STARTING)
+    window = MainWindow()
+    presenter = QtSessionPresenter(controller, window, announcer)
+    qtbot.addWidget(window)
+    window.show()
+
+    window.close()
+
+    assert window.isVisible() is True
+    assert window.live_page.banner.text() == "Session startup is still in progress."
+    assert window.stop_dialog.isVisible() is False
+    assert window.slow_finalization_dialog.isVisible() is False
+    assert controller.request_stop_count == 0
+    assert presenter.timer.isActive() is True
+    assert ("Session startup is still in progress.", False) in announcer.messages
+
+
+def test_stopping_close_before_slow_threshold_keeps_finalizing_without_dialog(
+    qtbot: QtBot,
+) -> None:
+    announcer = FakeStatusAnnouncer()
+    controller = ConfigurableController(state=SessionState.STOPPING)
+    window = MainWindow()
+    presenter = QtSessionPresenter(controller, window, announcer)
+    qtbot.addWidget(window)
+    window.show()
+
+    window.close()
+
+    assert window.isVisible() is True
+    assert window.live_page.banner.text() == "Finalization is in progress."
+    assert window.stop_dialog.isVisible() is False
+    assert window.slow_finalization_dialog.isVisible() is False
+    assert controller.request_stop_count == 0
+    assert presenter.timer.isActive() is True
+    assert ("Finalization is in progress.", False) in announcer.messages
+
+
+def test_stopping_close_with_slow_flag_shows_existing_slow_dialog(
+    qtbot: QtBot,
+) -> None:
+    controller = ConfigurableController(state=SessionState.STOPPING)
+    window = MainWindow()
+    presenter = QtSessionPresenter(controller, window, FakeAnnouncer())
+    qtbot.addWidget(window)
+    window.show()
+    controller.slow_finalization_visible = True
+    presenter.render_current_snapshot(force=True)
+
+    window.close()
+
+    assert window.isVisible() is True
+    assert window.slow_finalization_dialog.isVisible() is True
+    assert window.stop_dialog.isVisible() is False
+    assert controller.request_stop_count == 0
 
 
 def test_completion_close_saves_preferences_and_closes(qtbot: QtBot) -> None:

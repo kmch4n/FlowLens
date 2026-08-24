@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import flowlens.controller.models as controller_models
 from flowlens.asr.types import AsrWorkerConfig
 from flowlens.audio.types import AudioWorkerConfig
 from flowlens.controller.models import (
@@ -888,6 +889,72 @@ def stopped_envelope(worker: ProcessSource) -> MessageEnvelope[object]:
     else:
         payload = DiscussionStoppedPayload("DISCUSSION", True, 1, 0)
     return worker_envelope(worker, MessageType.WORKER_STOPPED, 2, payload)
+
+
+def stopped_envelope_with_sequence(
+    worker: ProcessSource,
+    sequence: int,
+) -> MessageEnvelope[object]:
+    envelope = stopped_envelope(worker)
+    return worker_envelope(worker, envelope.message_type, sequence, envelope.payload)
+
+
+def test_completion_summary_contract_validates_authoritative_values(
+    tmp_path: Path,
+) -> None:
+    summary_class = getattr(controller_models, "CompletionSummary", None)
+
+    assert summary_class is not None
+    with pytest.raises(Exception, match="duration_ms"):
+        summary_class(-1, 0, tmp_path.resolve())
+    with pytest.raises(Exception, match="transcript_count"):
+        summary_class(0, -1, tmp_path.resolve())
+    with pytest.raises(Exception, match="save_path"):
+        summary_class(0, 0, Path("relative"))
+
+    summary = summary_class(10_000, 1, tmp_path.resolve())
+    assert summary.duration_ms == 10_000
+    assert summary.transcript_count == 1
+    assert summary.save_path == tmp_path.resolve()
+
+
+def test_completed_snapshot_contains_durable_session_completion_summary(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, clock, _ = recording_controller(tmp_path)
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.ASR,
+            MessageType.TRANSCRIPT_COMMITTED,
+            2,
+            TranscriptCommitted(make_transcript_record()),
+        )
+    )
+    clock.ms = 11_000
+    controller.request_stop()
+    controller.confirm_stop()
+    controller.handle_message(stopped_envelope(ProcessSource.AUDIO))
+    controller.handle_message(stopped_envelope_with_sequence(ProcessSource.ASR, 3))
+    controller.handle_message(stopped_envelope(ProcessSource.DISCUSSION))
+    finalize = sent_to(runtime, ProcessSource.WRITER)[-1]
+
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.WRITER,
+            MessageType.WRITER_ACK,
+            2,
+            WriterAck(finalize.sequence, NOW),
+        )
+    )
+
+    completion = controller.snapshot().completion
+    assert completion is not None
+    assert completion.duration_ms == 10_000
+    assert completion.transcript_count == 1
+    assert completion.save_path == tmp_path.resolve() / SESSION_ID
+
+    controller.enter_preflight()
+    assert controller.snapshot().completion is None
 
 
 @pytest.mark.parametrize("worker", list(_START_WORKERS))

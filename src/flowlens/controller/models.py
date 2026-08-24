@@ -137,6 +137,32 @@ class BlockingIssue:
 
 
 @dataclass(frozen=True, slots=True)
+class CompletionSummary:
+    """Authoritative completed-session values from the controller."""
+
+    duration_ms: int
+    transcript_count: int
+    save_path: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "duration_ms",
+            _non_negative_int(self.duration_ms, "duration_ms"),
+        )
+        object.__setattr__(
+            self,
+            "transcript_count",
+            _non_negative_int(self.transcript_count, "transcript_count"),
+        )
+        object.__setattr__(
+            self,
+            "save_path",
+            _absolute_path(self.save_path, "save_path"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PreflightReport:
     """Complete immutable preflight snapshot for the UI."""
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
 
@@ -18,7 +19,6 @@ from flowlens.controller.models import PreflightReport, PreflightSelection
 from flowlens.controller.ports import FolderOpener
 from flowlens.controller.session_controller import ControllerSnapshot, SessionState
 from flowlens.domain.enums import SessionMode
-from flowlens.ui.completion_page import CompletionSummary
 from flowlens.ui.main_window import MainWindow
 
 
@@ -115,6 +115,8 @@ class QtSessionPresenter:
         self.last_timer_error: str | None = None
         self._in_timer = False
         self._last_snapshot: ControllerSnapshot | None = None
+        self._last_render_key: tuple[ControllerSnapshot, str | None] | None = None
+        self._close_block_message: str | None = None
         self._selection = PreflightSelection(SessionMode.MEETING, None, None)
         self._completion_path: Path | None = None
 
@@ -123,6 +125,7 @@ class QtSessionPresenter:
         self.render_current_snapshot(force=True)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start()
+        self.window.destroyed.connect(self._stop_timer)
 
     def on_timer(self) -> None:
         """Drain worker-facing updates, tick the controller, then render changes."""
@@ -156,12 +159,17 @@ class QtSessionPresenter:
 
         if not isinstance(snapshot, ControllerSnapshot):
             raise TypeError("snapshot must be a ControllerSnapshot")
+        if snapshot.state not in {SessionState.STARTING, SessionState.STOPPING}:
+            self._close_block_message = None
+        key = (snapshot, self._close_block_message)
         previous = self._last_snapshot
-        if not force and previous == snapshot:
+        if not force and self._last_render_key == key:
             return
-        self._render_snapshot(snapshot)
-        self._announce_snapshot_changes(previous, snapshot)
+        display_snapshot = self._snapshot_with_shell_message(snapshot)
+        self._render_snapshot(display_snapshot)
+        self._announce_snapshot_changes(previous, display_snapshot)
         self._last_snapshot = snapshot
+        self._last_render_key = key
         self.render_count += 1
 
     def on_selection_changed(self, selection: PreflightSelection) -> None:
@@ -199,8 +207,8 @@ class QtSessionPresenter:
         self.window.stop_requested.connect(self._request_stop)
         self.window.stop_confirmed_requested.connect(self._confirm_stop)
         self.window.stop_cancel_requested.connect(self._cancel_stop)
-        self.window.active_close_requested.connect(self._request_stop)
-        self.window.orderly_close_requested.connect(self.save_preferences)
+        self.window.active_close_requested.connect(self._active_close_requested)
+        self.window.orderly_close_requested.connect(self._orderly_close_requested)
         self.window.always_on_top_changed.connect(self._always_on_top_changed)
         self.window.keep_waiting_requested.connect(self._keep_waiting)
         self.window.force_close_requested.connect(self._force_close)
@@ -231,12 +239,16 @@ class QtSessionPresenter:
         }
         sanitized = PreflightSelection(
             selection.mode,
-            selection.microphone_id
-            if selection.microphone_id in microphone_ids
-            else None,
-            selection.loopback_output_id
-            if selection.loopback_output_id in loopback_ids
-            else None,
+            (
+                selection.microphone_id
+                if selection.microphone_id in microphone_ids
+                else None
+            ),
+            (
+                selection.loopback_output_id
+                if selection.loopback_output_id in loopback_ids
+                else None
+            ),
         )
         self._selection = sanitized
         if sanitized != selection:
@@ -258,9 +270,13 @@ class QtSessionPresenter:
         if snapshot.preflight is not None:
             self._selection = snapshot.preflight.selection
         if snapshot.state is SessionState.COMPLETED:
-            summary = self._completion_summary(snapshot)
-            self._completion_path = summary.save_path
-            self.window.show_completion(summary)
+            if snapshot.completion is None:
+                self._completion_path = None
+                self.window.show_live()
+                self.window.live_page.render(snapshot)
+                return
+            self._completion_path = snapshot.completion.save_path
+            self.window.show_completion(snapshot.completion)
         elif snapshot.state in {
             SessionState.RECORDING,
             SessionState.PAUSED,
@@ -322,6 +338,23 @@ class QtSessionPresenter:
         self.controller.request_stop()
         self.render_current_snapshot()
 
+    def _active_close_requested(self) -> None:
+        snapshot = self.controller.snapshot()
+        if snapshot.state in {SessionState.RECORDING, SessionState.PAUSED}:
+            self._request_stop()
+            return
+        if snapshot.state is SessionState.STARTING:
+            self._show_close_block_message(
+                "Session startup is still in progress.",
+                assertive=False,
+            )
+            return
+        if snapshot.state is SessionState.STOPPING:
+            self._show_close_block_message(
+                "Finalization is in progress.",
+                assertive=False,
+            )
+
     def _cancel_stop(self) -> None:
         try:
             self.controller.cancel_stop()
@@ -354,20 +387,28 @@ class QtSessionPresenter:
         self._refresh_preflight_with_available_devices(self._selection)
         self.render_current_snapshot(force=True)
 
-    def _completion_summary(self, snapshot: ControllerSnapshot) -> CompletionSummary:
-        save_path = (
-            snapshot.preflight.destination
-            if snapshot.preflight is not None
-            else Path.cwd().resolve()
-        )
-        return CompletionSummary(
-            duration_ms=0,
-            transcript_count=len(snapshot.transcript),
-            save_path=save_path,
-        )
-
     def _controller_state(self) -> SessionState:
         return self.controller.snapshot().state
+
+    def _snapshot_with_shell_message(
+        self,
+        snapshot: ControllerSnapshot,
+    ) -> ControllerSnapshot:
+        if self._close_block_message is None:
+            return snapshot
+        return replace(snapshot, issue=self._close_block_message)
+
+    def _show_close_block_message(self, message: str, *, assertive: bool) -> None:
+        self._close_block_message = message
+        self.render_current_snapshot(force=True)
+        del assertive
+
+    def _orderly_close_requested(self) -> None:
+        self._stop_timer()
+        self.save_preferences()
+
+    def _stop_timer(self, *_: object) -> None:
+        self.timer.stop()
 
 
 def _default_store() -> ConfigStore:

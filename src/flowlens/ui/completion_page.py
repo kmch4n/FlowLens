@@ -1,29 +1,12 @@
 """Completion screen for a finalized local session."""
 
-from dataclasses import dataclass
-from pathlib import Path
-
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout, QWidget
 
+from flowlens.controller.models import CompletionSummary
 from flowlens.ui.widgets import StatefulButton
 
-
-@dataclass(frozen=True, slots=True)
-class CompletionSummary:
-    """Values displayed after session persistence has completed."""
-
-    duration_ms: int
-    transcript_count: int
-    save_path: Path
-
-    def __post_init__(self) -> None:
-        if type(self.duration_ms) is not int or self.duration_ms < 0:
-            raise ValueError("duration_ms must be a non-negative integer")
-        if type(self.transcript_count) is not int or self.transcript_count < 0:
-            raise ValueError("transcript_count must be a non-negative integer")
-        if not isinstance(self.save_path, Path) or not self.save_path.is_absolute():
-            raise ValueError("save_path must be an absolute Path")
+__all__ = ["CompletionPage", "CompletionSummary"]
 
 
 class CompletionPage(QWidget):

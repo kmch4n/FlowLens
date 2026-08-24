@@ -10,7 +10,11 @@ from typing import Any, Protocol, cast
 from flowlens.asr.types import AsrWorkerConfig, PartialTranscript
 from flowlens.audio.types import AudioWorkerConfig
 from flowlens.controller.finalization import FinalizationCoordinator
-from flowlens.controller.models import PreflightReport, PreflightSelection
+from flowlens.controller.models import (
+    CompletionSummary,
+    PreflightReport,
+    PreflightSelection,
+)
 from flowlens.controller.ports import AccessibilityAnnouncer, Clock, WorkerRuntime
 from flowlens.controller.routing import (
     SequenceTracker,
@@ -161,6 +165,7 @@ class ControllerSnapshot:
     fatal_error: str | None
     stop_confirmation_visible: bool
     slow_finalization_visible: bool
+    completion: CompletionSummary | None = None
 
 
 class SessionController:
@@ -244,7 +249,11 @@ class SessionController:
             "PREFLIGHT",
             {SessionState.IDLE, SessionState.COMPLETED, SessionState.ERROR},
         )
-        self._set_state(SessionState.PREFLIGHT, recording_status="Ready")
+        self._set_state(
+            SessionState.PREFLIGHT,
+            recording_status="Ready",
+            completion=None,
+        )
 
     def refresh_preflight(self, selection: PreflightSelection) -> PreflightReport:
         """Evaluate current selections while remaining in preflight."""
@@ -342,6 +351,7 @@ class SessionController:
             asr_status="Starting",
             analysis_status="Starting",
             fatal_error=None,
+            completion=None,
         )
 
     def pause(self) -> None:
@@ -717,6 +727,7 @@ class SessionController:
                         latest_successful_save_at=payload.latest_successful_save_at,
                         recording_status="Incomplete",
                         slow_finalization_visible=False,
+                        completion=None,
                     )
                 return
             if finalization.completed:
@@ -729,6 +740,7 @@ class SessionController:
                     SessionState.COMPLETED,
                     recording_status="Completed",
                     slow_finalization_visible=False,
+                    completion=self._completion_summary(),
                 )
             return
         if message_type is MessageType.WRITER_ACK and isinstance(payload, WriterAck):
@@ -1142,9 +1154,17 @@ class SessionController:
                 else "Completed"
             ),
             slow_finalization_visible=False,
+            completion=(
+                None
+                if result.outcome is WriterForceCloseOutcome.INCOMPLETE
+                else self._completion_summary()
+            ),
         )
         if result.outcome is WriterForceCloseOutcome.COMPLETED:
-            self._set_state(SessionState.COMPLETED)
+            self._set_state(
+                SessionState.COMPLETED,
+                completion=self._completion_summary(),
+            )
 
     def _consume_terminal_event_sequence(self) -> None:
         if self._terminal_event_consumed:
@@ -1162,10 +1182,6 @@ class SessionController:
         if started_ms is None:
             raise RuntimeError("session start time is unavailable")
         elapsed_ms = now_ms - started_ms
-        paused_ms = sum(
-            interval.ended_ms - interval.started_ms
-            for interval in self._pause_intervals
-        )
         final_state = self._snapshot.discussion_state
         if final_state is None:
             raise RuntimeError("final discussion state is unavailable")
@@ -1181,11 +1197,29 @@ class SessionController:
         )
         return WriterFinalize(
             ended_at=ended_at,
-            active_duration_ms=max(0, elapsed_ms - paused_ms),
+            active_duration_ms=self._active_duration_ms_at_stop(),
             pause_intervals=tuple(self._pause_intervals),
             final_state=final_state,
             completion_event=completion_event,
         )
+
+    def _completion_summary(self) -> CompletionSummary:
+        return CompletionSummary(
+            duration_ms=self._active_duration_ms_at_stop(),
+            transcript_count=len(self._snapshot.transcript),
+            save_path=self._require_launch().session_dir,
+        )
+
+    def _active_duration_ms_at_stop(self) -> int:
+        now_ms = self._stop_confirmed_ms
+        started_ms = self._started_ms
+        if now_ms is None or started_ms is None:
+            raise RuntimeError("stop timing is unavailable")
+        paused_ms = sum(
+            interval.ended_ms - interval.started_ms
+            for interval in self._pause_intervals
+        )
+        return max(0, now_ms - started_ms - paused_ms)
 
     def _build_force_close_event(self) -> EventRecord:
         launch = self._require_launch()
@@ -1227,9 +1261,10 @@ class SessionController:
             self._snapshot,
             fatal_error="Session storage is unsafe; recording stopped.",
             issue="Session storage is unsafe; recording stopped.",
+            completion=None,
         )
         self._bounded_shutdown()
-        self._set_state(SessionState.ERROR, recording_status="Error")
+        self._set_state(SessionState.ERROR, recording_status="Error", completion=None)
         self._announce_once(
             ("fatal", "storage"),
             "Session storage is unsafe; recording stopped.",
@@ -1243,6 +1278,7 @@ class SessionController:
             issue=message,
             fatal_error=message,
             recording_status="Error",
+            completion=None,
         )
         self._announce_once(("fatal", "runtime"), message, True)
 

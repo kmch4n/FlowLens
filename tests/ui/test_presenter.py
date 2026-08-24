@@ -14,6 +14,7 @@ from pytestqt.qtbot import QtBot
 from flowlens.config.model import AppConfig
 from flowlens.controller.models import (
     BlockingIssue,
+    CompletionSummary,
     DeviceOption,
     ModelCheck,
     PreflightReport,
@@ -61,6 +62,17 @@ class RecordingController:
     ) -> None:
         self.state = state
         self.can_start = can_start
+        self.completion = (
+            CompletionSummary(
+                1_800_000,
+                1,
+                Path(
+                    "C:/FlowLens/sessions/" "2026-08-19_01J00000000000000000000000"
+                ).resolve(strict=False),
+            )
+            if state is SessionState.COMPLETED
+            else None
+        )
         self.stop_confirmation_visible = False
         self.slow_finalization_visible = False
         self.tick_count = 0
@@ -96,21 +108,23 @@ class RecordingController:
             asr_status="Running" if self.state is SessionState.RECORDING else "Idle",
             asr_backlog_ms=0,
             maximum_asr_backlog_ms=0,
-            analysis_status="Running"
-            if self.state is SessionState.RECORDING
-            else "Idle",
+            analysis_status=(
+                "Running" if self.state is SessionState.RECORDING else "Idle"
+            ),
             latest_successful_save_at=datetime.fromisoformat(
                 "2026-08-19T12:05:00+09:00"
             ),
             fatal_error=None,
             stop_confirmation_visible=self.stop_confirmation_visible,
             slow_finalization_visible=self.slow_finalization_visible,
+            completion=self.completion,
         )
 
     def enter_preflight(self) -> None:
         self.state = SessionState.PREFLIGHT
         self.stop_confirmation_visible = False
         self.slow_finalization_visible = False
+        self.completion = None
         self.transcript = ()
 
     def refresh_preflight(self, selection: PreflightSelection) -> PreflightReport:
@@ -178,9 +192,11 @@ def ready_report(
         ),
         storage=StorageCheck(destination, 500 * 1024 * 1024, True, None),
         destination=destination,
-        issues=()
-        if can_start
-        else (BlockingIssue("storage", "At least 500 MB is required."),),
+        issues=(
+            ()
+            if can_start
+            else (BlockingIssue("storage", "At least 500 MB is required."),)
+        ),
         can_start=can_start,
     )
 
@@ -363,3 +379,62 @@ def test_start_another_returns_to_fresh_preflight(qtbot: QtBot) -> None:
     assert window.current_page() is window.preflight_page
     assert window.live_page.transcript_view.model.rowCount() == 0
     assert presenter.render_count >= 2
+
+
+def test_completion_renders_authoritative_summary_and_opens_session_dir(
+    qtbot: QtBot,
+) -> None:
+    presenter, window, controller = make_presenter(completed=True)
+    qtbot.addWidget(window)
+    opened: list[Path] = []
+    presenter.folder_opener = FakeFolderOpener(opened)
+    completion = controller.completion
+    assert completion is not None
+
+    assert window.completion_page.duration_value.text() == "30:00"
+    assert window.completion_page.transcript_count_value.text() == "1"
+    assert window.completion_page.path_value.text() == str(completion.save_path)
+
+    QTest.mouseClick(
+        window.completion_page.open_folder_button,
+        Qt.MouseButton.LeftButton,
+    )
+
+    assert opened == [completion.save_path]
+
+
+def test_completion_missing_summary_does_not_open_fallback_path(
+    qtbot: QtBot,
+) -> None:
+    presenter, window, controller = make_presenter(completed=True)
+    qtbot.addWidget(window)
+    opened: list[Path] = []
+    presenter.folder_opener = FakeFolderOpener(opened)
+    controller.completion = None
+
+    presenter.render_current_snapshot(force=True)
+    QTest.mouseClick(
+        window.completion_page.open_folder_button,
+        Qt.MouseButton.LeftButton,
+    )
+
+    assert window.current_page() is window.live_page
+    assert opened == []
+
+
+def test_orderly_close_stops_presenter_timer(qtbot: QtBot) -> None:
+    presenter, window, _ = make_presenter()
+    qtbot.addWidget(window)
+    assert presenter.timer.isActive() is True
+
+    window.close()
+
+    assert presenter.timer.isActive() is False
+
+
+class FakeFolderOpener:
+    def __init__(self, opened: list[Path]) -> None:
+        self.opened = opened
+
+    def open(self, path: Path) -> None:
+        self.opened.append(path)
