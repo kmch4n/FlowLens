@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QTest
 from pytestqt.qtbot import QtBot
 
@@ -141,6 +142,37 @@ def test_unavailable_saved_device_stays_unselected(qtbot: QtBot) -> None:
     assert page.loopback_combo.currentIndex() == -1
 
 
+def test_selecting_one_device_after_unavailable_restore_emits_none_for_other(
+    qtbot: QtBot,
+) -> None:
+    page = PreflightPage()
+    qtbot.addWidget(page)
+    report = ready_report()
+    unavailable = PreflightReport(
+        selection=PreflightSelection(SessionMode.GENERAL, "gone-mic", "gone-out"),
+        microphones=report.microphones,
+        loopbacks=report.loopbacks,
+        mic_level=0.0,
+        loopback_level=0.0,
+        models=report.models,
+        storage=report.storage,
+        destination=report.destination,
+        issues=(
+            BlockingIssue("microphone", "Select an available microphone."),
+            BlockingIssue(
+                "loopback", "Select a loopback-capable Windows output device."
+            ),
+        ),
+        can_start=False,
+    )
+    page.render(unavailable)
+
+    with qtbot.waitSignal(page.selection_changed, timeout=500) as blocker:
+        page.microphone_combo.setCurrentIndex(0)
+
+    assert blocker.args == [PreflightSelection(SessionMode.GENERAL, "mic-1", None)]
+
+
 def test_device_change_emits_complete_selection(qtbot: QtBot) -> None:
     page = PreflightPage()
     qtbot.addWidget(page)
@@ -163,6 +195,27 @@ def test_ctrl_enter_emits_start_only_when_valid(qtbot: QtBot) -> None:
     )
     with qtbot.assertNotEmitted(page.start_requested):
         QTest.keyClick(page, Qt.Key.Key_Enter, Qt.KeyboardModifier.ControlModifier)
+
+
+def test_ctrl_enter_auto_repeat_is_accepted_without_requesting_start(
+    qtbot: QtBot,
+) -> None:
+    page = PreflightPage()
+    qtbot.addWidget(page)
+    page.render(ready_report())
+    repeated_event = QKeyEvent(
+        QEvent.Type.KeyPress,
+        Qt.Key.Key_Enter,
+        Qt.KeyboardModifier.ControlModifier,
+        "",
+        True,
+        1,
+    )
+
+    with qtbot.assertNotEmitted(page.start_requested):
+        page.keyPressEvent(repeated_event)
+
+    assert repeated_event.isAccepted() is True
 
 
 def test_tab_order_reaches_mode_devices_and_start(qtbot: QtBot) -> None:

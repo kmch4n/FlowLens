@@ -115,6 +115,11 @@ class PreflightPage(QWidget):
                 report.loopbacks,
                 report.selection.loopback_output_id,
             )
+            self._selection = PreflightSelection(
+                report.selection.mode,
+                self._selected_device_id(self.microphone_combo),
+                self._selected_device_id(self.loopback_combo),
+            )
             self.mic_meter.set_level(report.mic_level)
             self.loopback_meter.set_level(report.loopback_level)
             self._render_readiness(report)
@@ -152,7 +157,7 @@ class PreflightPage(QWidget):
             event.key() == Qt.Key.Key_Enter
             and event.modifiers() == Qt.KeyboardModifier.ControlModifier
         ):
-            if self._can_start:
+            if self._can_start and not event.isAutoRepeat():
                 self.start_requested.emit()
             event.accept()
             return
