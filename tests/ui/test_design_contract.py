@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from pytestqt.qtbot import QtBot
@@ -64,6 +65,17 @@ def test_stylesheet_resolves_tokens_once_without_placeholders() -> None:
     assert "duration: 0ms" in stylesheet
     assert 'font-family: "IBM Plex Sans JP"' in stylesheet
     assert 'font-family: "IBM Plex Mono"' in stylesheet
+
+
+def test_qss_padding_shorthand_uses_four_pixel_spacing_grid() -> None:
+    stylesheet = build_stylesheet(DesignTokens.approved(), reduced_motion=True)
+    violations: list[str] = []
+    for match in re.finditer(r"padding:\s*([^;]+);", stylesheet):
+        declaration = match.group(0)
+        values = [int(value) for value in re.findall(r"(\d+)px", declaration)]
+        if any(value % 4 != 0 for value in values):
+            violations.append(declaration)
+    assert violations == []
 
 
 def test_bundled_fonts_load_expected_qt_family_names(qtbot: QtBot) -> None:

@@ -54,7 +54,7 @@ QLabel[uiState="success"] {{
 QPushButton[flowlensRole="stateful"] {{
     min-width: 44px;
     min-height: 44px;
-    padding: 8px 14px;
+    padding: 8px 16px;
     color: {primary_text};
     background-color: {surface};
     border: 2px solid {rule};
