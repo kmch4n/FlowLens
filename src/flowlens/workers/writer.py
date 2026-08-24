@@ -21,10 +21,16 @@ from flowlens.domain.messages import (
     WriterFatal,
     WriterFinalize,
     WriterFlush,
+    WriterForceCloseOutcome,
+    WriterForceCloseResult,
     WriterOpenSession,
     WriterShutdown,
 )
-from flowlens.persistence.session_writer import SessionWriter
+from flowlens.persistence.session_writer import PreparedFinalization, SessionWriter
+from flowlens.workers.finalization_gate import (
+    WriterFinalizationGate,
+    WriterTerminalClaim,
+)
 
 _AUDIO_BATCH_LIMIT = 64
 _QUEUE_TIMEOUT_SECONDS = 0.1
@@ -90,6 +96,7 @@ class _WriterWorker:
         audio_queue: Queue[object],
         response_queue: Queue[object],
         stop_event: Event,
+        finalization_gate: WriterFinalizationGate | None,
         *,
         open_session: Callable[[WriterOpenSession], SessionWriter],
     ) -> None:
@@ -97,6 +104,7 @@ class _WriterWorker:
         self._audio_queue = audio_queue
         self._response_queue = response_queue
         self._stop_event = stop_event
+        self._finalization_gate = finalization_gate
         self._open_session = open_session
         self._expected_control_sequence = 1
         self._writer: SessionWriter | None = None
@@ -114,6 +122,7 @@ class _WriterWorker:
         self._cleanup_attempted = False
         self._finalized = False
         self._exiting = False
+        self._force_close_processed = False
 
     def run(self) -> None:
         """Run until shutdown, lifecycle stop, or a fail-closed exception."""
@@ -143,6 +152,8 @@ class _WriterWorker:
         while not self._exiting:
             if self._lifecycle_exit_requested():
                 self._close_incomplete_once()
+                return
+            if self._process_force_close_if_requested():
                 return
 
             self._raise_if_pending_transcript_timed_out()
@@ -325,7 +336,8 @@ class _WriterWorker:
             self._open(envelope)
         else:
             self._mutate(envelope)
-        self._emit_ack(envelope.sequence)
+        if not self._force_close_processed:
+            self._emit_ack(envelope.sequence)
         self._failed_sequence = 0
 
     def _validate_control_metadata(
@@ -417,8 +429,14 @@ class _WriterWorker:
         elif isinstance(payload, WriterFlush):
             writer.force_sync()
         elif isinstance(payload, WriterFinalize):
-            writer.finalize(payload)
-            self._finalized = True
+            gate = self._finalization_gate
+            if gate is None:
+                writer.finalize(payload)
+                self._finalized = True
+            else:
+                prepared = writer.prepare_finalize(payload)
+                claim = gate.claim_terminal(payload.completion_event)
+                self._commit_terminal_claim(claim, prepared=prepared)
         elif isinstance(payload, WriterShutdown):
             self._close_incomplete_once()
             self._exiting = True
@@ -455,8 +473,8 @@ class _WriterWorker:
     def _response_envelope(
         self,
         message_type: MessageType,
-        payload: WriterAck | WriterFatal,
-    ) -> MessageEnvelope[WriterAck | WriterFatal]:
+        payload: WriterAck | WriterFatal | WriterForceCloseResult,
+    ) -> MessageEnvelope[WriterAck | WriterFatal | WriterForceCloseResult]:
         self._response_sequence += 1
         return MessageEnvelope(
             schema_version=1,
@@ -467,6 +485,47 @@ class _WriterWorker:
             created_monotonic_ms=int(_monotonic() * 1_000),
             payload=payload,
         )
+
+    def _process_force_close_if_requested(self) -> bool:
+        gate = self._finalization_gate
+        if gate is None:
+            return False
+        claim = gate.claim_force_if_requested()
+        if claim is None:
+            return False
+        self._commit_terminal_claim(claim)
+        return True
+
+    def _commit_terminal_claim(
+        self,
+        claim: WriterTerminalClaim,
+        *,
+        prepared: PreparedFinalization | None = None,
+    ) -> None:
+        gate = self._finalization_gate
+        if gate is None:
+            raise RuntimeError("terminal claim requires a finalization gate")
+        writer = self._require_open_writer()
+        if claim.outcome is WriterForceCloseOutcome.INCOMPLETE:
+            writer.commit_force_close(claim.event)
+            self._cleanup_attempted = True
+            self._exiting = True
+            self._force_close_processed = True
+        else:
+            if type(prepared) is not PreparedFinalization:
+                raise RuntimeError("completion claim requires prepared finalization")
+            writer.commit_finalize(prepared)
+            self._finalized = True
+        latest_save = _wall_clock()
+        self._latest_successful_save_at = latest_save
+        result = gate.publish_result(claim.outcome, latest_save)
+        if claim.force_was_requested:
+            self._response_queue.put(
+                self._response_envelope(
+                    MessageType.WRITER_FORCE_CLOSE_RESULT,
+                    result,
+                )
+            )
 
     def _report_fatal(self, error: BaseException) -> None:
         self._close_incomplete_once(error)
@@ -533,6 +592,7 @@ def run_writer_worker(
     audio_queue: Queue[object],
     response_queue: Queue[object],
     stop_event: Event,
+    finalization_gate: WriterFinalizationGate | None = None,
 ) -> None:
     """Run the spawn-safe Writer process entry point."""
 
@@ -541,6 +601,7 @@ def run_writer_worker(
         audio_queue,
         response_queue,
         stop_event,
+        finalization_gate,
         open_session=_open_session,
     )
     worker.run()

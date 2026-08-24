@@ -45,6 +45,14 @@ _OWNED_RESOURCE_NAMES = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedFinalization:
+    """Validated finalization documents ready for one terminal commit."""
+
+    command: WriterFinalize
+    completed_manifest: SessionManifest
+
+
 class PersistenceInvariantError(ValueError):
     """Raised before a write when a session persistence invariant is violated."""
 
@@ -464,10 +472,33 @@ class SessionWriter:
     def finalize(self, command: WriterFinalize) -> SessionManifest:
         """Publish completed metadata only after every owned handle is durable."""
 
+        prepared = self.prepare_finalize(command)
+        return self.commit_finalize(prepared)
+
+    def prepare_finalize(self, command: WriterFinalize) -> PreparedFinalization:
+        """Validate and flush mutable artifacts before terminal linearization."""
+
         self._ensure_mutable()
         command = self._canonical_finalize_command(command)
         completed_manifest = self._build_completed_manifest(command)
         self._preflight_finalization_documents(command, completed_manifest)
+        try:
+            self._sync_all()
+        except BaseException as primary_error:
+            self._fail_closed(primary_error)
+            raise
+        return PreparedFinalization(command, completed_manifest)
+
+    def commit_finalize(self, prepared: PreparedFinalization) -> SessionManifest:
+        """Commit the already-prepared completed terminal outcome."""
+
+        self._ensure_mutable()
+        if type(prepared) is not PreparedFinalization:
+            raise PersistenceInvariantError(
+                "prepared must be an exact PreparedFinalization"
+            )
+        command = prepared.command
+        completed_manifest = prepared.completed_manifest
         try:
             self._append_completion_event(command.completion_event)
             self._sync_jsonl()
@@ -482,6 +513,19 @@ class SessionWriter:
         self._state = _WriterState.CLOSED
         self._resources_closed = True
         return completed_manifest
+
+    def commit_force_close(self, event: EventRecord) -> None:
+        """Persist the force terminal candidate and close incomplete."""
+
+        self._ensure_mutable()
+        event = self._canonical_event_record(event)
+        if event.event_type is not EventType.FORCE_CLOSE_REQUESTED:
+            raise PersistenceInvariantError(
+                "force-close event type must be FORCE_CLOSE_REQUESTED"
+            )
+        self.append_event(event)
+        self.force_sync()
+        self.close_incomplete()
 
     def close_incomplete(self) -> None:
         """Synchronize and close all resources without changing the manifest."""

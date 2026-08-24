@@ -861,6 +861,17 @@ header finalization, final state write, completed event, and the final
 sequence and enters `COMPLETED` only after a `WriterAck.acknowledged_sequence`
 matches it; only then does the UI show completion.
 
+Force close uses a typed `WriterForceCloseRequest` stored synchronously in a
+small spawn-safe shared-memory gate, separate from command queues and the
+parent-death/general lifecycle stop event. Completion and force use the same
+next event sequence and the Writer consumes it only after selecting one winner.
+Finalization validation and flush preparation remain outside the lock; the gate
+lock covers only the short terminal claim. The Writer publishes the shared
+result only after the selected terminal commit is durable. Queue result loss is
+resolved from shared state; a bounded request lock, five-second result deadline,
+and Writer health check prevent an infinite or falsely classified shutdown. No
+FIFO append or flush command is sent after `WriterFinalize`.
+
 - [ ] **Step 4: Write slow-finalization and force-close tests**
 
 ```python
@@ -876,15 +887,12 @@ def test_thirty_seconds_only_offers_choices_and_never_force_closes() -> None:
 
 
 def test_force_close_flushes_incomplete_session_without_completed_mutation() -> None:
-    coordinator = make_finalizer()
+    coordinator, transport = make_finalizer()
     coordinator.begin(now_ms=0)
-    commands = coordinator.force_close(now=NOW)
-    assert [type(command.payload) for command in commands] == [
-        WriterAppendEvent,
-        WriterFlush,
-        WriterShutdown,
-    ]
-    assert all(not isinstance(command.payload, WriterFinalize) for command in commands)
+    writer_commands_before = transport.writer_commands
+    request = coordinator.force_close(now_ms=1_000)
+    assert request is transport.shared_force_request
+    assert transport.writer_commands == writer_commands_before
 ```
 
 - [ ] **Step 5: Connect stop confirmation and window close to one path**

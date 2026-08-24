@@ -43,6 +43,8 @@ from flowlens.domain.messages import (
     TranscriptCommitted,
     WriterAck,
     WriterAppendEvent,
+    WriterForceCloseRequest,
+    WriterForceCloseResult,
     WriterOpenSession,
 )
 from tests.factories import make_discussion_state, make_manifest, make_transcript_record
@@ -79,6 +81,8 @@ class FakeRuntime:
         self.polled: tuple[MessageEnvelope[object], ...] = ()
         self.restarted: list[ProcessSource] = []
         self.shutdown_count = 0
+        self.force_close_requests: list[WriterForceCloseRequest] = []
+        self.force_close_result_value: WriterForceCloseResult | None = None
         self.health_values: dict[ProcessSource, bool] = {
             source: True for source in ProcessSource if source is not ProcessSource.GUI
         }
@@ -107,6 +111,18 @@ class FakeRuntime:
     def shutdown(self) -> object:
         self.shutdown_count += 1
         return None
+
+    def request_writer_force_close(
+        self,
+        request: WriterForceCloseRequest,
+        timeout_seconds: float,
+    ) -> WriterForceCloseResult | None:
+        assert timeout_seconds == 0.25
+        self.force_close_requests.append(request)
+        return self.force_close_result_value
+
+    def writer_force_close_result(self) -> WriterForceCloseResult | None:
+        return self.force_close_result_value
 
 
 class FakeAnnouncer:
@@ -896,7 +912,7 @@ def test_stopping_health_ignores_only_workers_with_drain_ack(
     assert runtime.shutdown_count == 0
 
 
-@pytest.mark.parametrize("worker", list(_START_WORKERS))
+@pytest.mark.parametrize("worker", [ProcessSource.ASR, ProcessSource.DISCUSSION])
 def test_unsolicited_stopped_payload_does_not_mask_health_failure(
     tmp_path: Path,
     worker: ProcessSource,
@@ -910,10 +926,9 @@ def test_unsolicited_stopped_payload_does_not_mask_health_failure(
 
     controller.tick()
 
-    if worker is ProcessSource.AUDIO:
-        assert runtime.shutdown_count == 1
-    else:
-        assert runtime.restarted == [worker]
+    assert controller.state is SessionState.ERROR
+    assert runtime.restarted == []
+    assert runtime.shutdown_count == 1
 
 
 def test_stopping_still_treats_writer_failure_as_fatal(tmp_path: Path) -> None:

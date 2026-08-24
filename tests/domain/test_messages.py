@@ -35,6 +35,9 @@ from flowlens.domain.messages import (
     WriterFatal,
     WriterFinalize,
     WriterFlush,
+    WriterForceCloseOutcome,
+    WriterForceCloseRequest,
+    WriterForceCloseResult,
     WriterOpenSession,
     WriterShutdown,
 )
@@ -676,6 +679,21 @@ def test_writer_fatal_accepts_zero_for_non_control_failures() -> None:
     fatal = WriterFatal(0, "OSError", "audio write failed")
 
     assert fatal.failed_sequence == 0
+
+
+def test_force_close_contracts_are_strict_and_spawn_picklable() -> None:
+    event = replace(
+        make_event_record(),
+        event_type=EventType.FORCE_CLOSE_REQUESTED,
+    )
+    request = WriterForceCloseRequest(event)
+    result = WriterForceCloseResult(WriterForceCloseOutcome.INCOMPLETE, NOW)
+
+    assert pickle.loads(pickle.dumps((request, result))) == (request, result)
+    with pytest.raises(ValueError, match="force close"):
+        WriterForceCloseRequest(make_event_record())
+    with pytest.raises(ValueError, match="outcome"):
+        WriterForceCloseResult(cast(WriterForceCloseOutcome, "INCOMPLETE"), NOW)
 
 
 @pytest.mark.parametrize(

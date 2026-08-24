@@ -411,6 +411,9 @@ def test_finalize_marks_completed_after_resources_are_durable_and_closed(
 
     assert result.status is SessionStatus.COMPLETED
     assert order == [
+        "sync-transcript.jsonl",
+        "sync-state-history.jsonl",
+        "sync-events.jsonl",
         "completion-event",
         "sync-transcript.jsonl",
         "sync-state-history.jsonl",

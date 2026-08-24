@@ -481,6 +481,48 @@ class WriterShutdown:
     """Writer command that exits after prior work has drained."""
 
 
+class WriterForceCloseOutcome(str, Enum):
+    """Writer-owned result of the force-close/finalize linearization race."""
+
+    INCOMPLETE = "INCOMPLETE"
+    COMPLETED = "COMPLETED"
+
+
+@dataclass(frozen=True, slots=True)
+class WriterForceCloseRequest:
+    """Out-of-band request carrying metadata-only incomplete evidence."""
+
+    event: EventRecord
+
+    def __post_init__(self) -> None:
+        if type(self.event) is not EventRecord:
+            raise ContractValidationError("event must be an exact EventRecord")
+        if self.event.event_type is not EventType.FORCE_CLOSE_REQUESTED:
+            raise ContractValidationError("event must record force close")
+
+
+@dataclass(frozen=True, slots=True)
+class WriterForceCloseResult:
+    """Writer-owned force-close result emitted after durable linearization."""
+
+    outcome: WriterForceCloseOutcome
+    latest_successful_save_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not WriterForceCloseOutcome:
+            raise ContractValidationError(
+                "outcome must be an exact WriterForceCloseOutcome"
+            )
+        object.__setattr__(
+            self,
+            "latest_successful_save_at",
+            _normalize_aware_datetime(
+                self.latest_successful_save_at,
+                "latest_successful_save_at",
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class WriterAck:
     """Writer response acknowledging a successful control mutation."""

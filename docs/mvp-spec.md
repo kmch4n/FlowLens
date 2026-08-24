@@ -450,6 +450,22 @@ session as `incomplete` for recovery on the next launch.
 Closing the application during an active or paused session uses the same stop
 confirmation and finalization path.
 
+`SESSION_COMPLETED` and `FORCE_CLOSE_REQUESTED` use the same next event sequence
+as competing terminal candidates. The sequence is consumed exactly once after
+the Writer selects and durably publishes the winner. A small synchronous shared
+gate, separate from queues and the parent-death stop event, holds force intent
+and the terminal outcome. Validation and ordinary flushes happen before the
+gate; only the short winner-selection point is locked.
+
+If the force-close request reaches that point first, the Writer appends its
+metadata-only terminal event, flushes it, closes the session as `incomplete`,
+and publishes that outcome. If completion wins, no force event is persisted and
+the Writer publishes `completed` only after its durable completion commit. The
+controller uses bounded lock acquisition and a five-second result deadline. On
+a lost response it inspects the shared result; if the Writer dies or the result
+remains unknown, it performs bounded shutdown and reports an error, never a
+false `incomplete` or `completed` outcome.
+
 ## 14. Completion Screen
 
 The completion screen shows:

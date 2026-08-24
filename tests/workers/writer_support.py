@@ -25,7 +25,7 @@ from flowlens.domain.messages import (
     WriterShutdown,
 )
 from flowlens.domain.session import SessionManifest
-from flowlens.persistence.session_writer import SessionWriter
+from flowlens.persistence.session_writer import PreparedFinalization, SessionWriter
 from flowlens.workers import writer as writer_module
 from tests.factories import (
     make_discussion_state,
@@ -94,6 +94,21 @@ class _FakeSessionWriter:
         del command
         self.operations.append(("finalize", 0))
         return make_manifest()
+
+    def prepare_finalize(self, command: WriterFinalize) -> PreparedFinalization:
+        self.operations.append(("prepare_finalize", 0))
+        return PreparedFinalization(command, make_manifest())
+
+    def commit_finalize(self, prepared: PreparedFinalization) -> SessionManifest:
+        del prepared
+        self.operations.append(("finalize", 0))
+        return make_manifest()
+
+    def commit_force_close(self, event: EventRecord) -> None:
+        self.operations.append(("event", event.sequence))
+        self.operations.append(("force_sync", 0))
+        self.close_calls += 1
+        self.operations.append(("close", self.close_calls))
 
     def close_incomplete(self) -> None:
         self.close_calls += 1

@@ -84,5 +84,6 @@ def test_message_type_wire_values_are_spec_values() -> None:
         "WRITER_FINALIZE",
         "WRITER_SHUTDOWN",
         "WRITER_ACK",
+        "WRITER_FORCE_CLOSE_RESULT",
         "WRITER_FATAL",
     ]

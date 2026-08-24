@@ -7,7 +7,11 @@ from typing import Protocol, runtime_checkable
 
 from flowlens.controller.models import DeviceOption, ModelCheck, StorageCheck
 from flowlens.domain.enums import AudioSource, ProcessSource
-from flowlens.domain.messages import MessageEnvelope
+from flowlens.domain.messages import (
+    MessageEnvelope,
+    WriterForceCloseRequest,
+    WriterForceCloseResult,
+)
 
 
 @runtime_checkable
@@ -51,6 +55,14 @@ class WorkerRuntime(Protocol):
     def health(self) -> Mapping[ProcessSource, bool]: ...
 
     def shutdown(self) -> object: ...
+
+    def request_writer_force_close(
+        self,
+        request: WriterForceCloseRequest,
+        timeout_seconds: float,
+    ) -> WriterForceCloseResult | None: ...
+
+    def writer_force_close_result(self) -> WriterForceCloseResult | None: ...
 
 
 @runtime_checkable

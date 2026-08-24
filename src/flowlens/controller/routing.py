@@ -18,6 +18,7 @@ from flowlens.domain.messages import (
     TranscriptRecord,
     WriterAck,
     WriterFatal,
+    WriterForceCloseResult,
 )
 
 
@@ -283,6 +284,11 @@ def _validate_writer_payload(message_type: MessageType, payload: object) -> obje
     if message_type is MessageType.WRITER_ACK and isinstance(payload, WriterAck):
         return payload
     if message_type is MessageType.WRITER_FATAL and isinstance(payload, WriterFatal):
+        return payload
+    if (
+        message_type is MessageType.WRITER_FORCE_CLOSE_RESULT
+        and type(payload) is WriterForceCloseResult
+    ):
         return payload
     raise PayloadValidationError("Writer payload is invalid")
 

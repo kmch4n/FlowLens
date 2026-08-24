@@ -9,6 +9,7 @@ from typing import Any, Protocol, cast
 
 from flowlens.asr.types import AsrWorkerConfig, PartialTranscript
 from flowlens.audio.types import AudioWorkerConfig
+from flowlens.controller.finalization import FinalizationCoordinator
 from flowlens.controller.models import PreflightReport, PreflightSelection
 from flowlens.controller.ports import AccessibilityAnnouncer, Clock, WorkerRuntime
 from flowlens.controller.routing import (
@@ -40,9 +41,13 @@ from flowlens.domain.messages import (
     WriterAck,
     WriterAppendEvent,
     WriterFatal,
+    WriterFinalize,
+    WriterForceCloseOutcome,
+    WriterForceCloseRequest,
+    WriterForceCloseResult,
     WriterOpenSession,
 )
-from flowlens.domain.session import SessionManifest
+from flowlens.domain.session import PauseInterval, SessionManifest
 
 READINESS_TIMEOUT_MS = 60_000
 _START_WORKERS = (
@@ -206,6 +211,7 @@ class SessionController:
         self._ready: set[ProcessSource] = set()
         self._early_ready: set[ProcessSource] = set()
         self._event_sequence = 0
+        self._terminal_event_consumed = False
         self._analysis_paused_for_lag = False
         self._analysis_disabled = False
         self._announced: set[tuple[str, str]] = set()
@@ -214,6 +220,11 @@ class SessionController:
         self._drained_workers: set[ProcessSource] = set()
         self._source_connected = {source: True for source in AudioSource}
         self._source_transition_generation = {source: 0 for source in AudioSource}
+        self._finalization: FinalizationCoordinator | None = None
+        self._pause_started_ms: int | None = None
+        self._pause_intervals: list[PauseInterval] = []
+        self._stop_confirmed_ms: int | None = None
+        self._stop_confirmed_at: datetime | None = None
 
     @property
     def state(self) -> SessionState:
@@ -309,11 +320,17 @@ class SessionController:
         self._ready = set()
         self._early_ready = set()
         self._event_sequence = 0
+        self._terminal_event_consumed = False
         self._analysis_paused_for_lag = False
         self._analysis_disabled = False
         self._drained_workers.clear()
         self._source_connected = {source: True for source in AudioSource}
         self._source_transition_generation = {source: 0 for source in AudioSource}
+        self._finalization = None
+        self._pause_started_ms = None
+        self._pause_intervals = []
+        self._stop_confirmed_ms = None
+        self._stop_confirmed_at = None
         self._set_state(
             SessionState.STARTING,
             preflight=checked,
@@ -331,6 +348,7 @@ class SessionController:
         """Synchronously show paused and stop all live producers."""
 
         self._require_state("PAUSED", {SessionState.RECORDING})
+        paused_ms = self._read_clock()
         before = self._analysis_pause_reasons()
         after = self._analysis_pause_reasons(state=SessionState.PAUSED)
         targets = [ProcessSource.AUDIO, ProcessSource.ASR]
@@ -343,12 +361,14 @@ class SessionController:
             recording_status="Paused",
             analysis_status=self._analysis_status(after),
         )
+        self._pause_started_ms = paused_ms
         self._persist_operational(EventType.PAUSE_START, ProcessSource.GUI, {})
 
     def resume(self) -> None:
         """Synchronously show recording and resume all live producers."""
 
         self._require_state("RECORDING", {SessionState.PAUSED})
+        resumed_ms = self._read_clock()
         before = self._analysis_pause_reasons()
         after = self._analysis_pause_reasons(state=SessionState.RECORDING)
         targets = [ProcessSource.AUDIO, ProcessSource.ASR]
@@ -361,6 +381,7 @@ class SessionController:
             recording_status="Recording",
             analysis_status=self._analysis_status(after),
         )
+        self._close_pause_interval(resumed_ms)
         self._persist_operational(EventType.PAUSE_END, ProcessSource.GUI, {})
 
     def request_stop(self) -> None:
@@ -386,12 +407,38 @@ class SessionController:
     def confirm_stop(self) -> None:
         """Enter the Task 7 finalization seam."""
 
+        if self._state is SessionState.STOPPING and self._finalization is not None:
+            return
         self._require_state(
             "STOPPING",
             {SessionState.RECORDING, SessionState.PAUSED},
         )
         if not self._snapshot.stop_confirmation_visible:
             raise InvalidTransition(f"{self._state.value} -> STOPPING")
+        if self._finalization is not None:
+            return
+        try:
+            now_ms = self._read_clock()
+            now = self._clock.now()
+            if not isinstance(now, datetime) or now.utcoffset() is None:
+                raise ValueError("clock now must be timezone-aware")
+            coordinator = FinalizationCoordinator(
+                session_id=self._require_launch().session_id,
+                send=self._send,
+                writer_finalize_factory=self._build_writer_finalize,
+                force_close_event_factory=self._build_force_close_event,
+                acknowledge_expected_stop=self.acknowledge_expected_stop,
+                request_writer_force_close=self._request_writer_force_close,
+                shutdown=self._bounded_shutdown,
+            )
+            coordinator.begin(now_ms)
+        except Exception:
+            self._fatal_runtime("Worker runtime became unavailable.")
+            return
+        self._finalization = coordinator
+        self._stop_confirmed_ms = now_ms
+        self._stop_confirmed_at = now
+        self._close_pause_interval(now_ms)
         self._set_state(
             SessionState.STOPPING,
             recording_status="Finalizing",
@@ -402,6 +449,9 @@ class SessionController:
         """Hide Task 7's slow-finalization message."""
 
         self._require_state("STOPPING", {SessionState.STOPPING})
+        if self._finalization is None:
+            raise InvalidTransition("STOPPING -> KEEP_WAITING")
+        self._finalization.keep_waiting()
         self._snapshot = replace(self._snapshot, slow_finalization_visible=False)
 
     def acknowledge_expected_stop(self, worker: ProcessSource) -> None:
@@ -416,11 +466,25 @@ class SessionController:
         """Provide Task 7's explicit incomplete-shutdown seam."""
 
         self._require_state("ERROR", {SessionState.STOPPING})
-        self._bounded_shutdown()
-        self._set_state(
-            SessionState.ERROR,
-            recording_status="Incomplete",
-            fatal_error="Session was force closed and remains incomplete.",
+        if self._finalization is None:
+            raise InvalidTransition("STOPPING -> FORCE_CLOSE")
+        try:
+            self._finalization.force_close(self._read_clock())
+        except Exception:
+            self._fatal_runtime("Worker runtime became unavailable.")
+            return
+        finalization_snapshot = self._finalization.snapshot()
+        if finalization_snapshot.incomplete or finalization_snapshot.completed:
+            result = self._runtime.writer_force_close_result()
+            if result is None:
+                self._fatal_runtime("Writer force-close outcome could not be resolved.")
+                return
+            self._apply_force_close_result(result)
+            return
+        self._snapshot = replace(
+            self._snapshot,
+            recording_status="Resolving force close",
+            slow_finalization_visible=False,
         )
 
     def persist_event(self, record: EventRecord) -> None:
@@ -443,6 +507,15 @@ class SessionController:
 
         if self._launch is None or self._sequence_tracker is None:
             return
+        if self._is_finalization_ack(envelope):
+            finalization = self._finalization
+            tracker = self._sequence_tracker
+            if (
+                finalization is None
+                or not finalization.accepts(envelope)
+                or envelope.sequence != tracker.expected(envelope.source)
+            ):
+                return
         try:
             payload = validate_worker_payload(envelope)
         except Exception:
@@ -477,7 +550,10 @@ class SessionController:
     def handle_worker_exit(self, worker: ProcessSource) -> None:
         """Apply one supervisor decision and announce it once."""
 
-        if self._state is SessionState.STOPPING and worker in self._drained_workers:
+        if self._state is SessionState.STOPPING:
+            if worker in self._drained_workers:
+                return
+            self._fatal_runtime("Worker exited during finalization.")
             return
         supervisor = self._require_supervisor()
         self._apply_recovery(supervisor.on_exit(worker))
@@ -535,6 +611,12 @@ class SessionController:
             SessionState.STOPPING,
         }:
             return
+        if (
+            self._state is SessionState.STOPPING
+            and self._finalization is not None
+            and self._finalization.snapshot().incomplete
+        ):
+            return
         try:
             now_ms = self._read_clock()
         except Exception:
@@ -555,13 +637,55 @@ class SessionController:
                 raise ValueError("runtime poll contract")
             for envelope in incoming:
                 self.handle_message(envelope)
-            if self._state is SessionState.ERROR:
+            if self._state in {SessionState.COMPLETED, SessionState.ERROR}:
                 return
+            if self._state is SessionState.STOPPING and self._finalization is not None:
+                if self._finalization.snapshot().incomplete:
+                    return
+                finalization_tick = self._finalization.tick(now_ms)
+                if finalization_tick.show_slow_message:
+                    self._snapshot = replace(
+                        self._snapshot,
+                        slow_finalization_visible=True,
+                    )
+                if self._finalization.snapshot().force_requested:
+                    result = self._runtime.writer_force_close_result()
+                    if result is not None:
+                        self._apply_force_close_result(result)
+                        return
+                    health = self._runtime.health()
+                    if not isinstance(health, Mapping):
+                        raise ValueError("runtime health contract")
+                    writer_alive = health.get(ProcessSource.WRITER)
+                    if (
+                        writer_alive is not True
+                        or finalization_tick.force_result_timed_out
+                    ):
+                        result = self._runtime.writer_force_close_result()
+                        if result is not None:
+                            self._apply_force_close_result(result)
+                        else:
+                            self._fatal_runtime(
+                                "Writer force-close outcome could not be resolved."
+                            )
+                    return
             supervisor = self._require_supervisor()
             if supervisor.health_poll_due(now_ms):
                 health = self._runtime.health()
                 if not isinstance(health, Mapping):
                     raise ValueError("runtime health contract")
+                if self._state is SessionState.STOPPING and any(
+                    health.get(worker) is False
+                    for worker in (
+                        ProcessSource.AUDIO,
+                        ProcessSource.ASR,
+                        ProcessSource.DISCUSSION,
+                        ProcessSource.WRITER,
+                    )
+                    if worker not in self._drained_workers
+                ):
+                    self._fatal_runtime("Worker exited during finalization.")
+                    return
                 effective_health = dict(health)
                 if self._state is SessionState.STOPPING:
                     for worker in self._drained_workers:
@@ -575,6 +699,38 @@ class SessionController:
 
     def _route(self, envelope: MessageEnvelope[object], payload: object) -> None:
         message_type = envelope.message_type
+        if self._is_finalization_ack(envelope):
+            finalization = self._finalization
+            if finalization is None:
+                return
+            was_terminal = finalization.completed or finalization.snapshot().incomplete
+            finalization.acknowledge(envelope)
+            finalization_snapshot = finalization.snapshot()
+            if not was_terminal and (
+                finalization_snapshot.incomplete or finalization_snapshot.completed
+            ):
+                self._consume_terminal_event_sequence()
+            if finalization_snapshot.incomplete:
+                if isinstance(payload, WriterForceCloseResult):
+                    self._snapshot = replace(
+                        self._snapshot,
+                        latest_successful_save_at=payload.latest_successful_save_at,
+                        recording_status="Incomplete",
+                        slow_finalization_visible=False,
+                    )
+                return
+            if finalization.completed:
+                if isinstance(payload, WriterAck | WriterForceCloseResult):
+                    self._snapshot = replace(
+                        self._snapshot,
+                        latest_successful_save_at=payload.latest_successful_save_at,
+                    )
+                self._set_state(
+                    SessionState.COMPLETED,
+                    recording_status="Completed",
+                    slow_finalization_visible=False,
+                )
+            return
         if message_type is MessageType.WRITER_ACK and isinstance(payload, WriterAck):
             self._writer_ack(payload)
             return
@@ -947,6 +1103,124 @@ class SessionController:
                 recording_status="Finalizing",
             )
         self._bounded_shutdown()
+
+    def _is_finalization_ack(self, envelope: MessageEnvelope[object]) -> bool:
+        return (
+            self._state is SessionState.STOPPING
+            and self._finalization is not None
+            and envelope.message_type
+            in {
+                MessageType.WORKER_STOPPED,
+                MessageType.WRITER_ACK,
+                MessageType.WRITER_FORCE_CLOSE_RESULT,
+            }
+        )
+
+    def _request_writer_force_close(
+        self,
+        request: WriterForceCloseRequest,
+        timeout_seconds: float,
+    ) -> WriterForceCloseResult | None:
+        if type(request) is not WriterForceCloseRequest:
+            raise TypeError("request must be an exact WriterForceCloseRequest")
+        return self._runtime.request_writer_force_close(request, timeout_seconds)
+
+    def _apply_force_close_result(self, result: WriterForceCloseResult) -> None:
+        finalization = self._finalization
+        if finalization is None:
+            raise RuntimeError("finalization is unavailable")
+        was_terminal = finalization.completed or finalization.snapshot().incomplete
+        finalization.resolve_force_result(result)
+        if not was_terminal:
+            self._consume_terminal_event_sequence()
+        self._snapshot = replace(
+            self._snapshot,
+            latest_successful_save_at=result.latest_successful_save_at,
+            recording_status=(
+                "Incomplete"
+                if result.outcome is WriterForceCloseOutcome.INCOMPLETE
+                else "Completed"
+            ),
+            slow_finalization_visible=False,
+        )
+        if result.outcome is WriterForceCloseOutcome.COMPLETED:
+            self._set_state(SessionState.COMPLETED)
+
+    def _consume_terminal_event_sequence(self) -> None:
+        if self._terminal_event_consumed:
+            return
+        self._event_sequence += 1
+        self._terminal_event_consumed = True
+
+    def _build_writer_finalize(self) -> WriterFinalize:
+        launch = self._require_launch()
+        now_ms = self._stop_confirmed_ms
+        ended_at = self._stop_confirmed_at
+        if now_ms is None or ended_at is None:
+            raise RuntimeError("stop confirmation time is unavailable")
+        started_ms = self._started_ms
+        if started_ms is None:
+            raise RuntimeError("session start time is unavailable")
+        elapsed_ms = now_ms - started_ms
+        paused_ms = sum(
+            interval.ended_ms - interval.started_ms
+            for interval in self._pause_intervals
+        )
+        final_state = self._snapshot.discussion_state
+        if final_state is None:
+            raise RuntimeError("final discussion state is unavailable")
+        completion_event = EventRecord(
+            schema_version=1,
+            session_id=launch.session_id,
+            sequence=self._event_sequence + 1,
+            event_type=EventType.SESSION_COMPLETED,
+            source=ProcessSource.GUI,
+            session_time_ms=elapsed_ms,
+            created_at=ended_at,
+            details={},
+        )
+        return WriterFinalize(
+            ended_at=ended_at,
+            active_duration_ms=max(0, elapsed_ms - paused_ms),
+            pause_intervals=tuple(self._pause_intervals),
+            final_state=final_state,
+            completion_event=completion_event,
+        )
+
+    def _build_force_close_event(self) -> EventRecord:
+        launch = self._require_launch()
+        now_ms = self._read_clock()
+        now = self._clock.now()
+        if not isinstance(now, datetime) or now.utcoffset() is None:
+            raise ValueError("clock now must be timezone-aware")
+        started_ms = self._started_ms
+        if started_ms is None:
+            raise RuntimeError("session start time is unavailable")
+        finalization = self._finalization
+        if finalization is None:
+            raise RuntimeError("finalization is unavailable")
+        return EventRecord(
+            schema_version=1,
+            session_id=launch.session_id,
+            sequence=self._event_sequence + 1,
+            event_type=EventType.FORCE_CLOSE_REQUESTED,
+            source=ProcessSource.GUI,
+            session_time_ms=now_ms - started_ms,
+            created_at=now,
+            details={"finalization_step": finalization.step.value},
+        )
+
+    def _close_pause_interval(self, now_ms: int) -> None:
+        pause_started = self._pause_started_ms
+        if pause_started is None:
+            return
+        started_ms = self._started_ms
+        if started_ms is None:
+            raise RuntimeError("session start time is unavailable")
+        self._pause_intervals.append(
+            PauseInterval(pause_started - started_ms, now_ms - started_ms)
+        )
+        self._pause_started_ms = None
 
     def _fatal_storage(self) -> None:
         self._snapshot = replace(
