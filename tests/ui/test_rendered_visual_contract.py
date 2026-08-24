@@ -3,8 +3,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import QPropertyAnimation
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsOpacityEffect, QWidget
 from pytestqt.qtbot import QtBot
 
 from flowlens.controller.models import (
@@ -19,6 +20,7 @@ from flowlens.domain.discussion import DiscussionState
 from flowlens.domain.enums import SessionMode
 from flowlens.ui.completion_page import CompletionPage, CompletionSummary
 from flowlens.ui.design import DesignTokens, build_stylesheet
+from flowlens.ui.discussion_panel import DiscussionPanel, labels_for
 from flowlens.ui.live_page import LivePage
 from flowlens.ui.preflight_page import PreflightPage
 
@@ -141,3 +143,25 @@ def test_live_page_size_boundaries_remain_operable(qtbot: QtBot) -> None:
         assert page.minimumHeight() <= 600
         assert page.main_splitter.sizes()
         assert page.narrow_scroll_area.horizontalScrollBar().maximum() == 0
+
+
+def test_discussion_opacity_animation_lifetime_stays_bounded(qtbot: QtBot) -> None:
+    panel = DiscussionPanel()
+    qtbot.addWidget(panel)
+    now = datetime.fromisoformat("2026-08-19T12:35:02+09:00")
+
+    for index in range(6):
+        state = DiscussionState(
+            revision=index,
+            mode=SessionMode.MEETING,
+            current_focus=f"Focus {index}",
+            key_points=(f"Point {index}",),
+            confirmed_outcomes=(f"Decision {index}",),
+            follow_up_items=(f"Open {index}",),
+            updated_at=now,
+        )
+        panel.render(state, labels_for(SessionMode.MEETING))
+        qtbot.wait(140)
+
+    assert len(panel.findChildren(QGraphicsOpacityEffect)) <= 4
+    assert len(panel.findChildren(QPropertyAnimation)) <= 4

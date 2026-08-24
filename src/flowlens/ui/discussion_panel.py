@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QPropertyAnimation
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -42,7 +42,7 @@ def labels_for(mode: SessionMode) -> DiscussionLabels:
     }[mode]
 
 
-class DiscussionPanel(QWidget):
+class DiscussionPanel(QFrame):
     """Render a conservative complete discussion-state snapshot."""
 
     _EMPTY_EXPLANATIONS: ClassVar[dict[SessionMode, DiscussionLabels]] = {
@@ -73,6 +73,7 @@ class DiscussionPanel(QWidget):
         self._reduced_motion = reduced_motion
         self._title_labels: list[QLabel] = []
         self._body_labels: list[QLabel] = []
+        self._opacity_effects: list[QGraphicsOpacityEffect] = []
         self._animations: list[QPropertyAnimation] = []
         self._last_texts: tuple[str, ...] = ()
         self._build_layout()
@@ -130,28 +131,41 @@ class DiscussionPanel(QWidget):
             body = QLabel()
             body.setWordWrap(True)
             body.setProperty("flowlensTone", "muted")
+            effect = QGraphicsOpacityEffect(body)
+            effect.setOpacity(1.0)
+            body.setGraphicsEffect(effect)
             self._title_labels.append(title)
             self._body_labels.append(body)
+            self._opacity_effects.append(effect)
             layout.addWidget(title)
             layout.addWidget(body)
         layout.addStretch(1)
 
     def _animate_bodies(self) -> None:
         duration = 0 if self._reduced_motion else 120
-        self._animations.clear()
-        for label in self._body_labels:
-            effect = QGraphicsOpacityEffect(label)
-            label.setGraphicsEffect(effect)
-            animation = QPropertyAnimation(effect, b"opacity", label)
+        self._stop_animations()
+        for effect in self._opacity_effects:
+            effect.setOpacity(0.72)
+            animation = QPropertyAnimation(effect, b"opacity", self)
             animation.setDuration(duration)
             animation.setStartValue(0.72)
             animation.setEndValue(1.0)
             animation.setEasingCurve(QEasingCurve.Type.OutCubic)
             animation.finished.connect(
-                lambda target=label: target.setGraphicsEffect(None)
+                lambda target=animation: self._forget_animation(target)
             )
             self._animations.append(animation)
-            animation.start()
+            animation.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def _stop_animations(self) -> None:
+        for animation in self._animations:
+            animation.stop()
+            animation.deleteLater()
+        self._animations.clear()
+
+    def _forget_animation(self, animation: QPropertyAnimation) -> None:
+        if animation in self._animations:
+            self._animations.remove(animation)
 
     @staticmethod
     def _separator() -> QFrame:

@@ -2,6 +2,8 @@ import dataclasses
 from datetime import datetime
 
 import pytest
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QFrame
 from pytestqt.qtbot import QtBot
 
 from flowlens.asr.types import PartialTranscript
@@ -40,14 +42,17 @@ def make_partial(
     *,
     source: AudioSource = AudioSource.ME,
     start_ms: int = 0,
+    end_ms: int | None = None,
+    start_sample: int = 0,
+    end_sample: int = 8_000,
 ) -> PartialTranscript:
     return PartialTranscript(
         source,
         text,
         start_ms,
-        start_ms + 500,
-        0,
-        8_000,
+        end_ms if end_ms is not None else start_ms + 500,
+        start_sample,
+        end_sample,
     )
 
 
@@ -72,7 +77,16 @@ def test_sequence_breaks_remaining_ties_deterministically() -> None:
 
 def test_partial_is_ephemeral_and_commit_is_immutable() -> None:
     model = TranscriptListModel()
-    model.set_partial(AudioSource.ME, make_partial("途中", start_ms=0))
+    model.set_partial(
+        AudioSource.ME,
+        make_partial(
+            "途中",
+            start_ms=0,
+            end_ms=800,
+            start_sample=16_000,
+            end_sample=28_800,
+        ),
+    )
     partial = model.partial(AudioSource.ME)
     assert partial is not None
     assert partial.text == "途中"
@@ -101,6 +115,21 @@ def test_view_renders_source_shape_and_partial_without_timestamps(qtbot: QtBot) 
     assert "12:" not in view.rendered_text()
 
 
+def test_view_renders_both_source_partials_at_the_same_time(qtbot: QtBot) -> None:
+    view = TranscriptView()
+    qtbot.addWidget(view)
+
+    view.model.set_partial(AudioSource.ME, make_partial("私の途中"))
+    view.model.set_partial(
+        AudioSource.OTHERS,
+        make_partial("相手の途中", source=AudioSource.OTHERS),
+    )
+
+    rendered = view.rendered_text()
+    assert "● ME · Partial · 私の途中" in rendered
+    assert "■ OTHERS · Partial · 相手の途中" in rendered
+
+
 def test_manual_scroll_disables_auto_scroll_until_return_to_latest(
     qtbot: QtBot,
 ) -> None:
@@ -125,3 +154,78 @@ def test_manual_scroll_disables_auto_scroll_until_return_to_latest(
 
     assert view.auto_scroll_enabled is True
     assert view.scrollbar().value() == view.scrollbar().maximum()
+
+
+def test_queued_auto_scroll_rechecks_user_scroll_state(qtbot: QtBot) -> None:
+    view = TranscriptView()
+    qtbot.addWidget(view)
+    view.resize(420, 180)
+    view.show()
+    for sequence in range(1, 28):
+        view.model.commit(make_record(sequence=sequence, start_ms=sequence * 1000))
+    qtbot.waitUntil(lambda: view.scrollbar().maximum() > 0, timeout=1000)
+    view.return_to_latest()
+    qtbot.waitUntil(
+        lambda: view.scrollbar().value() == view.scrollbar().maximum(),
+        timeout=1000,
+    )
+
+    view.model.commit(make_record(sequence=28, start_ms=28_000))
+    view.auto_scroll_enabled = False
+    view.scrollbar().setValue(0)
+    QTimer.singleShot(0, lambda: None)
+    qtbot.wait(20)
+
+    assert view.scrollbar().value() == 0
+
+
+def test_commit_clears_only_matching_source_partial_boundary() -> None:
+    model = TranscriptListModel()
+    newer_partial = make_partial(
+        "新しい途中",
+        start_ms=5000,
+        end_ms=5800,
+        start_sample=32_000,
+        end_sample=44_800,
+    )
+    model.set_partial(AudioSource.ME, newer_partial)
+
+    model.commit(make_record(sequence=1, source=AudioSource.ME, start_ms=1000))
+
+    assert model.partial(AudioSource.ME) == newer_partial
+    model.commit(make_record(sequence=2, source=AudioSource.ME, start_ms=5000))
+    assert model.partial(AudioSource.ME) is None
+
+
+def test_insert_rows_signal_reports_sorted_position_and_duplicate_is_noop(
+    qtbot: QtBot,
+) -> None:
+    model = TranscriptListModel()
+    later = make_record(sequence=2, source=AudioSource.OTHERS, start_ms=2000)
+    earlier = make_record(sequence=1, source=AudioSource.ME, start_ms=1000)
+    model.commit(later)
+
+    with qtbot.waitSignal(model.rowsInserted, timeout=500) as blocker:
+        model.commit(earlier)
+
+    assert blocker.args[1:] == [0, 0]
+    before = model.rowCount()
+    with qtbot.assertNotEmitted(model.rowsInserted):
+        model.commit(earlier)
+    assert model.rowCount() == before
+
+
+def test_conflicting_committed_record_raises_immutable_error() -> None:
+    model = TranscriptListModel()
+    record = make_record(sequence=1, source=AudioSource.ME, text="元")
+    model.commit(record)
+
+    with pytest.raises(ImmutableTranscriptError):
+        model.commit(dataclasses.replace(record, text="衝突"))
+
+
+def test_transcript_view_is_qframe_for_existing_qss_selector(qtbot: QtBot) -> None:
+    view = TranscriptView()
+    qtbot.addWidget(view)
+
+    assert isinstance(view, QFrame)

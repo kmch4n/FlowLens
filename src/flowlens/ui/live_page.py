@@ -19,8 +19,10 @@ from PySide6.QtWidgets import (
 
 from flowlens.controller.session_controller import ControllerSnapshot, SessionState
 from flowlens.domain.enums import AudioSource, SessionMode
+from flowlens.domain.messages import TranscriptRecord
 from flowlens.ui.discussion_panel import DiscussionPanel, labels_for
 from flowlens.ui.status_strip import StatusSnapshot, StatusStrip
+from flowlens.ui.transcript_model import ImmutableTranscriptError
 from flowlens.ui.transcript_view import TranscriptView
 from flowlens.ui.widgets import StatefulButton
 
@@ -201,9 +203,11 @@ class LivePage(QWidget):
 
     def _render_transcript(self, snapshot: ControllerSnapshot) -> None:
         for record in snapshot.transcript:
-            if record.segment_id not in self._known_segments:
-                self.transcript_view.model.commit(record)
-                self._known_segments.add(record.segment_id)
+            if record.segment_id in self._known_segments:
+                self._validate_known_segment(record)
+                continue
+            self.transcript_view.model.commit(record)
+            self._known_segments.add(record.segment_id)
         active_sources = {
             partial.source for partial in snapshot.partials if partial.text
         }
@@ -213,6 +217,16 @@ class LivePage(QWidget):
             if source not in active_sources:
                 self.transcript_view.model.clear_partial(source)
         self.transcript_view.sync_partials()
+
+    def _validate_known_segment(self, record: TranscriptRecord) -> None:
+        for existing in self.transcript_view.model.records():
+            if existing.segment_id == record.segment_id:
+                if existing != record:
+                    raise ImmutableTranscriptError(
+                        "committed transcript cannot be replaced"
+                    )
+                return
+        raise ImmutableTranscriptError("known transcript segment is missing")
 
     def _place_splitter(self, target_layout: QLayout | None) -> None:
         if target_layout is None:

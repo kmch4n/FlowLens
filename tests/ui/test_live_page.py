@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QFrame
 from pytestqt.qtbot import QtBot
 
 from flowlens.controller.models import (
@@ -15,10 +16,12 @@ from flowlens.controller.models import (
 )
 from flowlens.controller.session_controller import ControllerSnapshot, SessionState
 from flowlens.domain.discussion import DiscussionState
-from flowlens.domain.enums import SessionMode
+from flowlens.domain.enums import AudioSource, SessionMode
+from flowlens.domain.messages import TranscriptRecord
 from flowlens.ui.discussion_panel import DiscussionPanel, labels_for
 from flowlens.ui.live_page import LivePage
 from flowlens.ui.status_strip import StatusSnapshot, StatusStrip
+from flowlens.ui.transcript_model import ImmutableTranscriptError
 
 
 def empty_state(mode: SessionMode) -> DiscussionState:
@@ -74,6 +77,21 @@ def snapshot(
         fatal_error=None,
         stop_confirmation_visible=False,
         slow_finalization_visible=False,
+    )
+
+
+def transcript_record(text: str = "元") -> TranscriptRecord:
+    return TranscriptRecord(
+        1,
+        "01J00000000000000000000001",
+        1,
+        AudioSource.ME,
+        text,
+        1000,
+        1800,
+        16_000,
+        28_800,
+        datetime.fromisoformat("2026-08-19T12:05:00+09:00"),
     )
 
 
@@ -181,6 +199,23 @@ def test_statuses_are_separate_not_one_aggregate_string(qtbot: QtBot) -> None:
     assert "Delayed" in strip.asr_status.text()
     assert "Paused" in strip.analysis_status.text()
     assert "12:35:02" in strip.save_status.text()
+
+
+def test_live_page_rejects_conflicting_duplicate_segment(qtbot: QtBot) -> None:
+    page = LivePage()
+    qtbot.addWidget(page)
+    record = transcript_record()
+    page.render(replace(snapshot(), transcript=(record,)))
+
+    with pytest.raises(ImmutableTranscriptError):
+        page.render(replace(snapshot(), transcript=(replace(record, text="衝突"),)))
+
+
+def test_discussion_panel_is_qframe_for_existing_qss_selector(qtbot: QtBot) -> None:
+    panel = DiscussionPanel()
+    qtbot.addWidget(panel)
+
+    assert isinstance(panel, QFrame)
 
 
 def test_live_page_renders_top_bar_banner_and_signals(qtbot: QtBot) -> None:

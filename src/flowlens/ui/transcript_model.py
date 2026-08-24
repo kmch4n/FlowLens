@@ -120,14 +120,16 @@ class TranscriptListModel(QAbstractListModel):
 
         if not isinstance(record, TranscriptRecord):
             raise TypeError("record must be a TranscriptRecord")
+        if self._is_exact_duplicate(record):
+            return
         self._reject_replacement(record)
-        self.beginResetModel()
-        self._records.append(record)
-        self._records.sort(key=self._sort_key)
+        position = self._insert_position(record)
+        self.beginInsertRows(_ROOT_INDEX, position, position)
+        self._records.insert(position, record)
         self._by_segment_id[record.segment_id] = record
         self._by_sequence[record.sequence] = record
-        self._partials.pop(record.source, None)
-        self.endResetModel()
+        self.endInsertRows()
+        self._clear_matching_partial(record)
 
     def set_partial(self, source: AudioSource, partial: PartialTranscript) -> None:
         """Set or replace the visible ephemeral partial for one source."""
@@ -185,8 +187,6 @@ class TranscriptListModel(QAbstractListModel):
         existing_by_segment = self._by_segment_id.get(record.segment_id)
         existing_by_sequence = self._by_sequence.get(record.sequence)
         if existing_by_segment is not None or existing_by_sequence is not None:
-            if existing_by_segment == record or existing_by_sequence == record:
-                raise ImmutableTranscriptError("committed transcript already exists")
             raise ImmutableTranscriptError("committed transcript cannot be replaced")
 
     @classmethod
@@ -195,4 +195,41 @@ class TranscriptListModel(QAbstractListModel):
             record.session_start_ms,
             cls._SOURCE_RANK[record.source],
             record.sequence,
+        )
+
+    def _is_exact_duplicate(self, record: TranscriptRecord) -> bool:
+        existing_by_segment = self._by_segment_id.get(record.segment_id)
+        existing_by_sequence = self._by_sequence.get(record.sequence)
+        if existing_by_segment is None and existing_by_sequence is None:
+            return False
+        return (
+            existing_by_segment in (None, record)
+            and existing_by_sequence in (None, record)
+            and (existing_by_segment == record or existing_by_sequence == record)
+        )
+
+    def _insert_position(self, record: TranscriptRecord) -> int:
+        key = self._sort_key(record)
+        for index, existing in enumerate(self._records):
+            if key < self._sort_key(existing):
+                return index
+        return len(self._records)
+
+    def _clear_matching_partial(self, record: TranscriptRecord) -> None:
+        partial = self._partials.get(record.source)
+        if partial is None or not self._matches_partial_boundary(record, partial):
+            return
+        self._partials.pop(record.source)
+        self.partials_changed.emit()
+
+    @staticmethod
+    def _matches_partial_boundary(
+        record: TranscriptRecord, partial: PartialTranscript
+    ) -> bool:
+        return (
+            record.source is partial.source
+            and record.session_start_ms == partial.session_start_ms
+            and record.session_end_ms == partial.session_end_ms
+            and record.source_start_sample == partial.source_start_sample
+            and record.source_end_sample == partial.source_end_sample
         )

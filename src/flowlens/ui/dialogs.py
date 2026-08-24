@@ -1,6 +1,7 @@
 """Stop and slow-finalization dialogs."""
 
 from PySide6.QtCore import Signal
+from PySide6.QtGui import QCloseEvent, QShowEvent
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QVBoxLayout
 
 from flowlens.ui.widgets import StatefulButton
@@ -17,6 +18,7 @@ class StopConfirmationDialog(QDialog):
         self.message_label = QLabel("Stop this session?")
         self.confirm_button = StatefulButton("Stop and finalize")
         self.cancel_button = StatefulButton("Keep recording")
+        self._choice_emitted = False
         self._build_layout()
         self._connect()
 
@@ -41,8 +43,41 @@ class StopConfirmationDialog(QDialog):
         self.confirm_button.setProperty("uiState", "error")
 
     def _connect(self) -> None:
-        self.confirm_button.clicked.connect(self.stop_confirmed.emit)
-        self.cancel_button.clicked.connect(self.keep_recording_requested.emit)
+        self.confirm_button.clicked.connect(self._choose_stop)
+        self.cancel_button.clicked.connect(self._choose_keep_recording)
+
+    def _choose_stop(self) -> None:
+        self._choice_emitted = True
+        self.stop_confirmed.emit()
+        self.accept()
+
+    def _choose_keep_recording(self) -> None:
+        self._emit_keep_recording_default()
+        self.reject()
+
+    def _emit_keep_recording_default(self) -> None:
+        if self._choice_emitted:
+            return
+        self._choice_emitted = True
+        self.keep_recording_requested.emit()
+
+    def reject(self) -> None:
+        """Treat Escape as the non-destructive keep-recording choice."""
+
+        self._emit_keep_recording_default()
+        super().reject()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Reset completion state each time the dialog is shown."""
+
+        self._choice_emitted = False
+        super().showEvent(event)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Treat window close as the non-destructive keep-recording choice."""
+
+        self._emit_keep_recording_default()
+        super().closeEvent(event)
 
 
 class SlowFinalizationDialog(QDialog):
@@ -56,6 +91,7 @@ class SlowFinalizationDialog(QDialog):
         self.message_label = QLabel("Finalization is taking longer than expected")
         self.keep_waiting_button = StatefulButton("Keep waiting")
         self.force_close_button = StatefulButton("Force close")
+        self._choice_emitted = False
         self._build_layout()
         self._connect()
 
@@ -81,5 +117,38 @@ class SlowFinalizationDialog(QDialog):
         self.force_close_button.setProperty("uiState", "error")
 
     def _connect(self) -> None:
-        self.keep_waiting_button.clicked.connect(self.keep_waiting_requested.emit)
-        self.force_close_button.clicked.connect(self.force_close_requested.emit)
+        self.keep_waiting_button.clicked.connect(self._choose_keep_waiting)
+        self.force_close_button.clicked.connect(self._choose_force_close)
+
+    def _choose_keep_waiting(self) -> None:
+        self._emit_keep_waiting_default()
+        self.reject()
+
+    def _choose_force_close(self) -> None:
+        self._choice_emitted = True
+        self.force_close_requested.emit()
+        self.accept()
+
+    def _emit_keep_waiting_default(self) -> None:
+        if self._choice_emitted:
+            return
+        self._choice_emitted = True
+        self.keep_waiting_requested.emit()
+
+    def reject(self) -> None:
+        """Treat Escape as the non-destructive keep-waiting choice."""
+
+        self._emit_keep_waiting_default()
+        super().reject()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Reset completion state each time the dialog is shown."""
+
+        self._choice_emitted = False
+        super().showEvent(event)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Treat window close as the non-destructive keep-waiting choice."""
+
+        self._emit_keep_waiting_default()
+        super().closeEvent(event)
