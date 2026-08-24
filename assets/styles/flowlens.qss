@@ -1,0 +1,118 @@
+/* Hallmark · genre: atmospheric · macrostructure: Workbench · theme: Midnight · tone: technical-austere · enrichment: none */
+/* Hallmark · pre-emit critique: P5 H5 E4 S5 R5 V4 */
+/* motion-duration: {motion_duration} */
+QWidget {{
+    background-color: {background};
+    color: {primary_text};
+    font-family: "{font_interface}";
+    font-size: 14px;
+}}
+
+QMainWindow,
+QFrame[flowlensRole="canvas"] {{
+    background-color: {background};
+}}
+
+QFrame[flowlensRole="rail"],
+QFrame[flowlensRole="workArea"],
+QFrame[flowlensRole="statusStrip"] {{
+    background-color: {surface};
+    border: 1px solid {rule};
+    border-radius: 6px;
+}}
+
+QFrame[flowlensRole="workAreaPrimary"] {{
+    background-color: {elevated_surface};
+    border: 1px solid {rule};
+    border-radius: 6px;
+}}
+
+QLabel {{
+    color: {primary_text};
+    background-color: transparent;
+}}
+
+QLabel[flowlensTone="muted"],
+QLabel[flowlensRole="helper"] {{
+    color: {muted_text};
+}}
+
+QLabel[flowlensRole="metric"],
+QLabel[flowlensRole="timer"] {{
+    color: {primary_text};
+    font-family: "{font_mono}";
+}}
+
+QLabel[uiState="error"] {{
+    color: {error};
+}}
+
+QLabel[uiState="success"] {{
+    color: {success};
+}}
+
+QPushButton[flowlensRole="stateful"] {{
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px 14px;
+    color: {primary_text};
+    background-color: {surface};
+    border: 2px solid {rule};
+    border-radius: 6px;
+    font-family: "{font_interface}";
+    font-weight: 600;
+}}
+
+QPushButton[flowlensRole="stateful"]:hover {{
+    background-color: {elevated_surface};
+    border-color: {accent};
+}}
+
+QPushButton[flowlensRole="stateful"]:focus {{
+    border-color: {focus};
+}}
+
+QPushButton[flowlensRole="stateful"]:pressed,
+QPushButton[flowlensRole="stateful"][uiState="active"] {{
+    padding-top: 9px;
+    padding-bottom: 7px;
+    background-color: {elevated_surface};
+}}
+
+QPushButton[flowlensRole="stateful"]:disabled,
+QPushButton[flowlensRole="stateful"][uiState="disabled"],
+QPushButton[flowlensRole="stateful"][uiState="loading"] {{
+    color: {muted_text};
+    background-color: {surface};
+    border-color: {rule};
+}}
+
+QPushButton[flowlensRole="stateful"][uiState="error"] {{
+    color: {primary_text};
+    background-color: {surface};
+    border-color: {error};
+}}
+
+QPushButton[flowlensRole="stateful"][uiState="success"] {{
+    color: {primary_text};
+    background-color: {surface};
+    border-color: {success};
+}}
+
+QLineEdit[flowlensRole="inputMeter"],
+QProgressBar[flowlensRole="inputMeter"] {{
+    min-height: 44px;
+    color: {primary_text};
+    background-color: {surface};
+    border: 2px solid {rule};
+    border-radius: 6px;
+}}
+
+QLineEdit[flowlensRole="inputMeter"]:focus {{
+    border-color: {focus};
+}}
+
+QProgressBar[flowlensRole="inputMeter"]::chunk {{
+    background-color: {accent};
+    border-radius: 4px;
+}}
