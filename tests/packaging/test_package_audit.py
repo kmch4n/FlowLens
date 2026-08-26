@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Protocol, cast
 
 import pytest
@@ -124,7 +126,8 @@ def make_fake_package(tmp_path: Path) -> Path:
         "Qwen3-4B-Instruct-2507-Apache-2.0.txt",
         "kotoba-whisper-v2.0-license.txt",
     ):
-        (licenses / name).write_text("fixture license\n", encoding="utf-8")
+        source = Path("licenses") / name
+        (licenses / name).write_bytes(source.read_bytes())
     return package
 
 
@@ -190,24 +193,152 @@ def test_package_audit_does_not_launch_a_fixture_without_an_injected_probe(
     assert audit.errors == ()
 
 
-def test_package_audit_rejects_model_bins_but_allows_native_library_bins(
+def test_package_audit_rejects_empty_model_directories_and_all_bin_artifacts(
     tmp_path: Path,
 ) -> None:
-    """Model directories take precedence over a native-library allowlist."""
+    """Model locations are forbidden even when empty or disguised as native data."""
 
     package = make_fake_package(tmp_path)
+    empty_model_directory = package / "runtime" / "models"
+    empty_model_directory.mkdir()
+    assert _audit(package).errors == (
+        "Runtime package must not contain model artifacts: runtime/models",
+    )
+
+    empty_model_directory.rmdir()
     native_binary = package / "runtime" / "ctranslate2" / "native" / "kernel.bin"
     native_binary.parent.mkdir()
     native_binary.write_bytes(b"native")
-    assert _audit(package).errors == ()
-
-    model_binary = package / "runtime" / "kotoba-whisper-v2.0-faster" / "model.bin"
-    model_binary.parent.mkdir()
-    model_binary.write_bytes(b"model")
+    (package / "runtime" / "qwen.bin").write_bytes(b"model")
     assert _audit(package).errors == (
         "Runtime package must not contain model artifacts: "
-        "runtime/kotoba-whisper-v2.0-faster/model.bin",
+        "runtime/ctranslate2/native/kernel.bin",
+        "Runtime package must not contain model artifacts: " "runtime/qwen.bin",
     )
+
+
+def test_package_audit_rejects_replaced_license_text(tmp_path: Path) -> None:
+    """Every approved license artifact must retain its pinned source text."""
+
+    package = make_fake_package(tmp_path)
+    (package / "licenses" / "IBM-Plex-OFL.txt").write_text("\n", encoding="utf-8")
+
+    assert "Invalid license SHA-256: IBM-Plex-OFL.txt" in _audit(package).errors
+
+
+def test_qt_font_verifier_loads_real_bundled_fonts_in_offscreen_subprocess() -> None:
+    """Qt loads the shipped fonts after a single offscreen GUI application exists."""
+
+    pytest.importorskip("PySide6")
+    source = Path("scripts/check_package.py").resolve()
+    fonts = [
+        Path("assets/fonts/IBMPlexSansJP-Regular.ttf").resolve(),
+        Path("assets/fonts/IBMPlexSansJP-SemiBold.ttf").resolve(),
+        Path("assets/fonts/IBMPlexMono-Regular.ttf").resolve(),
+    ]
+    source_reference = repr(str(source))
+    font_references = repr([str(font) for font in fonts])
+    script = (
+        "import importlib.util\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"source_path = {source_reference}\n"
+        "spec = importlib.util.spec_from_file_location('qt_font_audit', source_path)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "assert spec.loader is not None\n"
+        "sys.modules[spec.name] = module\n"
+        "spec.loader.exec_module(module)\n"
+        f"font_paths = {font_references}\n"
+        "verifier = module.QtFontVerifier()\n"
+        "families = verifier.verify(tuple(Path(item) for item in font_paths))\n"
+        "assert 'IBM Plex Sans JP' in families\n"
+        "assert 'IBM Plex Mono' in families\n"
+    )
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@dataclass
+class _TimedOutProcess:
+    """Deterministic process double that remains alive until fallback kill."""
+
+    pid: int = 4102
+    killed: bool = False
+    communicate_calls: int = 0
+
+    def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            raise subprocess.TimeoutExpired("FlowLens.exe", timeout)
+        return (b"", b"")
+
+    def poll(self) -> int | None:
+        return 0 if self.killed else None
+
+    def kill(self) -> None:
+        self.killed = True
+
+    @property
+    def returncode(self) -> int | None:
+        return None if not self.killed else 1
+
+
+class _WindowsHost:
+    """Host double that enables Windows-only process-control behavior."""
+
+    def is_windows(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize(
+    ("taskkill_failure", "expected_detail"),
+    [
+        (SimpleNamespace(returncode=1), "taskkill exited with code 1"),
+        (subprocess.TimeoutExpired("taskkill", 5), "taskkill timed out"),
+    ],
+)
+def test_probe_reports_taskkill_cleanup_failures_and_falls_back_to_kill(
+    taskkill_failure: object,
+    expected_detail: str,
+) -> None:
+    """Timed probes expose failed descendant cleanup instead of suppressing it."""
+
+    process = _TimedOutProcess()
+    taskkill_calls: list[tuple[object, ...]] = []
+
+    def launch(*args: object, **kwargs: object) -> _TimedOutProcess:
+        del args, kwargs
+        return process
+
+    def taskkill(*args: object, **kwargs: object) -> object:
+        del kwargs
+        taskkill_calls.append(cast(tuple[object, ...], args))
+        if isinstance(taskkill_failure, BaseException):
+            raise taskkill_failure
+        return taskkill_failure
+
+    probe = _MODULE.WindowsSubprocessProbe(
+        platform=_WindowsHost(),
+        process_factory=launch,
+        taskkill_runner=taskkill,
+    )
+    result = probe.run(Path("FlowLens.exe"), ("--help",), 10)
+
+    assert result.timed_out is True
+    assert expected_detail in result.detail
+    assert process.killed is True
+    assert taskkill_calls == [(["taskkill", "/PID", "4102", "/T", "/F"],)]
 
 
 def test_package_audit_rejects_extra_top_level_entries(tmp_path: Path) -> None:

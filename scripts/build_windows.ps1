@@ -15,7 +15,41 @@ function Get-ValidatedRepoChild {
     if (-not $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Target escapes repository root: $RelativePath"
     }
+    Assert-NoReparsePathComponents -RepositoryRoot $root -TargetPath $candidate
     return $candidate
+}
+
+function Assert-NoReparsePathComponents {
+    param(
+        [Parameter(Mandatory = $true)][string] $RepositoryRoot,
+        [Parameter(Mandatory = $true)][string] $TargetPath
+    )
+
+    $rootItem = Get-Item -LiteralPath $RepositoryRoot -Force
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing repository root reparse point: $RepositoryRoot"
+    }
+
+    $relative = $TargetPath.Substring($RepositoryRoot.Length).TrimStart(
+        [char[]]@("\\", "/")
+    )
+    if ([string]::IsNullOrEmpty($relative)) {
+        return
+    }
+    $current = $RepositoryRoot
+    foreach ($component in ($relative -split "[\\/]")) {
+        if ([string]::IsNullOrEmpty($component)) {
+            continue
+        }
+        $current = Join-Path $current $component
+        if (-not (Test-Path -LiteralPath $current)) {
+            continue
+        }
+        $item = Get-Item -LiteralPath $current -Force
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing reparse-point path component: $current"
+        }
+    }
 }
 
 function Remove-ValidatedPackageTarget {
@@ -25,6 +59,16 @@ function Remove-ValidatedPackageTarget {
     )
 
     $target = Get-ValidatedRepoChild -RepositoryRoot $RepositoryRoot -RelativePath $RelativePath
+    $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
+        [char[]]@("\\", "/")
+    )
+    $allowedTargets = @(
+        [System.IO.Path]::GetFullPath((Join-Path $root "build\\FlowLens")),
+        [System.IO.Path]::GetFullPath((Join-Path $root "dist\\FlowLens"))
+    )
+    if (-not ($allowedTargets -contains $target)) {
+        throw "Refusing non-package cleanup target: $RelativePath"
+    }
     if (-not (Test-Path -LiteralPath $target)) {
         return
     }

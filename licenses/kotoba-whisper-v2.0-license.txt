@@ -1,6 +1,12 @@
-MIT License
+THIRD-PARTY NOTICE
 
-Copyright (c) <year> <copyright holders>
+The official model card for kotoba-tech/kotoba-whisper-v2.0-faster declares
+the license metadata as "mit". Its repository tree does not provide a
+standalone LICENSE file or project-specific copyright notice. The MIT license
+terms below are the authoritative SPDX MIT License text, included to document
+the declared license; they are not presented as a kotoba-tech copyright notice.
+
+MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

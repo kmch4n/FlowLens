@@ -9,6 +9,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -120,6 +121,48 @@ def test_package_self_check_does_not_build_application(
     monkeypatch.setattr(app, "_package_self_check", lambda: 0)
 
     assert app.main(["--package-self-check"]) == 0
+
+
+def test_package_self_check_loads_qt_platform_without_runtime_graph(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The package probe loads a Qt platform plugin without touching workers."""
+
+    import flowlens.app as app
+
+    created: list[object] = []
+    imported: list[str] = []
+
+    class FakeGuiApplication:
+        @classmethod
+        def instance(cls) -> None:
+            return None
+
+        def __init__(self, arguments: list[str]) -> None:
+            assert arguments == []
+            created.append(self)
+
+        def platformName(self) -> str:
+            return "offscreen"
+
+    def fake_import_module(name: str) -> object:
+        imported.append(name)
+        if name == "PySide6.QtGui":
+            return SimpleNamespace(QGuiApplication=FakeGuiApplication)
+        return object()
+
+    def fail_build_application(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("self-check must not build the runtime graph")
+
+    monkeypatch.setattr(app.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(app, "build_application", fail_build_application)
+    monkeypatch.setattr(app, "_PACKAGE_SELF_CHECK_APPLICATION", None, raising=False)
+
+    assert app._package_self_check() == 0
+    assert len(created) == 1
+    assert "PySide6.QtGui" in imported
+    assert all(not name.startswith("flowlens.workers") for name in imported)
 
 
 def final_snapshot() -> ControllerSnapshot:

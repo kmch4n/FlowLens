@@ -27,6 +27,7 @@ _SELF_CHECK_MODULES = (
     "llama_cpp",
 )
 _ACCEPTANCE_SCHEMA_VERSION = 1
+_PACKAGE_SELF_CHECK_APPLICATION: object | None = None
 
 
 class PackageSelfCheckReport(TypedDict):
@@ -159,7 +160,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _package_self_check() -> int:
-    """Import packaged native modules without starting workers or loading models."""
+    """Load packaged runtime dependencies without starting workers or models."""
 
     failed: list[str] = []
     for module_name in _SELF_CHECK_MODULES:
@@ -167,11 +168,31 @@ def _package_self_check() -> int:
             importlib.import_module(module_name)
         except Exception as error:
             failed.append(f"{module_name}: {type(error).__name__}")
+    try:
+        _load_package_qt_platform()
+    except Exception as error:
+        failed.append(f"PySide6.QtGui platform: {type(error).__name__}")
     if failed:
         for item in failed:
             print(item, file=sys.stderr)
         return 1
     return 0
+
+
+def _load_package_qt_platform() -> None:
+    """Load and retain the Qt platform plugin needed by packaged UI resources."""
+
+    global _PACKAGE_SELF_CHECK_APPLICATION
+
+    qt_gui = importlib.import_module("PySide6.QtGui")
+    application_type = qt_gui.QGuiApplication
+    application = application_type.instance()
+    if application is None:
+        application = application_type([])
+    platform_name = application.platformName()
+    if not isinstance(platform_name, str) or not platform_name:
+        raise RuntimeError("Qt platform plugin did not initialize")
+    _PACKAGE_SELF_CHECK_APPLICATION = application
 
 
 def _run_qt(

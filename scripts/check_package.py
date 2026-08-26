@@ -9,14 +9,15 @@ uses Qt only after the package tree has passed its structural safety checks.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import stat
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Protocol, cast
 
 _EXPECTED_TOP_LEVEL = frozenset({"FlowLens.exe", "runtime", "licenses"})
 _REQUIRED_LICENSES = (
@@ -32,8 +33,6 @@ _REQUIRED_FONTS = (
     "IBMPlexMono-Regular.ttf",
 )
 _EXPECTED_FONT_FAMILIES = frozenset({"IBM Plex Sans JP", "IBM Plex Mono"})
-_NATIVE_PACKAGES = frozenset({"llama_cpp", "ctranslate2", "pyaudiowpatch"})
-_NATIVE_BINARY_DIRECTORIES = frozenset({"bin", "lib", "native", "dlls"})
 _MODEL_DIRECTORY_NAMES = frozenset(
     {
         "models",
@@ -45,6 +44,23 @@ _MODEL_DIRECTORY_NAMES = frozenset(
         "kotoba-whisper-v2.0-faster",
     }
 )
+_LICENSE_SHA256 = {
+    "IBM-Plex-OFL.txt": (
+        "d741e57d5f865e294df801f96b7b5161a88b211df65887e4358d271c9fc5fb4f"
+    ),
+    "PySide6-LGPL-3.0-only.txt": (
+        "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118"
+    ),
+    "Qwen3-4B-Instruct-2507-Apache-2.0.txt": (
+        "c156170b718ec29139d3653d40ed1986fd92fb7e0959b5c71f3c48f62e6636f4"
+    ),
+    "kotoba-whisper-v2.0-license.txt": (
+        "c449d68446c278baaf454177fc2de19cf830b3ae86dfdd1e1227245d422f9fa4"
+    ),
+    "llama-cpp-python-MIT.txt": (
+        "2aa1e22f6de50309ec505631695f95b308e980efa318e15bb45732d2c5e07a34"
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,11 +120,42 @@ class CurrentPlatform:
         return os.name == "nt"
 
 
+class _ProbeProcess(Protocol):
+    """Minimal subprocess surface needed to stop an executable probe."""
+
+    pid: int
+    returncode: int | None
+
+    def communicate(self, timeout: int) -> tuple[bytes, bytes]:
+        """Collect output while applying a bounded wait."""
+
+    def poll(self) -> int | None:
+        """Return the process exit code if it has already exited."""
+
+    def kill(self) -> None:
+        """Terminate the direct process as a fallback."""
+
+
 class WindowsSubprocessProbe:
     """Execute only the two FlowLens probe commands and kill timed-out trees."""
 
-    def __init__(self, platform: HostPlatform | None = None) -> None:
+    def __init__(
+        self,
+        platform: HostPlatform | None = None,
+        process_factory: Callable[..., _ProbeProcess] | None = None,
+        taskkill_runner: Callable[..., object] | None = None,
+    ) -> None:
         self._platform = CurrentPlatform() if platform is None else platform
+        self._process_factory = (
+            cast(Callable[..., _ProbeProcess], subprocess.Popen)
+            if process_factory is None
+            else process_factory
+        )
+        self._taskkill_runner = (
+            cast(Callable[..., object], subprocess.run)
+            if taskkill_runner is None
+            else taskkill_runner
+        )
 
     def run(
         self,
@@ -137,7 +184,7 @@ class WindowsSubprocessProbe:
                 detail="Executable probe timeout must be positive",
             )
         try:
-            process = subprocess.Popen(
+            process = self._process_factory(
                 [os.fspath(executable), *arguments],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -150,21 +197,47 @@ class WindowsSubprocessProbe:
         try:
             process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            _terminate_process_tree(process)
-            return ProbeResult(None, True, "timed out")
+            cleanup_error = _terminate_process_tree(
+                process,
+                platform=self._platform,
+                taskkill_runner=self._taskkill_runner,
+            )
+            detail = "timed out"
+            if cleanup_error:
+                detail += f"; cleanup failed: {cleanup_error}"
+            return ProbeResult(None, True, detail)
         except OSError as error:
-            _terminate_process_tree(process)
-            return ProbeResult(None, False, f"probe failed: {type(error).__name__}")
+            cleanup_error = _terminate_process_tree(
+                process,
+                platform=self._platform,
+                taskkill_runner=self._taskkill_runner,
+            )
+            detail = f"probe failed: {type(error).__name__}"
+            if cleanup_error:
+                detail += f"; cleanup failed: {cleanup_error}"
+            return ProbeResult(None, False, detail)
         return ProbeResult(process.returncode, False, "")
 
 
 class QtFontVerifier:
     """Verify bundled fonts through the Qt API used by the application."""
 
+    def __init__(self) -> None:
+        self._application: object | None = None
+
     def verify(self, font_paths: tuple[Path, ...]) -> tuple[str, ...]:
         """Load package-local fonts and return all Qt family names."""
 
-        from PySide6.QtGui import QFontDatabase
+        from PySide6.QtGui import QFontDatabase, QGuiApplication
+
+        application = QGuiApplication.instance()
+        if application is None:
+            application = QGuiApplication([])
+        if not isinstance(application, QGuiApplication):
+            raise RuntimeError("Qt application is not a QGuiApplication")
+        if not application.platformName():
+            raise RuntimeError("Qt platform plugin did not initialize")
+        self._application = application
 
         families: list[str] = []
         for path in font_paths:
@@ -417,9 +490,12 @@ def _check_licenses(
             errors.append(f"Missing license: {name}")
             continue
         try:
-            _assert_unchanged(entry)
+            digest = _sha256_entry(entry)
         except (OSError, ValueError):
             errors.append(f"Unsafe license: {name}")
+            continue
+        if digest != _LICENSE_SHA256[name]:
+            errors.append(f"Invalid license SHA-256: {name}")
 
 
 def _check_model_artifacts(
@@ -427,31 +503,27 @@ def _check_model_artifacts(
     errors: list[str],
 ) -> None:
     for relative, entry in sorted(entries.items(), key=lambda item: item[0].as_posix()):
-        if not relative.parts or relative.parts[0] != "runtime" or not entry.is_file():
+        if not relative.parts or relative.parts[0] != "runtime":
             continue
-        if _is_model_artifact(relative):
+        if _is_model_artifact(relative, is_directory=entry.is_dir()):
             errors.append(
                 "Runtime package must not contain model artifacts: "
                 + relative.as_posix()
             )
 
 
-def _is_model_artifact(relative: PurePosixPath) -> bool:
+def _is_model_artifact(relative: PurePosixPath, *, is_directory: bool) -> bool:
+    """Return whether a package path is a model artifact or known model location."""
+
     lower_parts = tuple(part.casefold() for part in relative.parts)
-    filename = lower_parts[-1]
-    if any(part in _MODEL_DIRECTORY_NAMES for part in lower_parts[:-1]):
+    if any(part in _MODEL_DIRECTORY_NAMES for part in lower_parts):
         return True
+    if is_directory:
+        return False
+    filename = lower_parts[-1]
     if filename.endswith(".gguf"):
         return True
-    if not filename.endswith(".bin"):
-        return False
-    return not _is_known_native_binary(lower_parts)
-
-
-def _is_known_native_binary(parts: tuple[str, ...]) -> bool:
-    if len(parts) < 4 or parts[0] != "runtime" or parts[1] not in _NATIVE_PACKAGES:
-        return False
-    return any(part in _NATIVE_BINARY_DIRECTORIES for part in parts[2:-1])
+    return filename.endswith(".bin")
 
 
 def _check_executable_probes(
@@ -478,7 +550,10 @@ def _check_executable_probes(
             continue
         command = f"FlowLens.exe {' '.join(arguments)}"
         if result.timed_out:
-            errors.append(f"Executable probe timed out after 10 seconds: {command}")
+            suffix = "" if not result.detail else f" ({result.detail})"
+            errors.append(
+                f"Executable probe timed out after 10 seconds: {command}{suffix}"
+            )
         elif result.exit_code != 0:
             suffix = "" if not result.detail else f" ({result.detail})"
             errors.append(f"Executable probe failed: {command}{suffix}")
@@ -492,6 +567,18 @@ def _assert_unchanged(entry: _ScannedPath) -> None:
         or information.st_mode != entry.mode
     ):
         raise ValueError("package path changed during audit")
+
+
+def _sha256_entry(entry: _ScannedPath) -> str:
+    """Hash one lstat-validated license while rejecting path substitution races."""
+
+    _assert_unchanged(entry)
+    digest = hashlib.sha256()
+    with entry.path.open("rb") as source:
+        while chunk := source.read(128 * 1024):
+            digest.update(chunk)
+    _assert_unchanged(entry)
+    return digest.hexdigest()
 
 
 def _require_regular_file(
@@ -541,28 +628,41 @@ def _is_descendant(path: PurePosixPath, root: PurePosixPath) -> bool:
     )
 
 
-def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
-    """Terminate a timed-out process and its Windows descendants."""
+def _terminate_process_tree(
+    process: _ProbeProcess,
+    *,
+    platform: HostPlatform,
+    taskkill_runner: Callable[..., object],
+) -> str:
+    """Terminate a timed-out process tree and return any cleanup failure detail."""
 
-    if os.name == "nt":
+    failures: list[str] = []
+    if platform.is_windows():
         try:
-            subprocess.run(
+            result = taskkill_runner(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=False,
                 shell=False,
                 timeout=5,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            returncode = getattr(result, "returncode", None)
+            if returncode != 0:
+                failures.append(f"taskkill exited with code {returncode}")
+        except subprocess.TimeoutExpired:
+            failures.append("taskkill timed out")
+        except OSError as error:
+            failures.append(f"taskkill failed: {type(error).__name__}")
     try:
         if process.poll() is None:
             process.kill()
         process.communicate(timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    except subprocess.TimeoutExpired:
+        failures.append("direct process termination timed out")
+    except OSError as error:
+        failures.append(f"direct process termination failed: {type(error).__name__}")
+    return "; ".join(failures)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
