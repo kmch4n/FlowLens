@@ -6,7 +6,7 @@ import importlib
 import multiprocessing
 import queue
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from multiprocessing.context import BaseContext
 from typing import NoReturn, Protocol, cast
 
@@ -202,6 +202,7 @@ class MultiprocessingWorkerRuntime:
         self._writer_stop_event: _EventLike | None = None
         self._writer_finalization_gate: WriterFinalizationGate | None = None
         self._shutdown_report: WorkerShutdownReport | None = None
+        self._restart_cleanup_incomplete = False
         self.restart_reports: list[WorkerRestartReport] = []
 
     @property
@@ -261,6 +262,8 @@ class MultiprocessingWorkerRuntime:
 
         if not isinstance(launch, SessionLaunch):
             raise TypeError("launch must be a SessionLaunch")
+        if self._restart_cleanup_incomplete:
+            raise RuntimeError("worker runtime has incomplete restart cleanup")
         if self._processes and not self._ready_for_reuse():
             raise RuntimeError("worker runtime is already started")
         self._discard_previous_session()
@@ -346,15 +349,34 @@ class MultiprocessingWorkerRuntime:
             )
             raise RuntimeError(f"{target.value} process remained alive after restart")
         errors = errors + self._close_queues((old_queue,))
-        self._control_queues[target] = self.context.Queue()
+        fresh_queue = self.context.Queue()
+        self._control_queues[target] = fresh_queue
         process = self._create_process(target, launch)
         self._processes[target] = process
         try:
             process.start()
         except Exception as error:
-            self._processes[target] = old_process
-            self._control_queues[target] = old_queue
-            self._fail_closed(f"{target.value} restart failed", error)
+            cleanup_errors = self._cleanup_failed_restart(
+                target,
+                process,
+                fresh_queue,
+            )
+            self._restart_cleanup_incomplete = bool(cleanup_errors)
+            self._processes.pop(target, None)
+            self._control_queues.pop(target, None)
+            restart_errors = (
+                *errors,
+                f"{target.value} restart start: {_error_name(error)}",
+                *cleanup_errors,
+            )
+            self.restart_reports.append(
+                WorkerRestartReport(target, joined, terminated, restart_errors)
+            )
+            self._fail_closed(
+                f"{target.value} restart failed",
+                error,
+                additional_errors=restart_errors,
+            )
         self.restart_reports.append(
             WorkerRestartReport(
                 worker=target,
@@ -591,6 +613,30 @@ class MultiprocessingWorkerRuntime:
                 errors.append(f"{worker.value} close: {_error_name(error)}")
         return joined, terminated, tuple(errors)
 
+    def _cleanup_failed_restart(
+        self,
+        worker: ProcessSource,
+        process: _ProcessLike,
+        control_queue: _QueueLike,
+    ) -> tuple[str, ...]:
+        """Close a failed fresh child without unstarted lifecycle operations."""
+
+        errors: list[str] = []
+        alive = self._process_is_alive(worker, process, errors)
+        if alive:
+            _, _, stop_errors = self._stop_process(worker, process, control_queue)
+            errors.extend(stop_errors)
+        else:
+            try:
+                process.close()
+            except Exception as error:
+                errors.append(f"{worker.value} restart close: {_error_name(error)}")
+        errors.extend(
+            f"{worker.value} restart {error}"
+            for error in self._close_queues((control_queue,))
+        )
+        return tuple(errors)
+
     def _join_process(
         self,
         worker: ProcessSource,
@@ -640,9 +686,20 @@ class MultiprocessingWorkerRuntime:
             payload=payload,
         )
 
-    def _fail_closed(self, message: str, error: Exception) -> NoReturn:
+    def _fail_closed(
+        self,
+        message: str,
+        error: Exception,
+        *,
+        additional_errors: tuple[str, ...] = (),
+    ) -> NoReturn:
         try:
-            self.shutdown()
+            report = self.shutdown()
+            if additional_errors:
+                self._shutdown_report = replace(
+                    report,
+                    errors=report.errors + additional_errors,
+                )
         finally:
             raise RuntimeError(message) from error
 

@@ -41,6 +41,8 @@ class FakeQueue:
     items: list[object]
     fail_get: bool = False
     fail_put: bool = False
+    fail_close: bool = False
+    fail_join: bool = False
     closed: bool = False
     joined: bool = False
     get_nowait_calls: int = 0
@@ -67,9 +69,13 @@ class FakeQueue:
         return self.items.pop(0)
 
     def close(self) -> None:
+        if self.fail_close:
+            raise OSError("cannot close queue")
         self.closed = True
 
     def join_thread(self) -> None:
+        if self.fail_join:
+            raise OSError("cannot join queue thread")
         self.joined = True
 
 
@@ -97,6 +103,7 @@ class FakeProcess:
         target: Callable[..., object],
         args: tuple[object, ...],
         context: FakeMultiprocessingContext,
+        index: int,
     ) -> None:
         self.name = name
         self.target = target
@@ -108,6 +115,7 @@ class FakeProcess:
         self.closed = False
         self.join_calls: list[float] = []
         self._context = context
+        self._index = index
 
     def start(self) -> None:
         self._context.events.append(f"start:{self.name}")
@@ -115,6 +123,8 @@ class FakeProcess:
             raise OSError(f"cannot start {self.name}")
         self.started = True
         self.alive = True
+        if self.name in self._context.fail_start_after_start_names:
+            raise OSError(f"cannot finish starting {self.name}")
 
     def is_alive(self) -> bool:
         return self.alive
@@ -122,18 +132,31 @@ class FakeProcess:
     def join(self, timeout: float | None = None) -> None:
         assert timeout is not None
         self.join_calls.append(timeout)
+        if not self.started:
+            self._context.unstarted_lifecycle_calls.append(f"join:{self.name}")
+            if self._context.reject_unstarted_lifecycle:
+                raise AssertionError("join is invalid before start")
         if self.name in self._context.fail_join_names:
             raise OSError("cannot join process")
         if self._context.exit_on_join:
             self.alive = False
 
     def terminate(self) -> None:
+        if not self.started:
+            self._context.unstarted_lifecycle_calls.append(f"terminate:{self.name}")
+            if self._context.reject_unstarted_lifecycle:
+                raise AssertionError("terminate is invalid before start")
         if self.name in self._context.fail_terminate_names:
             raise OSError("cannot terminate process")
         self.terminated = True
-        self.alive = self.name in self._context.remain_alive_after_terminate
+        self.alive = (
+            self.name in self._context.remain_alive_after_terminate
+            or self._index in self._context.remain_alive_after_terminate_indices
+        )
 
     def close(self) -> None:
+        if self._index in self._context.fail_process_close_indices:
+            raise OSError("cannot close process")
         if self.name in self._context.fail_close_names:
             raise OSError("cannot close process")
         self.closed = True
@@ -146,10 +169,16 @@ class FakeMultiprocessingContext:
         self.processes: list[FakeProcess] = []
         self.events: list[str] = []
         self.fail_start_names: set[str] = set()
+        self.fail_start_after_start_names: set[str] = set()
         self.fail_join_names: set[str] = set()
         self.fail_terminate_names: set[str] = set()
         self.fail_close_names: set[str] = set()
+        self.fail_process_close_indices: set[int] = set()
+        self.fail_queue_close_indices: set[int] = set()
         self.remain_alive_after_terminate: set[str] = set()
+        self.remain_alive_after_terminate_indices: set[int] = set()
+        self.reject_unstarted_lifecycle = False
+        self.unstarted_lifecycle_calls: list[str] = []
         self.exit_on_join = False
 
     def get_start_method(self) -> str:
@@ -157,6 +186,7 @@ class FakeMultiprocessingContext:
 
     def Queue(self, maxsize: int = 0) -> FakeQueue:
         result = FakeQueue(maxsize=maxsize, items=[])
+        result.fail_close = len(self.queues) in self.fail_queue_close_indices
         self.queues.append(result)
         self.events.append(f"queue:{maxsize}")
         return result
@@ -183,7 +213,13 @@ class FakeMultiprocessingContext:
         target: Callable[..., object],
         args: tuple[object, ...],
     ) -> FakeProcess:
-        result = FakeProcess(name=name, target=target, args=args, context=self)
+        result = FakeProcess(
+            name=name,
+            target=target,
+            args=args,
+            context=self,
+            index=len(self.processes),
+        )
         self.processes.append(result)
         self.events.append(f"process:{name}")
         return result
@@ -578,6 +614,120 @@ def test_restart_is_limited_to_asr_and_discussion_with_bounded_old_process_stop(
 
     with pytest.raises(ValueError, match="only ASR and Discussion"):
         runtime.restart(ProcessSource.AUDIO)
+
+
+@pytest.mark.parametrize(
+    ("target", "process_name"),
+    [
+        (ProcessSource.ASR, "FlowLens-ASR"),
+        (ProcessSource.DISCUSSION, "FlowLens-Discussion"),
+    ],
+)
+def test_restart_start_failure_cleans_unstarted_handles_and_allows_new_session(
+    target: ProcessSource,
+    process_name: str,
+) -> None:
+    context = FakeMultiprocessingContext()
+    context.reject_unstarted_lifecycle = True
+    runtime = make_runtime(context=context)
+    runtime.start_all(make_launch())
+    old_process = runtime.processes[target]
+    old_queue = runtime.control_queues[target]
+    context.fail_start_names.add(process_name)
+
+    with pytest.raises(RuntimeError, match=f"{target.value} restart failed"):
+        runtime.restart(target)
+
+    fresh_process = context.processes[4]
+    fresh_queue = context.queues[7]
+    report = runtime.shutdown_report
+    assert report is not None
+    assert runtime.shutdown() is report
+    assert target not in runtime.processes
+    assert target not in runtime.control_queues
+    assert fresh_process.started is False
+    assert fresh_process.terminated is False
+    assert fresh_process.closed is True
+    assert fresh_process.join_calls == []
+    assert context.unstarted_lifecycle_calls == []
+    assert fresh_queue.closed is True
+    assert fresh_queue.joined is True
+    assert old_process.closed is True
+    assert old_queue.closed is True
+    assert any(
+        f"{target.value} restart start: OSError" in error for error in report.errors
+    )
+
+    context.fail_start_names.clear()
+    runtime.start_all(make_launch("02J00000000000000000000000"))
+
+    assert len(runtime.processes) == 4
+    assert runtime.processes[target] is not old_process
+
+
+@pytest.mark.parametrize(
+    ("target", "process_name"),
+    [
+        (ProcessSource.ASR, "FlowLens-ASR"),
+        (ProcessSource.DISCUSSION, "FlowLens-Discussion"),
+    ],
+)
+def test_restart_start_failure_reports_fresh_cleanup_exceptions(
+    target: ProcessSource,
+    process_name: str,
+) -> None:
+    context = FakeMultiprocessingContext()
+    runtime = make_runtime(context=context)
+    runtime.start_all(make_launch())
+    context.fail_start_names.add(process_name)
+    context.fail_process_close_indices.add(4)
+    context.fail_queue_close_indices.add(7)
+
+    with pytest.raises(RuntimeError, match=f"{target.value} restart failed"):
+        runtime.restart(target)
+
+    report = runtime.shutdown_report
+    assert report is not None
+    assert target not in runtime.processes
+    assert target not in runtime.control_queues
+    assert any(
+        f"{target.value} restart start: OSError" in error for error in report.errors
+    )
+    assert any(
+        f"{target.value} restart close: OSError" in error for error in report.errors
+    )
+    assert any("queue close: OSError" in error for error in report.errors)
+    context.fail_start_names.clear()
+    with pytest.raises(RuntimeError, match="incomplete restart cleanup"):
+        runtime.start_all(make_launch("02J00000000000000000000000"))
+    assert runtime.shutdown() is report
+
+
+def test_restart_start_failure_closes_fresh_queue_when_child_remains_alive() -> None:
+    context = FakeMultiprocessingContext()
+    runtime = make_runtime(context=context)
+    runtime.start_all(make_launch())
+    context.fail_start_after_start_names.add("FlowLens-ASR")
+    context.remain_alive_after_terminate_indices.add(4)
+
+    with pytest.raises(RuntimeError, match="ASR restart failed"):
+        runtime.restart(ProcessSource.ASR)
+
+    fresh_process = context.processes[4]
+    fresh_queue = context.queues[7]
+    report = runtime.shutdown_report
+    assert report is not None
+    assert fresh_process.started is True
+    assert fresh_process.terminated is True
+    assert fresh_process.closed is False
+    assert fresh_queue.closed is True
+    assert ProcessSource.ASR not in runtime.processes
+    assert ProcessSource.ASR not in runtime.control_queues
+    assert any(
+        "ASR remains alive after bounded termination" in error
+        for error in report.errors
+    )
+    assert runtime.shutdown() is report
 
 
 def test_shutdown_sends_typed_controls_joins_bounded_and_never_completes() -> None:
