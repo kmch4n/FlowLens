@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import os
 import subprocess
@@ -155,7 +156,7 @@ def test_package_self_check_loads_qt_platform_without_runtime_graph(
         del args, kwargs
         raise AssertionError("self-check must not build the runtime graph")
 
-    monkeypatch.setattr(app.importlib, "import_module", fake_import_module)
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
     monkeypatch.setattr(app, "build_application", fail_build_application)
     monkeypatch.setattr(app, "_PACKAGE_SELF_CHECK_APPLICATION", None, raising=False)
 
@@ -255,6 +256,33 @@ def test_qt_resource_failure_returns_nonzero_before_building_a_window(
     assert app._run_qt(fake_paths(tmp_path), AppOptions()) == 1
 
 
+def test_qt_launch_recovers_incomplete_sessions_before_acquiring_ui(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import flowlens.app as app
+
+    calls: list[AppPaths] = []
+    paths = fake_paths(tmp_path)
+    monkeypatch.setattr(
+        app,
+        "_recover_startup_sessions",
+        lambda selected: calls.append(selected),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app,
+        "_acquire_qapplication",
+        lambda: (_ for _ in ()).throw(AssertionError("ui boundary")),
+    )
+
+    from flowlens.integration.composition import AppOptions
+
+    with pytest.raises(AssertionError, match="ui boundary"):
+        app._run_qt(paths, AppOptions())
+    assert calls == [paths]
+
+
 def test_acceptance_report_serializes_only_local_safe_final_measurements(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
@@ -307,6 +335,12 @@ def test_acceptance_report_serializes_only_local_safe_final_measurements(
             "transcript_count": 0,
             "asr_backlog_ms": 0,
             "maximum_asr_backlog_ms": 125,
+            "latencies_ms": {
+                "partial": [],
+                "commit": [],
+                "discussion": [],
+                "ui_feedback": [],
+            },
         },
     }
     assert "\ufeff" not in report_path.read_text(encoding="utf-8")

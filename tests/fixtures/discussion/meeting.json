@@ -1,0 +1,16 @@
+{
+    "transcript": [
+        {"source": "ME", "text": "保存先はローカルにします。"},
+        {"source": "OTHERS", "text": "はい、その方針で確定です。"}
+    ],
+    "output": {
+        "revision": 1,
+        "mode": "MEETING",
+        "current_focus": "保存方針",
+        "key_points": ["保存先はローカル"],
+        "confirmed_outcomes": ["ローカル保存で確定"],
+        "follow_up_items": [],
+        "updated_at": "2026-08-19T12:00:01.000+09:00"
+    },
+    "prohibited_phrases": ["おすすめ", "賛成材料", "反対材料", "すべき"]
+}

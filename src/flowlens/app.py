@@ -18,6 +18,7 @@ from typing import Any, TypedDict, cast
 from flowlens.config.store import ConfigStore
 from flowlens.integration.composition import AppOptions, build_application
 from flowlens.persistence.paths import AppPaths
+from flowlens.persistence.recovery import recover_incomplete_sessions
 
 _SELF_CHECK_MODULES = (
     "PySide6.QtCore",
@@ -46,6 +47,7 @@ class ControllerAcceptanceSnapshot(TypedDict):
     transcript_count: int
     asr_backlog_ms: int
     maximum_asr_backlog_ms: int
+    latencies_ms: dict[str, list[int]]
 
 
 class AcceptanceReport(TypedDict, total=False):
@@ -206,6 +208,7 @@ def _run_qt(
     from flowlens.ui.main_window import MainWindow
     from flowlens.ui.presenter import QtAccessibilityAnnouncer, QtSessionPresenter
 
+    _recover_startup_sessions(paths)
     app, owns_application = _acquire_qapplication()
     try:
         _configure_qt_surface(app)
@@ -239,6 +242,12 @@ def _run_qt(
                 pass
         if owns_application:
             app.quit()
+
+
+def _recover_startup_sessions(paths: AppPaths) -> None:
+    """Durably recover every incomplete session before opening the live UI."""
+
+    recover_incomplete_sessions(paths.sessions, _utc_now())
 
 
 def _acquire_qapplication() -> tuple[Any, bool]:
@@ -392,6 +401,12 @@ def _controller_measurements(
         "transcript_count": len(transcript),
         "asr_backlog_ms": asr_backlog_ms,
         "maximum_asr_backlog_ms": maximum_asr_backlog_ms,
+        "latencies_ms": {
+            "partial": list(getattr(snapshot, "partial_latencies_ms", ())),
+            "commit": list(getattr(snapshot, "commit_latencies_ms", ())),
+            "discussion": list(getattr(snapshot, "discussion_latencies_ms", ())),
+            "ui_feedback": list(getattr(snapshot, "ui_feedback_latencies_ms", ())),
+        },
     }
 
 

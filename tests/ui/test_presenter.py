@@ -84,6 +84,7 @@ class RecordingController:
         self.transcript = (
             (make_transcript_record(1),) if state is SessionState.COMPLETED else ()
         )
+        self.ui_feedback_latencies: list[int] = []
 
     def snapshot(self) -> ControllerSnapshot:
         return ControllerSnapshot(
@@ -173,6 +174,9 @@ class RecordingController:
         if self.raise_on_tick:
             raise RuntimeError("simulated tick failure")
 
+    def record_ui_feedback(self, latency_ms: int) -> None:
+        self.ui_feedback_latencies.append(latency_ms)
+
 
 def ready_report(
     selection: PreflightSelection,
@@ -225,7 +229,7 @@ def make_presenter(
 
 
 def test_pause_feedback_is_rendered_in_same_event_turn(qtbot: QtBot) -> None:
-    presenter, window, _controller = make_presenter(recording=True)
+    presenter, window, controller = make_presenter(recording=True)
     qtbot.addWidget(window)
 
     started = time.perf_counter()
@@ -237,6 +241,8 @@ def test_pause_feedback_is_rendered_in_same_event_turn(qtbot: QtBot) -> None:
     )
     assert (time.perf_counter() - started) < 0.1
     assert presenter.render_count >= 2
+    assert len(controller.ui_feedback_latencies) == 1
+    assert controller.ui_feedback_latencies[0] <= 100
 
 
 def test_space_does_nothing_when_text_input_has_focus(qtbot: QtBot) -> None:

@@ -166,6 +166,10 @@ class ControllerSnapshot:
     stop_confirmation_visible: bool
     slow_finalization_visible: bool
     completion: CompletionSummary | None = None
+    partial_latencies_ms: tuple[int, ...] = ()
+    commit_latencies_ms: tuple[int, ...] = ()
+    discussion_latencies_ms: tuple[int, ...] = ()
+    ui_feedback_latencies_ms: tuple[int, ...] = ()
 
 
 class SessionController:
@@ -179,12 +183,16 @@ class SessionController:
         clock: Clock,
         announcer: AccessibilityAnnouncer,
         launch_factory: LaunchFactory,
+        acceptance_enabled: bool = False,
     ) -> None:
+        if type(acceptance_enabled) is not bool:
+            raise TypeError("acceptance_enabled must be a boolean")
         self._preflight_service = preflight
         self._runtime = runtime
         self._clock = clock
         self._announcer = announcer
         self._launch_factory = launch_factory
+        self._acceptance_enabled = acceptance_enabled
         self._state = SessionState.IDLE
         self._snapshot = ControllerSnapshot(
             state=self._state,
@@ -352,6 +360,10 @@ class SessionController:
             analysis_status="Starting",
             fatal_error=None,
             completion=None,
+            partial_latencies_ms=(),
+            commit_latencies_ms=(),
+            discussion_latencies_ms=(),
+            ui_feedback_latencies_ms=(),
         )
 
     def pause(self) -> None:
@@ -758,17 +770,38 @@ class SessionController:
             payload, TranscriptCommitted
         ):
             self._route_transcript(envelope, payload)
+            self._record_acceptance_latency(
+                "commit",
+                envelope,
+                payload.record.session_end_ms,
+            )
             return
         if message_type is MessageType.TRANSCRIPT_PARTIAL and isinstance(
             payload, PartialTranscript
         ):
             self._replace_partial(payload)
+            self._record_acceptance_latency(
+                "partial",
+                envelope,
+                payload.session_end_ms,
+            )
             return
         if message_type is MessageType.DISCUSSION_STATE_REPLACED and isinstance(
             payload, DiscussionStateReplaced
         ):
             self._send_rewrapped(ProcessSource.WRITER, envelope, payload)
             self._snapshot = replace(self._snapshot, discussion_state=payload.state)
+            analyzed_records = tuple(
+                item
+                for item in self._snapshot.transcript
+                if item.committed_at <= payload.state.updated_at
+            )
+            if analyzed_records:
+                self._record_acceptance_latency(
+                    "discussion",
+                    envelope,
+                    max(item.session_end_ms for item in analyzed_records),
+                )
             return
         if message_type is MessageType.ASR_STATUS and isinstance(payload, dict):
             self._asr_status(payload)
@@ -886,6 +919,63 @@ class SessionController:
             self._snapshot,
             partials=retained if not payload.text else (*retained, payload),
         )
+
+    def _record_acceptance_latency(
+        self,
+        metric: str,
+        envelope: MessageEnvelope[object],
+        utterance_end_ms: int,
+    ) -> None:
+        if not self._acceptance_enabled:
+            return
+        started_ms = self._started_ms
+        if started_ms is None:
+            return
+        observed_ms = max(
+            envelope.created_monotonic_ms,
+            self._last_clock_ms or envelope.created_monotonic_ms,
+        )
+        latency_ms = max(0, observed_ms - started_ms - utterance_end_ms)
+        if metric == "partial":
+            self._snapshot = replace(
+                self._snapshot,
+                partial_latencies_ms=(
+                    *self._snapshot.partial_latencies_ms,
+                    latency_ms,
+                ),
+            )
+        elif metric == "commit":
+            self._snapshot = replace(
+                self._snapshot,
+                commit_latencies_ms=(
+                    *self._snapshot.commit_latencies_ms,
+                    latency_ms,
+                ),
+            )
+        elif metric == "discussion":
+            self._snapshot = replace(
+                self._snapshot,
+                discussion_latencies_ms=(
+                    *self._snapshot.discussion_latencies_ms,
+                    latency_ms,
+                ),
+            )
+        else:
+            raise ValueError("unknown acceptance latency metric")
+
+    def record_ui_feedback(self, latency_ms: int) -> None:
+        """Record one rendered direct-feedback latency for local acceptance."""
+
+        if type(latency_ms) is not int or latency_ms < 0:
+            raise ValueError("latency_ms must be a non-negative integer")
+        if self._acceptance_enabled:
+            self._snapshot = replace(
+                self._snapshot,
+                ui_feedback_latencies_ms=(
+                    *self._snapshot.ui_feedback_latencies_ms,
+                    latency_ms,
+                ),
+            )
 
     def _asr_status(self, payload: dict[str, object]) -> None:
         state = cast(str, payload["state"])

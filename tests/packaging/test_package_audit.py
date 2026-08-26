@@ -323,7 +323,7 @@ def test_probe_reports_taskkill_cleanup_failures_and_falls_back_to_kill(
 
     def taskkill(*args: object, **kwargs: object) -> object:
         del kwargs
-        taskkill_calls.append(cast(tuple[object, ...], args))
+        taskkill_calls.append(args)
         if isinstance(taskkill_failure, BaseException):
             raise taskkill_failure
         return taskkill_failure

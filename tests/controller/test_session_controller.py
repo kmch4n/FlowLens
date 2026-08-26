@@ -2,7 +2,7 @@
 
 import pickle
 from collections.abc import Mapping
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -197,6 +197,8 @@ def launch(root: Path) -> SessionLaunch:
 
 def make_controller(
     tmp_path: Path,
+    *,
+    acceptance_enabled: bool = False,
 ) -> tuple[SessionController, FakeRuntime, FakeClock, FakeAnnouncer, SessionLaunch]:
     root = tmp_path.resolve()
     runtime = FakeRuntime()
@@ -209,6 +211,7 @@ def make_controller(
         clock=clock,
         announcer=announcer,
         launch_factory=lambda checked, now, now_ms: launch_value,
+        acceptance_enabled=acceptance_enabled,
     )
     return controller, runtime, clock, announcer, launch_value
 
@@ -393,6 +396,76 @@ def test_committed_transcript_is_persisted_before_discussion_fanout(
     assert sent_to(runtime, ProcessSource.WRITER)[-1].sequence == 2
     assert sent_to(runtime, ProcessSource.DISCUSSION)[-1].sequence == 2
     assert controller.snapshot().transcript == (make_transcript_record(),)
+
+
+def test_acceptance_mode_records_commit_and_discussion_latencies(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, clock, announcer, _ = make_controller(
+        tmp_path,
+        acceptance_enabled=True,
+    )
+    controller.enter_preflight()
+    controller.start(selection())
+    controller.handle_message(writer_ack())
+    for source in (ProcessSource.AUDIO, ProcessSource.ASR, ProcessSource.DISCUSSION):
+        controller.handle_message(ready(source))
+    partial = replace(
+        worker_envelope(
+            ProcessSource.ASR,
+            MessageType.TRANSCRIPT_PARTIAL,
+            2,
+            {
+                "source": make_transcript_record().source.value,
+                "text": "今回の方針",
+                "session_start_ms": 200,
+                "session_end_ms": 1_000,
+                "source_start_sample": 0,
+                "source_end_sample": 12_800,
+            },
+        ),
+        created_monotonic_ms=2_500,
+    )
+    controller.handle_message(partial)
+    committed = replace(
+        worker_envelope(
+            ProcessSource.ASR,
+            MessageType.TRANSCRIPT_COMMITTED,
+            3,
+            make_transcript_record().to_dict(),
+        ),
+        created_monotonic_ms=3_200,
+    )
+    controller.handle_message(committed)
+    later_record = replace(
+        make_transcript_record(2),
+        committed_at=datetime.fromisoformat("2026-08-19T12:06:00+09:00"),
+    )
+    later = replace(
+        worker_envelope(
+            ProcessSource.ASR,
+            MessageType.TRANSCRIPT_COMMITTED,
+            4,
+            later_record.to_dict(),
+        ),
+        created_monotonic_ms=4_200,
+    )
+    controller.handle_message(later)
+    replacement = replace(
+        worker_envelope(
+            ProcessSource.DISCUSSION,
+            MessageType.DISCUSSION_STATE_REPLACED,
+            2,
+            DiscussionStateReplaced(0, make_discussion_state(revision=1)),
+        ),
+        created_monotonic_ms=7_000,
+    )
+    controller.handle_message(replacement)
+
+    snapshot = controller.snapshot()
+    assert snapshot.partial_latencies_ms == (500,)
+    assert snapshot.commit_latencies_ms == (400, 400)
+    assert snapshot.discussion_latencies_ms == (4_200,)
 
 
 def test_writer_mutations_share_one_contiguous_gui_sequence(tmp_path: Path) -> None:

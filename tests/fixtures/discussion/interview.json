@@ -1,0 +1,16 @@
+{
+    "transcript": [
+        {"source": "OTHERS", "text": "学生時代に力を入れたことを教えてください。"},
+        {"source": "ME", "text": "ゼミで地域調査を担当しました。"}
+    ],
+    "output": {
+        "revision": 1,
+        "mode": "INTERVIEW",
+        "current_focus": "学生時代に力を入れたこと",
+        "key_points": ["ゼミで地域調査を担当"],
+        "confirmed_outcomes": [],
+        "follow_up_items": ["担当内容の詳細"],
+        "updated_at": "2026-08-19T12:00:01.000+09:00"
+    },
+    "prohibited_phrases": ["決定事項", "未解決事項", "おすすめ", "回答すべき"]
+}

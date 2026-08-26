@@ -166,6 +166,7 @@ def build_application(paths: AppPaths, options: AppOptions) -> ApplicationGraph:
             now_ms,
             model_readiness,
         ),
+        acceptance_enabled=options.acceptance_report is not None,
     )
     return ApplicationGraph(
         paths=paths,

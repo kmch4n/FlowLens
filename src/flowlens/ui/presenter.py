@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Protocol
@@ -319,6 +320,7 @@ class QtSessionPresenter:
         self.render_current_snapshot()
 
     def _pause_or_resume_requested(self) -> None:
+        started_ns = time.perf_counter_ns()
         state = self.controller.snapshot().state
         if state is SessionState.RECORDING:
             self.controller.pause()
@@ -327,6 +329,10 @@ class QtSessionPresenter:
         else:
             return
         self.render_current_snapshot()
+        recorder = getattr(self.controller, "record_ui_feedback", None)
+        if callable(recorder):
+            latency_ms = max(0, (time.perf_counter_ns() - started_ns) // 1_000_000)
+            recorder(latency_ms)
 
     def _request_stop(self) -> None:
         snapshot = self.controller.snapshot()
