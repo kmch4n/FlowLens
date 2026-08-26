@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import queue
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import pytest
@@ -15,14 +17,16 @@ from flowlens.audio.types import AudioFrame, AudioWorkerConfig
 from flowlens.controller.session_controller import SessionLaunch
 from flowlens.discussion.llama_cpp_adapter import DiscussionModelConfig
 from flowlens.discussion.worker import DiscussionWorkerConfig
-from flowlens.domain.enums import AudioSource, MessageType, ProcessSource
+from flowlens.domain.enums import AudioSource, EventType, MessageType, ProcessSource
 from flowlens.domain.messages import (
     AudioDrainFence,
     AudioWriteCommand,
     MessageEnvelope,
+    WriterForceCloseOutcome,
+    WriterForceCloseRequest,
     WriterShutdown,
 )
-from tests.factories import make_discussion_state, make_manifest
+from tests.factories import make_discussion_state, make_event_record, make_manifest
 
 SESSION_ID = "01J00000000000000000000000"
 
@@ -80,6 +84,11 @@ class FakeEvent:
         return self.set_count > 0
 
 
+@dataclass
+class FakeRawValue:
+    value: int
+
+
 class FakeProcess:
     def __init__(
         self,
@@ -113,14 +122,20 @@ class FakeProcess:
     def join(self, timeout: float | None = None) -> None:
         assert timeout is not None
         self.join_calls.append(timeout)
+        if self.name in self._context.fail_join_names:
+            raise OSError("cannot join process")
         if self._context.exit_on_join:
             self.alive = False
 
     def terminate(self) -> None:
+        if self.name in self._context.fail_terminate_names:
+            raise OSError("cannot terminate process")
         self.terminated = True
-        self.alive = False
+        self.alive = self.name in self._context.remain_alive_after_terminate
 
     def close(self) -> None:
+        if self.name in self._context.fail_close_names:
+            raise OSError("cannot close process")
         self.closed = True
 
 
@@ -131,6 +146,10 @@ class FakeMultiprocessingContext:
         self.processes: list[FakeProcess] = []
         self.events: list[str] = []
         self.fail_start_names: set[str] = set()
+        self.fail_join_names: set[str] = set()
+        self.fail_terminate_names: set[str] = set()
+        self.fail_close_names: set[str] = set()
+        self.remain_alive_after_terminate: set[str] = set()
         self.exit_on_join = False
 
     def get_start_method(self) -> str:
@@ -145,6 +164,17 @@ class FakeMultiprocessingContext:
     def Event(self) -> FakeEvent:
         self.events.append("event")
         return FakeEvent()
+
+    def Lock(self) -> Lock:
+        return Lock()
+
+    def RawValue(self, typecode: str, value: int) -> FakeRawValue:
+        del typecode
+        return FakeRawValue(value)
+
+    def RawArray(self, typecode: str, size: int) -> bytearray:
+        del typecode
+        return bytearray(size)
 
     def Process(
         self,
@@ -170,7 +200,7 @@ def fake_targets() -> Any:
     )
 
 
-def make_launch() -> SessionLaunch:
+def make_launch(session_id: str = SESSION_ID) -> SessionLaunch:
     initial_state = make_discussion_state()
     model = object.__new__(DiscussionModelConfig)
     object.__setattr__(model, "model_path", Path("C:/models/qwen.gguf"))
@@ -180,13 +210,13 @@ def make_launch() -> SessionLaunch:
     object.__setattr__(model, "temperature", 0.0)
     object.__setattr__(model, "max_tokens", 512)
     return SessionLaunch(
-        session_id=SESSION_ID,
+        session_id=session_id,
         session_dir=Path("C:/FlowLens/sessions/01J").resolve(strict=False),
-        manifest=make_manifest(session_id=SESSION_ID),
+        manifest=make_manifest(session_id=session_id),
         initial_state=initial_state,
-        audio_config=AudioWorkerConfig(SESSION_ID, "mic-1", "out-1", 1_000, 4, 5),
-        asr_config=AsrWorkerConfig(SESSION_ID, Path("C:/models/asr")),
-        discussion_config=DiscussionWorkerConfig(SESSION_ID, model, initial_state),
+        audio_config=AudioWorkerConfig(session_id, "mic-1", "out-1", 1_000, 4, 5),
+        asr_config=AsrWorkerConfig(session_id, Path("C:/models/asr")),
+        discussion_config=DiscussionWorkerConfig(session_id, model, initial_state),
     )
 
 
@@ -243,6 +273,24 @@ def worker_envelope(
     )
 
 
+def force_close_request(session_id: str = SESSION_ID) -> WriterForceCloseRequest:
+    return WriterForceCloseRequest(
+        replace(
+            make_event_record(sequence=1),
+            session_id=session_id,
+            event_type=EventType.FORCE_CLOSE_REQUESTED,
+        )
+    )
+
+
+def completion_event(session_id: str = SESSION_ID) -> object:
+    return replace(
+        make_event_record(sequence=1),
+        session_id=session_id,
+        event_type=EventType.SESSION_COMPLETED,
+    )
+
+
 def test_runtime_starts_exactly_four_children_with_spawn_context() -> None:
     context = FakeMultiprocessingContext(start_method="spawn")
     runtime = make_runtime(context=context)
@@ -274,6 +322,7 @@ def test_worker_process_arguments_match_target_signatures() -> None:
         runtime.writer_audio_queue,
         runtime.response_queue,
         runtime.writer_stop_event,
+        runtime.writer_finalization_gate,
     )
     assert audio.args == (
         launch.audio_config,
@@ -295,6 +344,87 @@ def test_worker_process_arguments_match_target_signatures() -> None:
     )
 
 
+def test_runtime_owns_a_fresh_writer_gate_and_reports_normal_completion() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+
+    first_gate = runtime.writer_finalization_gate
+    first_claim = first_gate.claim_terminal(completion_event())
+    first_result = first_gate.publish_result(
+        first_claim.outcome,
+        datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+    )
+
+    assert first_result.outcome is WriterForceCloseOutcome.COMPLETED
+    assert runtime.writer_force_close_result() == first_result
+
+    runtime.shutdown()
+    runtime.start_all(make_launch("02J00000000000000000000000"))
+
+    assert runtime.writer_finalization_gate is not first_gate
+    assert runtime.writer_force_close_result() is None
+
+
+def test_runtime_delegates_force_first_and_finalize_first_gate_outcomes() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+    gate = runtime.writer_finalization_gate
+
+    assert runtime.request_writer_force_close(force_close_request(), 0.1) is None
+    force_claim = gate.claim_force_if_requested()
+    assert force_claim is not None
+    force_result = gate.publish_result(
+        force_claim.outcome,
+        datetime(2026, 8, 26, 12, 1, tzinfo=UTC),
+    )
+    assert runtime.writer_force_close_result() == force_result
+
+    runtime.shutdown()
+    runtime.start_all(make_launch("02J00000000000000000000000"))
+    fresh_gate = runtime.writer_finalization_gate
+    completion_claim = fresh_gate.claim_terminal(
+        completion_event("02J00000000000000000000000")
+    )
+    completion_result = fresh_gate.publish_result(
+        completion_claim.outcome,
+        datetime(2026, 8, 26, 12, 2, tzinfo=UTC),
+    )
+
+    assert (
+        runtime.request_writer_force_close(
+            force_close_request("02J00000000000000000000000"),
+            0.1,
+        )
+        == completion_result
+    )
+    assert runtime.writer_force_close_result() == completion_result
+
+
+def test_runtime_fails_closed_for_stale_force_requests_and_dead_writer() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch("02J00000000000000000000000"))
+
+    with pytest.raises(RuntimeError, match="does not match the active session"):
+        runtime.request_writer_force_close(force_close_request(), 0.1)
+
+    assert runtime.shutdown_report is not None
+
+    restarted = make_runtime()
+    restarted.start_all(make_launch())
+    assert restarted.request_writer_force_close(force_close_request(), 0.1) is None
+    restarted.context.processes[0].alive = False
+
+    with pytest.raises(RuntimeError, match="could not be resolved"):
+        restarted.writer_force_close_result()
+
+    assert restarted.shutdown_report is not None
+
+
+def test_runtime_rejects_force_close_queries_without_an_active_gate() -> None:
+    with pytest.raises(RuntimeError, match="finalization gate became unavailable"):
+        make_runtime().writer_force_close_result()
+
+
 def test_audio_payload_and_writer_fence_never_enter_general_control_queue() -> None:
     runtime = make_runtime()
     runtime.start_all(make_launch())
@@ -313,7 +443,16 @@ def test_audio_payload_and_writer_fence_never_enter_general_control_queue() -> N
     assert runtime.general_queues_contain(AudioDrainFence) is False
 
 
-@pytest.mark.parametrize("payload", [b"\x00\x01", AudioDrainFence()])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x00\x01",
+        AudioDrainFence(),
+        {"nested": [bytearray(b"\x00\x01")]},
+        {"nested": memoryview(b"\x00\x01")},
+        AudioWriteCommand(AudioSource.ME, b"\x00\x00", 0, 1, 0, 1),
+    ],
+)
 def test_runtime_rejects_audio_payloads_on_general_control_queue(
     payload: object,
 ) -> None:
@@ -334,6 +473,50 @@ def test_runtime_rejects_audio_payloads_on_general_control_queue(
 
     assert runtime.general_queues_contain_bytes() is False
     assert runtime.general_queues_contain(AudioDrainFence) is False
+
+
+def test_runtime_rejects_cyclic_and_hostile_audio_payload_containers() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+    cyclic: list[object] = []
+    cyclic.extend([cyclic, {"fence": AudioDrainFence()}])
+
+    class HostileMapping(dict[str, object]):
+        def items(self) -> Any:
+            raise RuntimeError("hostile mapping")
+
+    for payload in (cyclic, HostileMapping(payload="safe-looking")):
+        envelope = MessageEnvelope(
+            schema_version=1,
+            session_id=SESSION_ID,
+            message_type=MessageType.WORKER_START,
+            sequence=1,
+            source=ProcessSource.GUI,
+            created_monotonic_ms=1_000,
+            payload=payload,
+        )
+        with pytest.raises(ValueError, match="dedicated audio queues"):
+            runtime.send(ProcessSource.AUDIO, envelope)
+
+    assert runtime.control_queues[ProcessSource.AUDIO].items == []
+
+
+def test_runtime_keeps_legitimate_control_envelopes_usable() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+    envelope = MessageEnvelope(
+        schema_version=1,
+        session_id=SESSION_ID,
+        message_type=MessageType.WORKER_START,
+        sequence=1,
+        source=ProcessSource.GUI,
+        created_monotonic_ms=1_000,
+        payload={"worker": "AUDIO"},
+    )
+
+    runtime.send(ProcessSource.AUDIO, envelope)
+
+    assert runtime.control_queues[ProcessSource.AUDIO].items == [envelope]
 
 
 def test_poll_drains_with_fixed_nonblocking_budget() -> None:
@@ -381,7 +564,7 @@ def test_restart_is_limited_to_asr_and_discussion_with_bounded_old_process_stop(
 
     assert old_asr_queue.items[-1].message_type is MessageType.WORKER_STOP
     assert old_asr_queue.items[-1].payload == {"worker": "ASR", "finalize": True}
-    assert old_asr_process.join_calls == [0.25]
+    assert old_asr_process.join_calls == [0.25, 0.25]
     assert old_asr_process.terminated is True
     assert old_asr_process.closed is True
     assert runtime.restart_reports[-1].terminated == (ProcessSource.ASR,)
@@ -427,7 +610,72 @@ def test_shutdown_sends_typed_controls_joins_bounded_and_never_completes() -> No
         "worker": "DISCUSSION",
         "finalize": True,
     }
-    assert all(process.join_calls == [0.25] for process in runtime.processes.values())
+    assert all(
+        process.join_calls == [0.25, 0.25] for process in runtime.processes.values()
+    )
+    assert all(process.closed is True for process in runtime.processes.values())
+    assert all(queue.closed and queue.joined for queue in runtime.context.queues)
+
+
+def test_runtime_recreates_queues_events_and_processes_after_shutdown() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+    first_processes = tuple(runtime.processes.values())
+    first_queues = tuple(runtime.context.queues)
+    first_gate = runtime.writer_finalization_gate
+
+    first_report = runtime.shutdown()
+    runtime.start_all(make_launch("02J00000000000000000000000"))
+    second_report = runtime.shutdown()
+
+    assert first_report is not second_report
+    assert all(queue.closed and queue.joined for queue in first_queues)
+    assert not any(process in runtime.processes.values() for process in first_processes)
+    assert runtime.writer_finalization_gate is not first_gate
+
+
+def test_runtime_allows_retry_after_partial_start_failure() -> None:
+    context = FakeMultiprocessingContext()
+    context.fail_start_names.add("FlowLens-ASR")
+    runtime = make_runtime(context=context)
+
+    with pytest.raises(RuntimeError, match="FlowLens-ASR"):
+        runtime.start_all(make_launch())
+
+    failed_queues = tuple(context.queues)
+    context.fail_start_names.clear()
+    runtime.start_all(make_launch("02J00000000000000000000000"))
+
+    assert len(runtime.processes) == 4
+    assert all(queue.closed and queue.joined for queue in failed_queues)
+
+
+def test_shutdown_reports_a_process_that_survives_termination_without_closing_it() -> (
+    None
+):
+    context = FakeMultiprocessingContext()
+    context.remain_alive_after_terminate.add("FlowLens-ASR")
+    runtime = make_runtime(context=context)
+    runtime.start_all(make_launch())
+
+    report = runtime.shutdown()
+    asr = runtime.processes[ProcessSource.ASR]
+
+    assert ProcessSource.ASR not in report.joined
+    assert ProcessSource.ASR in report.terminated
+    assert any("ASR remains alive" in error for error in report.errors)
+    assert asr.closed is False
+
+
+def test_shutdown_records_process_operation_errors_without_raising() -> None:
+    context = FakeMultiprocessingContext()
+    context.fail_join_names.add("FlowLens-ASR")
+    runtime = make_runtime(context=context)
+    runtime.start_all(make_launch())
+
+    report = runtime.shutdown()
+
+    assert any("ASR join: OSError" in error for error in report.errors)
 
 
 def test_start_failure_cleans_up_already_started_children_without_starting_later() -> (

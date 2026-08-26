@@ -6,7 +6,8 @@ import importlib
 import multiprocessing
 import queue
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
+from multiprocessing.context import BaseContext
 from typing import NoReturn, Protocol, cast
 
 from flowlens.controller.session_controller import SessionLaunch
@@ -18,6 +19,7 @@ from flowlens.domain.messages import (
     WriterForceCloseResult,
     WriterShutdown,
 )
+from flowlens.workers.finalization_gate import WriterFinalizationGate
 
 _PROCESS_ORDER = (
     ProcessSource.WRITER,
@@ -198,6 +200,7 @@ class MultiprocessingWorkerRuntime:
         self._writer_audio_queue: _QueueLike | None = None
         self._asr_audio_queue: _QueueLike | None = None
         self._writer_stop_event: _EventLike | None = None
+        self._writer_finalization_gate: WriterFinalizationGate | None = None
         self._shutdown_report: WorkerShutdownReport | None = None
         self.restart_reports: list[WorkerRestartReport] = []
 
@@ -240,6 +243,14 @@ class MultiprocessingWorkerRuntime:
         return self._writer_stop_event
 
     @property
+    def writer_finalization_gate(self) -> WriterFinalizationGate:
+        """Return the Writer gate owned by the currently active runtime session."""
+
+        if self._writer_finalization_gate is None:
+            raise RuntimeError("writer finalization gate is unavailable")
+        return self._writer_finalization_gate
+
+    @property
     def shutdown_report(self) -> WorkerShutdownReport | None:
         """Return the latest shutdown report, if shutdown has run."""
 
@@ -250,10 +261,14 @@ class MultiprocessingWorkerRuntime:
 
         if not isinstance(launch, SessionLaunch):
             raise TypeError("launch must be a SessionLaunch")
-        if self._processes:
+        if self._processes and not self._ready_for_reuse():
             raise RuntimeError("worker runtime is already started")
+        self._discard_previous_session()
         self._launch = launch
         self._shutdown_report = None
+        self._writer_finalization_gate = WriterFinalizationGate.create(
+            cast(BaseContext, self.context),
+        )
         self._create_queues(launch)
         for worker in _START_ORDER:
             process = self._create_process(worker, launch)
@@ -325,6 +340,12 @@ class MultiprocessingWorkerRuntime:
             old_process,
             old_queue,
         )
+        if target not in joined:
+            self.restart_reports.append(
+                WorkerRestartReport(target, joined, terminated, errors)
+            )
+            raise RuntimeError(f"{target.value} process remained alive after restart")
+        errors = errors + self._close_queues((old_queue,))
         self._control_queues[target] = self.context.Queue()
         process = self._create_process(target, launch)
         self._processes[target] = process
@@ -388,6 +409,17 @@ class MultiprocessingWorkerRuntime:
             joined.extend(worker_joined)
             terminated.extend(worker_terminated)
             errors.extend(worker_errors)
+        if self._all_processes_stopped():
+            errors.extend(
+                self._close_queues(
+                    (
+                        self._response_queue,
+                        *self._control_queues.values(),
+                        self._writer_audio_queue,
+                        self._asr_audio_queue,
+                    )
+                )
+            )
         self._shutdown_report = WorkerShutdownReport(
             completed=False,
             joined=tuple(joined),
@@ -401,7 +433,7 @@ class MultiprocessingWorkerRuntime:
         request: WriterForceCloseRequest,
         timeout_seconds: float,
     ) -> WriterForceCloseResult | None:
-        """Return unresolved because Task 12 starts Writer with the 4-arg target."""
+        """Delegate a current-session force-close request to Writer's gate."""
 
         if type(request) is not WriterForceCloseRequest:
             raise TypeError("request must be an exact WriterForceCloseRequest")
@@ -411,11 +443,31 @@ class MultiprocessingWorkerRuntime:
             or float(timeout_seconds) < 0.0
         ):
             raise ValueError("timeout_seconds must be non-negative")
-        return None
+        launch = self._require_launch()
+        if request.event.session_id != launch.session_id:
+            self._fail_closed(
+                "Writer force-close request does not match the active session",
+                ValueError("stale force-close request"),
+            )
+        self._require_live_writer()
+        try:
+            return self.writer_finalization_gate.request_force_close(
+                request,
+                timeout_seconds=float(timeout_seconds),
+            )
+        except Exception as error:
+            self._fail_closed("Writer finalization gate became unavailable", error)
 
     def writer_force_close_result(self) -> WriterForceCloseResult | None:
-        """Return no force-close result for the 4-argument Writer target."""
+        """Read Writer's gate result without relying on a response-queue delivery."""
 
+        try:
+            result = self.writer_finalization_gate.result()
+        except Exception as error:
+            self._fail_closed("Writer finalization gate became unavailable", error)
+        if result is not None:
+            return result
+        self._require_live_writer()
         return None
 
     def general_queues_contain_bytes(self) -> bool:
@@ -472,6 +524,7 @@ class MultiprocessingWorkerRuntime:
                 self.writer_audio_queue,
                 self.response_queue,
                 self.writer_stop_event,
+                self.writer_finalization_gate,
             )
         if worker is ProcessSource.AUDIO:
             return (
@@ -516,28 +569,50 @@ class MultiprocessingWorkerRuntime:
             _put_nowait(control_queue, self._shutdown_envelope(worker))
         except Exception as error:
             errors.append(f"{worker.value} control: {_error_name(error)}")
-        try:
-            process.join(timeout=self._join_timeout_seconds)
-        except Exception as error:
-            errors.append(f"{worker.value} join: {_error_name(error)}")
-        joined = (worker,)
+        self._join_process(worker, process, errors)
+        alive = self._process_is_alive(worker, process, errors)
         terminated: tuple[ProcessSource, ...] = ()
-        try:
-            alive = process.is_alive()
-        except Exception as error:
-            errors.append(f"{worker.value} health: {_error_name(error)}")
-            alive = True
         if alive:
             try:
                 process.terminate()
                 terminated = (worker,)
             except Exception as error:
                 errors.append(f"{worker.value} terminate: {_error_name(error)}")
-        try:
-            process.close()
-        except Exception as error:
-            errors.append(f"{worker.value} close: {_error_name(error)}")
+            self._join_process(worker, process, errors)
+            alive = self._process_is_alive(worker, process, errors)
+        joined: tuple[ProcessSource, ...] = ()
+        if alive:
+            errors.append(f"{worker.value} remains alive after bounded termination")
+        else:
+            joined = (worker,)
+            try:
+                process.close()
+            except Exception as error:
+                errors.append(f"{worker.value} close: {_error_name(error)}")
         return joined, terminated, tuple(errors)
+
+    def _join_process(
+        self,
+        worker: ProcessSource,
+        process: _ProcessLike,
+        errors: list[str],
+    ) -> None:
+        try:
+            process.join(timeout=self._join_timeout_seconds)
+        except Exception as error:
+            errors.append(f"{worker.value} join: {_error_name(error)}")
+
+    @staticmethod
+    def _process_is_alive(
+        worker: ProcessSource,
+        process: _ProcessLike,
+        errors: list[str],
+    ) -> bool:
+        try:
+            return bool(process.is_alive())
+        except Exception as error:
+            errors.append(f"{worker.value} health: {_error_name(error)}")
+            return True
 
     def _shutdown_envelope(self, worker: ProcessSource) -> MessageEnvelope[object]:
         launch = self._require_launch()
@@ -576,6 +651,64 @@ class MultiprocessingWorkerRuntime:
             raise RuntimeError("worker runtime has no active launch")
         return self._launch
 
+    def _require_live_writer(self) -> None:
+        writer = self._processes.get(ProcessSource.WRITER)
+        if writer is None:
+            self._fail_closed(
+                "Writer force-close outcome could not be resolved",
+                RuntimeError("Writer process is unavailable"),
+            )
+        errors: list[str] = []
+        if not self._process_is_alive(ProcessSource.WRITER, writer, errors):
+            self._fail_closed(
+                "Writer force-close outcome could not be resolved",
+                RuntimeError("Writer process exited"),
+            )
+        if errors:
+            self._fail_closed(
+                "Writer force-close outcome could not be resolved",
+                RuntimeError(errors[0]),
+            )
+
+    def _ready_for_reuse(self) -> bool:
+        return self._shutdown_report is not None and self._all_processes_stopped()
+
+    def _discard_previous_session(self) -> None:
+        self._launch = None
+        self._control_queues = {}
+        self._processes = {}
+        self._response_queue = None
+        self._writer_audio_queue = None
+        self._asr_audio_queue = None
+        self._writer_stop_event = None
+        self._writer_finalization_gate = None
+        self.restart_reports = []
+
+    def _all_processes_stopped(self) -> bool:
+        for worker, process in self._processes.items():
+            errors: list[str] = []
+            if self._process_is_alive(worker, process, errors):
+                return False
+        return True
+
+    @staticmethod
+    def _close_queues(
+        queues: tuple[_QueueLike | None, ...],
+    ) -> tuple[str, ...]:
+        errors: list[str] = []
+        for queue_value in queues:
+            if queue_value is None:
+                continue
+            for operation_name in ("close", "join_thread"):
+                operation = getattr(queue_value, operation_name, None)
+                if not callable(operation):
+                    continue
+                try:
+                    operation()
+                except Exception as error:
+                    errors.append(f"queue {operation_name}: {_error_name(error)}")
+        return tuple(errors)
+
     @staticmethod
     def _require_queue(queue_value: _QueueLike | None, name: str) -> _QueueLike:
         if queue_value is None:
@@ -602,11 +735,10 @@ def _put_nowait(queue_value: _QueueLike, item: object) -> None:
 
 
 def _contains_dedicated_audio_payload(value: object) -> bool:
-    return (
-        isinstance(value, AudioDrainFence)
-        or isinstance(value, bytes | bytearray | memoryview)
-        or _contains_type(value, AudioDrainFence)
-        or _contains_type(value, bytes)
+    return _contains_payload_type(
+        value,
+        (AudioDrainFence, bytes, bytearray, memoryview),
+        fail_closed=True,
     )
 
 
@@ -615,9 +747,26 @@ def _contains_type(
     payload_type: type[object],
     active_ids: set[int] | None = None,
 ) -> bool:
-    if isinstance(value, payload_type):
+    return _contains_payload_type(
+        value,
+        (payload_type,),
+        active_ids=active_ids,
+        fail_closed=False,
+    )
+
+
+def _contains_payload_type(
+    value: object,
+    payload_types: tuple[type[object], ...],
+    *,
+    active_ids: set[int] | None = None,
+    fail_closed: bool,
+) -> bool:
+    if isinstance(value, payload_types):
         return True
     active = set() if active_ids is None else active_ids
+    if not _is_traversable_payload(value):
+        return False
     value_id = id(value)
     if value_id in active:
         return False
@@ -625,20 +774,46 @@ def _contains_type(
     try:
         if isinstance(value, Mapping):
             return any(
-                _contains_type(item, payload_type, active)
+                _contains_payload_type(
+                    item,
+                    payload_types,
+                    active_ids=active,
+                    fail_closed=fail_closed,
+                )
                 for pair in value.items()
                 for item in pair
             )
         if isinstance(value, tuple | list | set | frozenset):
-            return any(_contains_type(item, payload_type, active) for item in value)
-        if hasattr(value, "__dataclass_fields__"):
             return any(
-                _contains_type(getattr(value, field_name), payload_type, active)
-                for field_name in value.__dataclass_fields__
+                _contains_payload_type(
+                    item,
+                    payload_types,
+                    active_ids=active,
+                    fail_closed=fail_closed,
+                )
+                for item in value
             )
+        if is_dataclass(value) and not isinstance(value, type):
+            return any(
+                _contains_payload_type(
+                    getattr(value, field.name),
+                    payload_types,
+                    active_ids=active,
+                    fail_closed=fail_closed,
+                )
+                for field in fields(value)
+            )
+    except BaseException:
+        return fail_closed
     finally:
         active.remove(value_id)
     return False
+
+
+def _is_traversable_payload(value: object) -> bool:
+    return isinstance(value, Mapping | tuple | list | set | frozenset) or (
+        is_dataclass(value) and not isinstance(value, type)
+    )
 
 
 def _error_name(error: Exception) -> str:
