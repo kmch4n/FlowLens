@@ -141,8 +141,8 @@ def _latencies(events: Sequence[object], event_type: str) -> list[int]:
     return values
 
 
-def _sample_measurements(samples: Sequence[object]) -> tuple[float | None, int]:
-    parsed: list[tuple[int, int, bool]] = []
+def _sample_measurements(samples: Sequence[object]) -> float | None:
+    parsed: list[tuple[int, int]] = []
     for index, value in enumerate(samples, start=1):
         sample = _mapping(value, f"samples line {index}")
         elapsed = _non_negative_int(
@@ -151,10 +151,7 @@ def _sample_measurements(samples: Sequence[object]) -> tuple[float | None, int]:
         rss = _non_negative_int(
             sample.get("rss_bytes"), f"samples line {index} rss_bytes"
         )
-        gpu_oom = sample.get("gpu_oom")
-        if not isinstance(gpu_oom, bool):
-            raise ValueError(f"samples line {index} gpu_oom must be a boolean")
-        parsed.append((elapsed, rss, gpu_oom))
+        parsed.append((elapsed, rss))
     if [item[0] for item in parsed] != sorted({item[0] for item in parsed}):
         raise ValueError("sample elapsed_seconds must be strictly increasing")
     minute_5 = next((item for item in parsed if 300 <= item[0] <= 305), None)
@@ -162,7 +159,19 @@ def _sample_measurements(samples: Sequence[object]) -> tuple[float | None, int]:
     growth = None
     if minute_5 is not None and minute_30 is not None:
         growth = (minute_30[1] - minute_5[1]) / (1024 * 1024)
-    return growth, sum(1 for _, _, gpu_oom in parsed if gpu_oom)
+    return growth
+
+
+def _gpu_oom_count(events: Sequence[object]) -> int:
+    count = 0
+    for index, value in enumerate(events, start=1):
+        event = _mapping(value, f"events line {index}")
+        if event.get("event_type") != "ANALYSIS_FAILED":
+            continue
+        details = _mapping(event.get("details"), f"events line {index} details")
+        if details.get("error_code") == "GPU_OOM":
+            count += 1
+    return count
 
 
 def _offline_blocked(value: object) -> bool:
@@ -235,7 +244,8 @@ def collect_acceptance(
     else:
         latency_values = _application_latencies(application_report_path)
     samples = _load_jsonl(samples_path)
-    memory_growth, gpu_oom_count = _sample_measurements(samples)
+    memory_growth = _sample_measurements(samples)
+    gpu_oom_count = _gpu_oom_count(events)
     ui_values = latency_values["ui_feedback"]
     discussion_values = latency_values["discussion"]
     return AcceptanceMetrics(

@@ -143,6 +143,78 @@ def test_collector_uses_event_samples_and_offline_evidence(tmp_path: Path) -> No
     assert evaluate_acceptance(metrics).errors == ()
 
 
+def test_collector_counts_gpu_oom_from_persisted_analysis_failures(
+    tmp_path: Path,
+) -> None:
+    session = tmp_path / "session"
+    session.mkdir()
+    events = [
+        {"event_type": "ANALYSIS_FAILED", "details": {"error_code": "GPU_OOM"}},
+        {"event_type": "ANALYSIS_FAILED", "details": {"error_code": "EXIT"}},
+        {"event_type": "ANALYSIS_FAILED", "details": {"error_code": "GPU_OOM"}},
+    ]
+    (session / "events.jsonl").write_text(
+        "".join(json.dumps(item) + "\n" for item in events),
+        encoding="utf-8",
+        newline="\n",
+    )
+    application_report = tmp_path / "application.json"
+    application_report.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "exit_code": 0,
+                "controller": {
+                    "state": "COMPLETED",
+                    "completion_available": True,
+                    "latencies_ms": {
+                        "partial": [1_000],
+                        "commit": [2_000],
+                        "discussion": [4_000],
+                        "ui_feedback": [80],
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    samples = tmp_path / "samples.jsonl"
+    samples.write_text(
+        json.dumps({"elapsed_seconds": 300, "rss_bytes": 100_000_000})
+        + "\n"
+        + json.dumps({"elapsed_seconds": 1800, "rss_bytes": 200_000_000})
+        + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    evidence = tmp_path / "firewall.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "program": "C:/FlowLens/FlowLens.exe",
+                "rule_name": "FlowLens-Acceptance-123",
+                "outbound_blocked": True,
+                "active_throughout": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    metrics = collect_acceptance(
+        session=session,
+        samples_path=samples,
+        offline_evidence_path=evidence,
+        application_report_path=application_report,
+        artifact_errors=(),
+        wav_error_percent=0.4,
+        queue_overflows=0,
+    )
+
+    assert metrics.gpu_oom_count == 2
+    assert "GPU OOM count must be zero" in evaluate_acceptance(metrics).errors
+
+
 def test_collector_rejects_samples_that_miss_measurement_boundaries(
     tmp_path: Path,
 ) -> None:

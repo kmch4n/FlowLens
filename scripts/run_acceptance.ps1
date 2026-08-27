@@ -75,34 +75,137 @@ function Get-NewSessionDirectory {
     return [System.IO.Path]::GetFullPath($candidate.FullName)
 }
 
-function Get-ProcessTreeIds {
-    param([Parameter(Mandatory = $true)][int] $RootProcessId)
+function Get-LiveProcessIdentity {
+    param([Parameter(Mandatory = $true)][int] $ProcessId)
 
-    $processes = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
-    $known = New-Object System.Collections.Generic.HashSet[int]
-    [void] $known.Add($RootProcessId)
+    $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" `
+        -ErrorAction SilentlyContinue
+    $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $cim -or $null -eq $process) {
+        return $null
+    }
+    try {
+        $path = [System.IO.Path]::GetFullPath($process.Path)
+        $startTicks = $process.StartTime.ToUniversalTime().Ticks
+    }
+    catch {
+        throw "Could not establish process ownership for PID $ProcessId."
+    }
+    return [pscustomobject][ordered]@{
+        process_id = [int] $ProcessId
+        parent_process_id = [int] $cim.ParentProcessId
+        start_time_utc_ticks = [long] $startTicks
+        executable_path = $path
+    }
+}
+
+function Test-LiveProcessIdentity {
+    param([Parameter(Mandatory = $true)][object] $Identity)
+
+    $process = Get-Process -Id $Identity.process_id -ErrorAction SilentlyContinue
+    if ($null -eq $process) {
+        return $false
+    }
+    try {
+        return (
+            $process.StartTime.ToUniversalTime().Ticks -eq
+                $Identity.start_time_utc_ticks -and
+            [System.IO.Path]::GetFullPath($process.Path) -ieq
+                $Identity.executable_path
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
+function Register-OwnedProcessTree {
+    param(
+        [Parameter(Mandatory = $true)][hashtable] $OwnedProcesses,
+        [Parameter(Mandatory = $true)][int] $RootProcessId,
+        [Parameter(Mandatory = $true)][string] $RootExecutable
+    )
+
+    if ($OwnedProcesses.Count -eq 0) {
+        $rootIdentity = Get-LiveProcessIdentity -ProcessId $RootProcessId
+        if ($null -eq $rootIdentity -or
+            $rootIdentity.executable_path -ine $RootExecutable) {
+            throw "FlowLens root process identity could not be established."
+        }
+        $OwnedProcesses[$RootProcessId] = $rootIdentity
+    }
+
+    $liveOwned = New-Object System.Collections.Generic.HashSet[int]
+    foreach ($identity in $OwnedProcesses.Values) {
+        if (Test-LiveProcessIdentity -Identity $identity) {
+            [void] $liveOwned.Add([int] $identity.process_id)
+        }
+    }
+    $snapshot = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId)
     do {
         $changed = $false
-        foreach ($process in $processes) {
-            $id = [int] $process.ProcessId
-            $parent = [int] $process.ParentProcessId
-            if ($known.Contains($parent) -and -not $known.Contains($id)) {
-                [void] $known.Add($id)
+        foreach ($candidate in $snapshot) {
+            $candidateId = [int] $candidate.ProcessId
+            $parentId = [int] $candidate.ParentProcessId
+            if (-not $liveOwned.Contains($parentId) -or
+                $OwnedProcesses.ContainsKey($candidateId)) {
+                continue
+            }
+            $identity = Get-LiveProcessIdentity -ProcessId $candidateId
+            if ($null -ne $identity -and
+                $identity.parent_process_id -eq $parentId) {
+                $OwnedProcesses[$candidateId] = $identity
+                [void] $liveOwned.Add($candidateId)
                 $changed = $true
             }
         }
     } while ($changed)
-    return @($known)
 }
 
-function Stop-RecordedProcessTree {
-    param([Parameter(Mandatory = $true)][int] $RootProcessId)
+function Stop-OwnedProcessTree {
+    param(
+        [Parameter(Mandatory = $true)][hashtable] $OwnedProcesses,
+        [Parameter(Mandatory = $true)][int] $RootProcessId
+    )
 
-    $ids = @(Get-ProcessTreeIds -RootProcessId $RootProcessId)
-    foreach ($id in ($ids | Where-Object { $_ -ne $RootProcessId })) {
-        Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+    $live = @{}
+    $mismatches = New-Object System.Collections.Generic.List[int]
+    foreach ($identity in $OwnedProcesses.Values) {
+        $process = Get-Process -Id $identity.process_id -ErrorAction SilentlyContinue
+        if ($null -eq $process) {
+            continue
+        }
+        try {
+            $matches = (
+                $process.StartTime.ToUniversalTime().Ticks -eq
+                    $identity.start_time_utc_ticks -and
+                [System.IO.Path]::GetFullPath($process.Path) -ieq
+                    $identity.executable_path
+            )
+        }
+        catch {
+            $matches = $false
+        }
+        if (-not $matches) {
+            $mismatches.Add([int] $identity.process_id)
+        }
+        else {
+            $live[[int] $identity.process_id] = $process
+        }
     }
-    Stop-Process -Id $RootProcessId -Force -ErrorAction SilentlyContinue
+    if ($mismatches.Count -gt 0) {
+        throw "Process ownership changed before cleanup: $($mismatches -join ', ')."
+    }
+
+    $orderedIds = @(
+        $live.Keys | Sort-Object { if ($_ -eq $RootProcessId) { 1 } else { 0 } }
+    )
+    foreach ($processId in $orderedIds) {
+        $process = $live[[int] $processId]
+        if (-not $process.HasExited) {
+            $process.Kill()
+        }
+    }
 }
 
 function Test-OwnedFirewallRule {
@@ -211,22 +314,17 @@ function Wait-ForRecoveredStatus {
 function Add-AcceptanceSample {
     param(
         [Parameter(Mandatory = $true)][System.IO.StreamWriter] $Writer,
-        [Parameter(Mandatory = $true)][int] $RootProcessId,
-        [Parameter(Mandatory = $true)][int] $ElapsedSeconds,
-        [Parameter(Mandatory = $true)][string] $Stderr
+        [Parameter(Mandatory = $true)][hashtable] $OwnedProcesses,
+        [Parameter(Mandatory = $true)][int] $ElapsedSeconds
     )
 
-    $ids = @(Get-ProcessTreeIds -RootProcessId $RootProcessId)
     [long] $rss = 0
-    foreach ($id in $ids) {
-        $process = Get-Process -Id $id -ErrorAction SilentlyContinue
-        if ($null -ne $process) {
+    foreach ($identity in $OwnedProcesses.Values) {
+        $process = Get-Process -Id $identity.process_id -ErrorAction SilentlyContinue
+        if ($null -ne $process -and
+            (Test-LiveProcessIdentity -Identity $identity)) {
             $rss += [long] $process.WorkingSet64
         }
-    }
-    $gpuOom = $false
-    if (Test-Path -LiteralPath $Stderr -PathType Leaf) {
-        $gpuOom = Select-String -LiteralPath $Stderr -Pattern "CUDA.*out of memory|GPU.*out of memory" -Quiet
     }
     $nvidiaSmiAvailable = $null -ne (Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue)
     if ($nvidiaSmiAvailable) {
@@ -235,7 +333,6 @@ function Add-AcceptanceSample {
     $sample = [ordered]@{
         elapsed_seconds = $ElapsedSeconds
         rss_bytes = $rss
-        gpu_oom = [bool] $gpuOom
         nvidia_smi_available = [bool] $nvidiaSmiAvailable
     }
     $Writer.WriteLine(($sample | ConvertTo-Json -Compress))
@@ -285,6 +382,7 @@ $stderrPath = Join-Path $reportParent "application-stderr.log"
 $ruleCreated = $false
 $activeThroughout = $true
 $rootProcess = $null
+$ownedProcesses = @{}
 $sampleWriter = $null
 $failure = $null
 $cleanupFailure = $null
@@ -299,12 +397,17 @@ try {
 
     $rootProcess = Start-FlowLensProcess -Program $resolvedExecutable `
         -AcceptanceReport $appReportPath -Stdout $stdoutPath -Stderr $stderrPath
+    Register-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+        -RootProcessId $rootProcess.Id -RootExecutable $resolvedExecutable
 
     if ($RecoveryCheck) {
         $session = Wait-ForRecoveryArtifacts -SessionsRoot $sessionsRoot `
             -Before $before -TimeoutSeconds $RecoveryTimeoutSeconds
         Start-Sleep -Seconds $RecoveryCaptureSeconds
-        Stop-RecordedProcessTree -RootProcessId $rootProcess.Id
+        Register-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+            -RootProcessId $rootProcess.Id -RootExecutable $resolvedExecutable
+        Stop-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+            -RootProcessId $rootProcess.Id
         $rootProcess.WaitForExit()
         if (-not (Test-OwnedFirewallRule -RuleName $ruleName -Program $resolvedExecutable)) {
             $activeThroughout = $false
@@ -314,8 +417,14 @@ try {
         $recoveryAppReport = Join-Path $reportParent "application-recovery.json"
         $rootProcess = Start-FlowLensProcess -Program $resolvedExecutable `
             -AcceptanceReport $recoveryAppReport -Stdout $stdoutPath -Stderr $stderrPath
+        $ownedProcesses = @{}
+        Register-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+            -RootProcessId $rootProcess.Id -RootExecutable $resolvedExecutable
         Wait-ForRecoveredStatus -Session $session -TimeoutSeconds $RecoveryTimeoutSeconds
-        Stop-RecordedProcessTree -RootProcessId $rootProcess.Id
+        Register-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+            -RootProcessId $rootProcess.Id -RootExecutable $resolvedExecutable
+        Stop-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+            -RootProcessId $rootProcess.Id
         $rootProcess.WaitForExit()
         & $python (Join-Path $repositoryRoot "scripts\validate_session.py") $session `
             --minimum-active-seconds 0 --require-recovered | Out-Null
@@ -344,10 +453,12 @@ try {
         $started = [DateTime]::UtcNow
         $lastSample = -5
         while (-not $rootProcess.HasExited) {
+            Register-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+                -RootProcessId $rootProcess.Id -RootExecutable $resolvedExecutable
             $elapsed = [int] [Math]::Floor(([DateTime]::UtcNow - $started).TotalSeconds)
             if ($elapsed -ge ($lastSample + 5)) {
-                Add-AcceptanceSample -Writer $sampleWriter -RootProcessId $rootProcess.Id `
-                    -ElapsedSeconds $elapsed -Stderr $stderrPath
+                Add-AcceptanceSample -Writer $sampleWriter `
+                    -OwnedProcesses $ownedProcesses -ElapsedSeconds $elapsed
                 $lastSample = $elapsed
             }
             if (-not (Test-OwnedFirewallRule -RuleName $ruleName -Program $resolvedExecutable)) {
@@ -397,8 +508,13 @@ finally {
         if ($null -ne $sampleWriter) {
             $sampleWriter.Dispose()
         }
-        if ($null -ne $rootProcess -and -not $rootProcess.HasExited) {
-            Stop-RecordedProcessTree -RootProcessId $rootProcess.Id
+        if ($ownedProcesses.Count -gt 0) {
+            if ($null -ne $rootProcess) {
+                Register-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+                    -RootProcessId $rootProcess.Id -RootExecutable $resolvedExecutable
+            }
+            Stop-OwnedProcessTree -OwnedProcesses $ownedProcesses `
+                -RootProcessId $rootProcess.Id
         }
         if ($ruleCreated) {
             $owned = @(Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)

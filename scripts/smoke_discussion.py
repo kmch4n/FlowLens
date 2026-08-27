@@ -40,6 +40,16 @@ _PROHIBITED = (
     "you should",
 )
 _INTERVIEW_PROHIBITED = ("決定事項", "未解決事項", "decisions", "unresolved issues")
+_GENERAL_PROHIBITED = ("賛成", "反対", "pros", "cons")
+_MEETING_CONFIRMATION_MARKERS = (
+    "確定",
+    "決定",
+    "合意",
+    "確認済",
+    "confirmed",
+    "agreed",
+    "decided",
+)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -83,11 +93,16 @@ def _combined_state_text(state: DiscussionState) -> str:
 def validate_discussion_smoke(
     output: object,
     expected_mode: SessionMode,
+    prohibited_phrases: Sequence[str] = (),
 ) -> DiscussionState:
     """Validate exact state shape, expected mode, and anti-advice rules."""
 
     if not isinstance(expected_mode, SessionMode):
         raise TypeError("expected_mode must be a SessionMode")
+    if not isinstance(prohibited_phrases, list | tuple) or not all(
+        isinstance(phrase, str) and phrase for phrase in prohibited_phrases
+    ):
+        raise TypeError("prohibited_phrases must contain non-empty strings")
     try:
         state = DiscussionState.from_dict(output)
     except Exception as error:
@@ -98,14 +113,33 @@ def validate_discussion_smoke(
         raise ValueError("discussion output mode does not match requested mode")
     if state.revision != 1:
         raise ValueError("discussion smoke output revision must be 1")
+    if expected_mode is SessionMode.MEETING:
+        if not state.confirmed_outcomes:
+            raise ValueError("MEETING output must include a confirmation")
+        confirmed = " ".join(state.confirmed_outcomes).casefold()
+        if not any(
+            marker.casefold() in confirmed for marker in _MEETING_CONFIRMATION_MARKERS
+        ):
+            raise ValueError("MEETING output must include an explicit confirmation")
     combined = _combined_state_text(state)
-    prohibited = list(_PROHIBITED)
+    prohibited = [*_PROHIBITED, *prohibited_phrases]
     if expected_mode is SessionMode.INTERVIEW:
         prohibited.extend(_INTERVIEW_PROHIBITED)
+    elif expected_mode is SessionMode.GENERAL:
+        prohibited.extend(_GENERAL_PROHIBITED)
     for phrase in prohibited:
         if phrase.casefold() in combined:
             raise ValueError(f"discussion output contains prohibited phrase: {phrase}")
     return state
+
+
+def _fixture_prohibited_phrases(fixture: Mapping[str, object]) -> tuple[str, ...]:
+    raw = fixture.get("prohibited_phrases")
+    if not isinstance(raw, list) or not all(
+        isinstance(phrase, str) and phrase for phrase in raw
+    ):
+        raise ValueError("fixture prohibited_phrases must contain non-empty strings")
+    return tuple(cast(list[str], raw))
 
 
 def _transcript_records(
@@ -197,7 +231,11 @@ def run_discussion_smoke(model_manifest: Path) -> dict[str, object]:
                 build_messages(request), discussion_state_schema(request)
             )
             parsed = parse_discussion_state(raw, request)
-            state = validate_discussion_smoke(parsed.to_dict(), mode)
+            state = validate_discussion_smoke(
+                parsed.to_dict(),
+                mode,
+                _fixture_prohibited_phrases(fixture),
+            )
             reports.append(
                 {
                     "mode": mode.value,

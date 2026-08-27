@@ -6,8 +6,8 @@ import argparse
 import json
 import os
 import stat
+import struct
 import sys
-import wave
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -132,17 +132,61 @@ def _read_jsonl(path: Path) -> list[object]:
 
 
 def _wav_contract(path: Path) -> tuple[tuple[int, int, int], float]:
-    try:
-        with wave.open(str(path), "rb") as reader:
-            channels = reader.getnchannels()
-            sample_width = reader.getsampwidth()
-            sample_rate = reader.getframerate()
-            frame_count = reader.getnframes()
-            if reader.getcomptype() != "NONE":
-                raise ValueError("compressed WAV is not supported")
-    except (EOFError, OSError, wave.Error) as error:
-        raise ValueError(f"{path.name} must be a usable PCM WAV") from error
-    duration_ms = frame_count * 1_000 / sample_rate if sample_rate else 0.0
+    encoded = path.read_bytes()
+    if len(encoded) < 12 or encoded[:4] != b"RIFF" or encoded[8:12] != b"WAVE":
+        raise ValueError("missing RIFF/WAVE header")
+    riff_size = struct.unpack_from("<I", encoded, 4)[0]
+    if riff_size + 8 < len(encoded):
+        raise ValueError("surplus bytes after RIFF chunk")
+    if riff_size + 8 > len(encoded):
+        raise ValueError("RIFF chunk is truncated")
+
+    format_values: tuple[int, int, int, int, int, int] | None = None
+    data_size: int | None = None
+    offset = 12
+    while offset < len(encoded):
+        if offset + 8 > len(encoded):
+            raise ValueError("WAV chunk header is truncated")
+        chunk_id = encoded[offset : offset + 4]
+        chunk_size = struct.unpack_from("<I", encoded, offset + 4)[0]
+        payload_start = offset + 8
+        payload_end = payload_start + chunk_size
+        if payload_end > len(encoded):
+            if chunk_id == b"data":
+                raise ValueError("PCM payload is truncated")
+            raise ValueError("WAV chunk payload is truncated")
+        padded_end = payload_end + (chunk_size & 1)
+        if padded_end > len(encoded):
+            raise ValueError("WAV chunk padding is truncated")
+        if chunk_id == b"fmt ":
+            if format_values is not None or chunk_size < 16:
+                raise ValueError("WAV must contain one complete fmt chunk")
+            format_values = struct.unpack_from("<HHIIHH", encoded, payload_start)
+        elif chunk_id == b"data":
+            if data_size is not None:
+                raise ValueError("WAV must contain exactly one data chunk")
+            if padded_end != len(encoded):
+                raise ValueError("surplus bytes after PCM payload")
+            data_size = chunk_size
+        offset = padded_end
+
+    if format_values is None or data_size is None:
+        raise ValueError("WAV must contain fmt and data chunks")
+    audio_format, channels, sample_rate, byte_rate, block_align, bits = format_values
+    if audio_format != 1:
+        raise ValueError("compressed WAV is not supported")
+    if bits == 0 or bits % 8 != 0 or channels == 0 or sample_rate == 0:
+        raise ValueError("PCM format values must be positive and byte-aligned")
+    sample_width = bits // 8
+    expected_frame_bytes = channels * sample_width
+    if block_align != expected_frame_bytes:
+        raise ValueError("PCM block alignment does not match frame bytes")
+    if byte_rate != sample_rate * expected_frame_bytes:
+        raise ValueError("PCM byte rate does not match frame bytes")
+    if data_size % expected_frame_bytes != 0:
+        raise ValueError("PCM payload is not an exact number of frames")
+    frame_count = data_size // expected_frame_bytes
+    duration_ms = frame_count * 1_000 / sample_rate
     return (channels, sample_width, sample_rate), duration_ms
 
 
@@ -150,19 +194,29 @@ def _append_contract_error(errors: list[str], name: str, error: Exception) -> No
     errors.append(f"{name} is invalid: {type(error).__name__}: {error}")
 
 
-def _validate_pause_events(events: list[EventRecord], errors: list[str]) -> None:
-    paused = False
+def _pause_intervals(
+    events: list[EventRecord], errors: list[str]
+) -> tuple[tuple[int, int], ...]:
+    open_pause: int | None = None
+    intervals: list[tuple[int, int]] = []
     for event in events:
         if event.event_type is EventType.PAUSE_START:
-            if paused:
+            if open_pause is not None:
                 errors.append("events.jsonl contains nested PAUSE_START events")
-            paused = True
+            else:
+                open_pause = event.session_time_ms
         elif event.event_type is EventType.PAUSE_END:
-            if not paused:
+            if open_pause is None:
                 errors.append("events.jsonl contains PAUSE_END without PAUSE_START")
-            paused = False
-    if paused:
+            elif event.session_time_ms < open_pause:
+                errors.append("PAUSE_END must not precede PAUSE_START")
+                open_pause = None
+            else:
+                intervals.append((open_pause, event.session_time_ms))
+                open_pause = None
+    if open_pause is not None:
         errors.append("events.jsonl contains an unclosed PAUSE_START")
+    return tuple(intervals)
 
 
 def _validate_terminal_events(
@@ -307,6 +361,7 @@ def validate_session(
                 _append_contract_error(errors, "state-history.jsonl", error)
 
     events: list[EventRecord] = []
+    event_pause_intervals: tuple[tuple[int, int], ...] = ()
     if "events.jsonl" in entries:
         try:
             events = [
@@ -324,7 +379,7 @@ def validate_session(
                 event.session_id != manifest.session_id for event in events
             ):
                 errors.append("events.jsonl session IDs must match session.json")
-            _validate_pause_events(events, errors)
+            event_pause_intervals = _pause_intervals(events, errors)
             _validate_terminal_events(events, expected_status, errors)
             if require_pause:
                 pause_starts = sum(
@@ -351,6 +406,8 @@ def validate_session(
                 errors.append("session.json final revision does not match snapshot")
             if final_state.mode is not manifest.mode:
                 errors.append("discussion-state.json mode does not match session.json")
+        if len(history) != manifest.final_discussion_state_revision:
+            errors.append("state-history.jsonl length must match final revision")
         if history:
             if final_state is None or history[-1].state != final_state:
                 errors.append(
@@ -360,6 +417,31 @@ def validate_session(
                 errors.append("state-history.jsonl session IDs must match session.json")
             if any(item.state.mode is not manifest.mode for item in history):
                 errors.append("state-history.jsonl modes must match session.json")
+        manifest_intervals = tuple(
+            (interval.started_ms, interval.ended_ms)
+            for interval in manifest.pause_intervals
+        )
+        if event_pause_intervals != manifest_intervals:
+            errors.append("session.json pause intervals do not match events.jsonl")
+        terminal_events = [
+            event
+            for event in events
+            if event.event_type
+            in {EventType.SESSION_COMPLETED, EventType.SESSION_RECOVERED}
+        ]
+        if len(terminal_events) == 1:
+            terminal_time_ms = terminal_events[0].session_time_ms
+            paused_ms = sum(end - start for start, end in event_pause_intervals)
+            if terminal_time_ms - paused_ms != manifest.active_duration_ms:
+                errors.append(
+                    "session.json active duration does not match event timeline"
+                )
+            if manifest.ended_at is not None:
+                elapsed_ms = round(
+                    (manifest.ended_at - manifest.started_at).total_seconds() * 1_000
+                )
+                if elapsed_ms != terminal_time_ms:
+                    errors.append("session.json ended_at does not match event timeline")
 
     wav_error: float | None = None
     if manifest is not None and len(durations) == 2:

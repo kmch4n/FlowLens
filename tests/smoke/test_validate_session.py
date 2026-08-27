@@ -4,7 +4,7 @@ import json
 import wave
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,7 @@ import pytest
 from flowlens.domain.discussion import StateHistoryRecord
 from flowlens.domain.enums import EventType, ProcessSource, SessionMode, SessionStatus
 from flowlens.domain.messages import EventRecord
+from flowlens.domain.session import PauseInterval
 from scripts.validate_session import REQUIRED_ARTIFACTS, validate_session
 from tests.factories import (
     make_discussion_state,
@@ -54,12 +55,20 @@ def make_valid_session(
     active_ms: int = 300_000,
     wav_ms: int = 300_000,
     status: SessionStatus = SessionStatus.COMPLETED,
+    pause_intervals: tuple[PauseInterval, ...] = (),
 ) -> Path:
     session = root / "session"
     session.mkdir(parents=True)
+    base_manifest = make_manifest(status=status)
+    paused_ms = sum(
+        interval.ended_ms - interval.started_ms for interval in pause_intervals
+    )
+    wall_duration_ms = active_ms + paused_ms
     manifest = replace(
-        make_manifest(status=status),
+        base_manifest,
+        ended_at=base_manifest.started_at + timedelta(milliseconds=wall_duration_ms),
         active_duration_ms=active_ms,
+        pause_intervals=pause_intervals,
         transcript_entry_count=1,
         final_discussion_state_revision=1,
     )
@@ -77,7 +86,28 @@ def make_valid_session(
         state=state,
     )
     _jsonl(session / "state-history.jsonl", [history.to_dict()])
-    first = make_event_record(session_time_ms=0)
+    events = [make_event_record(session_time_ms=0)]
+    for interval in pause_intervals:
+        sequence = len(events) + 1
+        events.append(
+            replace(
+                make_event_record(sequence=sequence),
+                event_type=EventType.PAUSE_START,
+                session_time_ms=interval.started_ms,
+                created_at=manifest.started_at
+                + timedelta(milliseconds=interval.started_ms),
+            )
+        )
+        sequence += 1
+        events.append(
+            replace(
+                make_event_record(sequence=sequence),
+                event_type=EventType.PAUSE_END,
+                session_time_ms=interval.ended_ms,
+                created_at=manifest.started_at
+                + timedelta(milliseconds=interval.ended_ms),
+            )
+        )
     final_type = (
         EventType.SESSION_COMPLETED
         if status is SessionStatus.COMPLETED
@@ -87,14 +117,17 @@ def make_valid_session(
     final = EventRecord(
         schema_version=1,
         session_id=manifest.session_id,
-        sequence=2,
+        sequence=len(events) + 1,
         event_type=final_type,
         source=ProcessSource.WRITER,
-        session_time_ms=active_ms,
+        session_time_ms=wall_duration_ms,
         created_at=manifest.ended_at,
         details={},
     )
-    _jsonl(session / "events.jsonl", [first.to_dict(), final.to_dict()])
+    _jsonl(
+        session / "events.jsonl",
+        [event.to_dict() for event in events] + [final.to_dict()],
+    )
     return session
 
 
@@ -126,6 +159,37 @@ def test_validator_checks_wav_format_and_pause_excluded_duration(
     assert result.wav_error_percent < 0.5
     assert result.mic_format == (1, 2, 16_000)
     assert result.loopback_format == (1, 2, 16_000)
+
+
+def test_validator_rejects_wav_with_truncated_pcm_payload(tmp_path: Path) -> None:
+    session = make_valid_session(tmp_path)
+    path = session / "mic.wav"
+    encoded = bytearray(path.read_bytes())
+    data_offset = encoded.index(b"data")
+    data_size = int.from_bytes(encoded[data_offset + 4 : data_offset + 8], "little")
+    encoded[data_offset + 4 : data_offset + 8] = (data_size + 2).to_bytes(4, "little")
+    path.write_bytes(encoded)
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert any("PCM payload is truncated" in error for error in result.errors)
+
+
+def test_validator_rejects_wav_with_surplus_pcm_payload(tmp_path: Path) -> None:
+    session = make_valid_session(tmp_path)
+    path = session / "mic.wav"
+    encoded = bytearray(path.read_bytes())
+    encoded.extend(b"\0\0")
+    encoded[4:8] = (len(encoded) - 8).to_bytes(4, "little")
+    path.write_bytes(encoded)
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert any("surplus bytes after PCM payload" in error for error in result.errors)
 
 
 def test_validator_rejects_unknown_artifact_and_torn_jsonl(tmp_path: Path) -> None:
@@ -216,3 +280,112 @@ def test_validator_rejects_history_mode_that_differs_from_manifest(
         session, minimum_active_seconds=300, expected_status="completed"
     )
     assert "state-history.jsonl modes must match session.json" in result.errors
+
+
+def test_validator_requires_one_history_record_per_final_revision(
+    tmp_path: Path,
+) -> None:
+    session = make_valid_session(tmp_path)
+    _jsonl(session / "state-history.jsonl", [])
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert "state-history.jsonl length must match final revision" in result.errors
+
+
+def test_validator_rejects_history_beyond_manifest_final_revision(
+    tmp_path: Path,
+) -> None:
+    session = make_valid_session(tmp_path)
+    manifest = make_manifest(status=SessionStatus.COMPLETED)
+    state_one = make_discussion_state(revision=1)
+    state_two = replace(state_one, revision=2)
+    history = [
+        StateHistoryRecord(1, manifest.session_id, 0, 1, state_one).to_dict(),
+        StateHistoryRecord(1, manifest.session_id, 1, 2, state_two).to_dict(),
+    ]
+    _jsonl(session / "state-history.jsonl", history)
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert "state-history.jsonl length must match final revision" in result.errors
+
+
+def test_validator_allows_empty_history_only_for_revision_zero(tmp_path: Path) -> None:
+    session = make_valid_session(tmp_path)
+    manifest = make_manifest(status=SessionStatus.COMPLETED)
+    manifest = replace(
+        manifest,
+        ended_at=manifest.started_at + timedelta(seconds=300),
+        active_duration_ms=300_000,
+        transcript_entry_count=1,
+        final_discussion_state_revision=0,
+    )
+    _json(session / "session.json", manifest.to_dict())
+    _json(session / "discussion-state.json", make_discussion_state(0).to_dict())
+    _jsonl(session / "state-history.jsonl", [])
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert result.errors == ()
+
+
+def test_validator_cross_checks_pause_events_manifest_and_active_time(
+    tmp_path: Path,
+) -> None:
+    interval = PauseInterval(100_000, 105_000)
+    session = make_valid_session(tmp_path, pause_intervals=(interval,))
+    manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    manifest["pause_intervals"] = [{"started_ms": 100_000, "ended_ms": 104_000}]
+    manifest["active_duration_ms"] = 301_000
+    _json(session / "session.json", manifest)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+        require_pause=True,
+    )
+
+    assert "session.json pause intervals do not match events.jsonl" in result.errors
+    assert "session.json active duration does not match event timeline" in result.errors
+
+
+def test_validator_rejects_pause_event_after_terminal_time(tmp_path: Path) -> None:
+    interval = PauseInterval(100_000, 105_000)
+    session = make_valid_session(tmp_path, pause_intervals=(interval,))
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    events[1]["session_time_ms"] = 306_000
+    _jsonl(session / "events.jsonl", events)
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert "events.jsonl session times must be nondecreasing" in result.errors
+    assert "PAUSE_END must not precede PAUSE_START" in result.errors
+
+
+def test_validator_rejects_unclosed_pause_even_when_manifest_closes_it(
+    tmp_path: Path,
+) -> None:
+    interval = PauseInterval(100_000, 105_000)
+    session = make_valid_session(tmp_path, pause_intervals=(interval,))
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    _jsonl(session / "events.jsonl", [events[0], events[1], events[-1]])
+
+    result = validate_session(
+        session, minimum_active_seconds=300, expected_status="completed"
+    )
+
+    assert "events.jsonl contains an unclosed PAUSE_START" in result.errors

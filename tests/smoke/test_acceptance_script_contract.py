@@ -16,11 +16,22 @@ def test_acceptance_script_enforces_requested_active_duration_and_pause() -> Non
 
 def test_acceptance_script_always_stops_its_recorded_process_tree() -> None:
     script = _script()
-    assert "$null -ne $rootProcess -and -not $rootProcess.HasExited) {" in script
-    assert (
-        "$null -ne $rootProcess -and -not $rootProcess.HasExited -and $RecoveryCheck"
-        not in script
-    )
+    assert "Stop-OwnedProcessTree -OwnedProcesses $ownedProcesses" in script
+    assert "if ($ownedProcesses.Count -gt 0)" in script
+
+
+def test_acceptance_script_verifies_process_identity_before_termination() -> None:
+    script = _script()
+    assert "start_time_utc_ticks" in script
+    assert "executable_path" in script
+    assert "Process ownership changed before cleanup" in script
+    assert "Register-OwnedProcessTree" in script
+
+
+def test_acceptance_script_does_not_infer_gpu_oom_from_stderr_text() -> None:
+    script = _script()
+    assert "Select-String" not in script
+    assert "gpu_oom" not in script
 
 
 def test_acceptance_script_removes_only_its_verified_exact_rule() -> None:
