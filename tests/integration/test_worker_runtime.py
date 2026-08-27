@@ -99,6 +99,7 @@ def _restart_discussion_worker(config: Any, control: Any, output: Any) -> None:
         config.initial_state,
         revision=config.initial_state.revision + 1,
         updated_at=committed.payload.record.committed_at,
+        analyzed_through_sequence=committed.payload.record.sequence,
     )
     output.put(
         MessageEnvelope(
@@ -810,6 +811,7 @@ def test_real_spawn_queues_restore_asr_transcript_and_discussion_update() -> Non
     )
     assert isinstance(first_update.payload, DiscussionStateReplaced)
     recovered_state = first_update.payload.state
+    assert recovered_state.analyzed_through_sequence == 2
 
     recovered_discussion = replace(
         launch_value.discussion_config,
@@ -821,6 +823,18 @@ def test_real_spawn_queues_restore_asr_transcript_and_discussion_update() -> Non
         discussion_config=recovered_discussion,
     )
     runtime.restart(ProcessSource.DISCUSSION, launch_value)
+    pending_record = TranscriptRecord(
+        schema_version=1,
+        segment_id="01J00000000000000000000003",
+        sequence=3,
+        source=AudioSource.OTHERS,
+        text="restart pending replay",
+        session_start_ms=3_000,
+        session_end_ms=3_800,
+        source_start_sample=25_600,
+        source_end_sample=38_400,
+        committed_at=second_record.committed_at,
+    )
     runtime.send(
         ProcessSource.DISCUSSION,
         MessageEnvelope(
@@ -843,7 +857,7 @@ def test_real_spawn_queues_restore_asr_transcript_and_discussion_update() -> Non
             2,
             ProcessSource.GUI,
             1_001,
-            second_payload,
+            TranscriptCommitted(pending_record),
         ),
     )
     second_update = wait_for(
@@ -852,6 +866,7 @@ def test_real_spawn_queues_restore_asr_transcript_and_discussion_update() -> Non
     )
     assert isinstance(second_update.payload, DiscussionStateReplaced)
     assert second_update.payload.state.revision == recovered_state.revision + 1
+    assert second_update.payload.state.analyzed_through_sequence == 3
 
     runtime.shutdown()
 

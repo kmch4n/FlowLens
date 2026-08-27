@@ -14,6 +14,7 @@ def make_state(
     *,
     mode: SessionMode = SessionMode.MEETING,
     revision: int = 0,
+    analyzed_through_sequence: int | None = None,
 ) -> DiscussionState:
     """Build one complete state with Japanese content."""
 
@@ -25,6 +26,9 @@ def make_state(
         confirmed_outcomes=("MVPでは助言を行わない",),
         follow_up_items=("遅延を確認する",),
         updated_at=NOW,
+        analyzed_through_sequence=(
+            revision if analyzed_through_sequence is None else analyzed_through_sequence
+        ),
     )
 
 

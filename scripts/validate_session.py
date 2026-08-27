@@ -443,6 +443,23 @@ def validate_session(
                 errors.append("state-history.jsonl session IDs must match session.json")
             if any(item.state.mode is not manifest.mode for item in history):
                 errors.append("state-history.jsonl modes must match session.json")
+            if any(
+                later.state.analyzed_through_sequence
+                < earlier.state.analyzed_through_sequence
+                for earlier, later in pairwise(history)
+            ):
+                errors.append("state-history.jsonl watermarks must be nondecreasing")
+        maximum_transcript_sequence = transcripts[-1].sequence if transcripts else 0
+        if (
+            final_state is not None
+            and final_state.analyzed_through_sequence > maximum_transcript_sequence
+        ):
+            errors.append("discussion watermark exceeds transcript.jsonl")
+        if any(
+            item.state.analyzed_through_sequence > maximum_transcript_sequence
+            for item in history
+        ):
+            errors.append("state-history watermark exceeds transcript.jsonl")
         manifest_intervals = tuple(
             (interval.started_ms, interval.ended_ms)
             for interval in manifest.pause_intervals

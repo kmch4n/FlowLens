@@ -522,6 +522,75 @@ def test_validator_requires_one_history_record_per_final_revision(
     assert "state-history.jsonl length must match final revision" in result.errors
 
 
+def test_validator_migrates_legacy_state_watermarks_to_zero(tmp_path: Path) -> None:
+    session = make_valid_session(tmp_path)
+    snapshot = json.loads(
+        (session / "discussion-state.json").read_text(encoding="utf-8")
+    )
+    del snapshot["analyzed_through_sequence"]
+    history = json.loads((session / "state-history.jsonl").read_text(encoding="utf-8"))
+    del history["state"]["analyzed_through_sequence"]
+    _json(session / "discussion-state.json", snapshot)
+    _jsonl(session / "state-history.jsonl", [history])
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert result.errors == ()
+
+
+def test_validator_rejects_watermark_beyond_transcript_log(tmp_path: Path) -> None:
+    session = make_valid_session(tmp_path)
+    state = replace(
+        make_discussion_state(revision=1),
+        analyzed_through_sequence=2,
+    )
+    manifest = make_manifest(status=SessionStatus.COMPLETED)
+    history = StateHistoryRecord(1, manifest.session_id, 0, 1, state)
+    _json(session / "discussion-state.json", state.to_dict())
+    _jsonl(session / "state-history.jsonl", [history.to_dict()])
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert "discussion watermark exceeds transcript.jsonl" in result.errors
+
+
+def test_validator_rejects_regressing_history_watermark(tmp_path: Path) -> None:
+    session = make_valid_session(tmp_path)
+    manifest_value = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    manifest_value["final_discussion_state_revision"] = 2
+    state_one = replace(
+        make_discussion_state(revision=1),
+        analyzed_through_sequence=1,
+    )
+    state_two = replace(
+        make_discussion_state(revision=2),
+        analyzed_through_sequence=0,
+    )
+    history = [
+        StateHistoryRecord(1, manifest_value["session_id"], 0, 1, state_one),
+        StateHistoryRecord(1, manifest_value["session_id"], 1, 2, state_two),
+    ]
+    _json(session / "session.json", manifest_value)
+    _json(session / "discussion-state.json", state_two.to_dict())
+    _jsonl(session / "state-history.jsonl", [item.to_dict() for item in history])
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert "state-history.jsonl watermarks must be nondecreasing" in result.errors
+
+
 def test_validator_rejects_history_beyond_manifest_final_revision(
     tmp_path: Path,
 ) -> None:

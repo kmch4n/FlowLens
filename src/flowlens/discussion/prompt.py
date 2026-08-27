@@ -65,6 +65,7 @@ def _system_content(request: DiscussionRequest) -> str:
             f"- confirmed_outcomes ({outcomes}): only content explicitly confirmed.",
             f"- follow_up_items ({follow_up}): only open content explicitly raised.",
             "- updated_at: use the requested timestamp constant.",
+            "- analyzed_through_sequence: use the requested watermark constant.",
         )
     )
 
@@ -79,6 +80,7 @@ def _user_content(request: DiscussionRequest) -> str:
             "Create the next complete discussion state from this input.",
             f"requested_revision: {request.requested_revision}",
             f"updated_at: {request.updated_at.isoformat(timespec='milliseconds')}",
+            "analyzed_through_sequence: " f"{request.analyzed_through_sequence}",
             "current_state:",
             _json(request.current_state.to_dict()),
             "new_transcript_records:",

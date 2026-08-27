@@ -805,7 +805,7 @@ class SessionController:
             analyzed_records = tuple(
                 item
                 for item in self._snapshot.transcript
-                if item.committed_at <= payload.state.updated_at
+                if item.sequence <= payload.state.analyzed_through_sequence
             )
             if analyzed_records:
                 self._record_acceptance_latency(
@@ -1296,7 +1296,7 @@ class SessionController:
                 self._safe_stop("DISCUSSION worker restart failed.")
                 return
             for record in self._snapshot.transcript:
-                if record.committed_at > state.updated_at:
+                if record.sequence > state.analyzed_through_sequence:
                     self._send(
                         ProcessSource.DISCUSSION,
                         MessageType.TRANSCRIPT_COMMITTED,

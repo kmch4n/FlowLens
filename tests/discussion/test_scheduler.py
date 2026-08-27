@@ -452,7 +452,10 @@ def test_randomized_state_machine_never_loses_or_duplicates_records() -> None:
             batch = [record.sequence for record in in_flight.records]
             scheduler.succeed(
                 in_flight,
-                make_state(revision=scheduler.current_state.revision + 1),
+                make_state(
+                    revision=scheduler.current_state.revision + 1,
+                    analyzed_through_sequence=(in_flight.analyzed_through_sequence),
+                ),
             )
             completed.extend(batch)
             accepted = [item for item in accepted if item not in set(batch)]

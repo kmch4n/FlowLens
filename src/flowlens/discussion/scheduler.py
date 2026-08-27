@@ -75,7 +75,7 @@ class DiscussionScheduler:
         self._paused = False
         self._coalesce_deadline_ms: int | None = None
         self._needs_new_commit_after_failure = False
-        self._last_sequence = 0
+        self._last_sequence = initial_state.analyzed_through_sequence
         self._last_now_ms: int | None = None
 
     @property
@@ -160,6 +160,7 @@ class DiscussionScheduler:
                 confirmed_outcomes=new_state.confirmed_outcomes,
                 follow_up_items=new_state.follow_up_items,
                 updated_at=new_state.updated_at,
+                analyzed_through_sequence=new_state.analyzed_through_sequence,
             )
         except (TypeError, ValueError):
             self._invalidate_active_request(
@@ -173,6 +174,7 @@ class DiscussionScheduler:
             new_state.revision != request.requested_revision
             or new_state.mode is not request.current_state.mode
             or new_state.updated_at != request.updated_at
+            or new_state.analyzed_through_sequence != request.analyzed_through_sequence
         ):
             self._invalidate_active_request(
                 "replacement must match the request revision, mode, and timestamp"

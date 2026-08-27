@@ -464,7 +464,13 @@ def test_acceptance_mode_records_commit_and_discussion_latencies(
             ProcessSource.DISCUSSION,
             MessageType.DISCUSSION_STATE_REPLACED,
             2,
-            DiscussionStateReplaced(0, make_discussion_state(revision=1)),
+            DiscussionStateReplaced(
+                0,
+                replace(
+                    make_discussion_state(revision=1),
+                    analyzed_through_sequence=2,
+                ),
+            ),
         ),
         created_monotonic_ms=7_000,
     )
@@ -473,7 +479,7 @@ def test_acceptance_mode_records_commit_and_discussion_latencies(
     snapshot = controller.snapshot()
     assert snapshot.partial_latencies_ms == (500,)
     assert snapshot.commit_latencies_ms == (400, 400)
-    assert snapshot.discussion_latencies_ms == (4_200,)
+    assert snapshot.discussion_latencies_ms == (3_200,)
 
 
 def test_writer_mutations_share_one_contiguous_gui_sequence(tmp_path: Path) -> None:
@@ -695,7 +701,7 @@ def test_discussion_restart_uses_latest_state_and_replays_only_pending_history(
     first = make_transcript_record()
     second = replace(
         make_transcript_record(2),
-        committed_at=datetime.fromisoformat("2026-08-19T12:06:00+09:00"),
+        committed_at=datetime.fromisoformat("2026-08-19T12:04:00+09:00"),
     )
     controller.handle_message(
         worker_envelope(
@@ -707,7 +713,8 @@ def test_discussion_restart_uses_latest_state_and_replays_only_pending_history(
     )
     state = replace(
         make_discussion_state(revision=1),
-        updated_at=first.committed_at,
+        analyzed_through_sequence=first.sequence,
+        updated_at=datetime.fromisoformat("2026-08-19T12:05:00+09:00"),
     )
     controller.handle_message(
         worker_envelope(

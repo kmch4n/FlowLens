@@ -18,7 +18,7 @@ from flowlens.domain._validation import (
 from flowlens.domain.enums import SessionMode
 
 _SESSION_ID_PATTERN = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}")
-_DISCUSSION_STATE_KEYS = frozenset(
+_LEGACY_DISCUSSION_STATE_KEYS = frozenset(
     {
         "revision",
         "mode",
@@ -29,6 +29,7 @@ _DISCUSSION_STATE_KEYS = frozenset(
         "updated_at",
     }
 )
+_DISCUSSION_STATE_KEYS = _LEGACY_DISCUSSION_STATE_KEYS | {"analyzed_through_sequence"}
 _STATE_HISTORY_RECORD_KEYS = frozenset(
     {
         "schema_version",
@@ -94,6 +95,7 @@ class DiscussionState:
     confirmed_outcomes: tuple[str, ...]
     follow_up_items: tuple[str, ...]
     updated_at: datetime
+    analyzed_through_sequence: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -127,6 +129,14 @@ class DiscussionState:
             "updated_at",
             _normalize_aware_datetime(self.updated_at, "updated_at"),
         )
+        object.__setattr__(
+            self,
+            "analyzed_through_sequence",
+            require_non_negative_int(
+                self.analyzed_through_sequence,
+                "analyzed_through_sequence",
+            ),
+        )
 
     @classmethod
     def initial(cls, mode: SessionMode, updated_at: datetime) -> Self:
@@ -140,6 +150,7 @@ class DiscussionState:
             confirmed_outcomes=(),
             follow_up_items=(),
             updated_at=updated_at,
+            analyzed_through_sequence=0,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -153,6 +164,7 @@ class DiscussionState:
             "confirmed_outcomes": list(self.confirmed_outcomes),
             "follow_up_items": list(self.follow_up_items),
             "updated_at": self.updated_at.isoformat(timespec="milliseconds"),
+            "analyzed_through_sequence": self.analyzed_through_sequence,
         }
 
     @classmethod
@@ -160,7 +172,12 @@ class DiscussionState:
         """Parse a snapshot while rejecting missing or unknown fields."""
 
         mapping = _require_mapping(value, "DiscussionState")
-        require_exact_keys(mapping, _DISCUSSION_STATE_KEYS, "DiscussionState")
+        actual_keys = frozenset(mapping)
+        if actual_keys not in {
+            _LEGACY_DISCUSSION_STATE_KEYS,
+            _DISCUSSION_STATE_KEYS,
+        }:
+            require_exact_keys(mapping, _DISCUSSION_STATE_KEYS, "DiscussionState")
         return cls(
             revision=require_non_negative_int(mapping["revision"], "revision"),
             mode=_parse_mode(mapping["mode"]),
@@ -173,6 +190,14 @@ class DiscussionState:
                 require_str_list(mapping["follow_up_items"], "follow_up_items")
             ),
             updated_at=parse_timezone_datetime(mapping["updated_at"], "updated_at"),
+            analyzed_through_sequence=(
+                require_non_negative_int(
+                    mapping["analyzed_through_sequence"],
+                    "analyzed_through_sequence",
+                )
+                if "analyzed_through_sequence" in mapping
+                else 0
+            ),
         )
 
 

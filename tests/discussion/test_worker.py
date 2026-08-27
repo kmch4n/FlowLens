@@ -24,7 +24,7 @@ from flowlens.discussion.worker import (
     _discussion_worker_loop,
     run_discussion_worker,
 )
-from flowlens.domain.enums import MessageType, ProcessSource
+from flowlens.domain.enums import AudioSource, MessageType, ProcessSource
 from flowlens.domain.messages import (
     DiscussionStateReplaced,
     MessageEnvelope,
@@ -114,11 +114,12 @@ def _config(tmp_path: Path, *, coalesce_ms: int = 500) -> DiscussionWorkerConfig
     )
 
 
-def _valid_output(revision: int = 1) -> str:
+def _valid_output(revision: int = 1, *, watermark: int = 1) -> str:
     return (
         f'{{"revision":{revision},"mode":"MEETING","current_focus":"Scope",'
         '"key_points":[],"confirmed_outcomes":[],"follow_up_items":[],'
-        '"updated_at":"2026-08-19T12:35:02.125+09:00"}'
+        '"updated_at":"2026-08-19T12:35:02.125+09:00",'
+        f'"analyzed_through_sequence":{watermark}}}'
     )
 
 
@@ -157,11 +158,14 @@ def _commit(
     text: str = "方針を確認します",
     *,
     at_ms: int | None = None,
+    source: AudioSource = AudioSource.ME,
 ) -> MessageEnvelope[object]:
     return _envelope(
         MessageType.TRANSCRIPT_COMMITTED,
         sequence,
-        TranscriptCommitted(make_record(sequence=record_sequence, text=text)),
+        TranscriptCommitted(
+            make_record(sequence=record_sequence, text=text, source=source)
+        ),
         created_monotonic_ms=(record_sequence - 1) * 100 if at_ms is None else at_ms,
     )
 
@@ -259,12 +263,33 @@ def test_committed_message_generates_replacement_then_status_after_coalesce(
     assert isinstance(replacement.payload, DiscussionStateReplaced)
     assert replacement.payload.previous_revision == 0
     assert replacement.payload.state.revision == 1
+    assert replacement.payload.state.analyzed_through_sequence == 1
     assert outgoing[1].payload == DiscussionStatusPayload(
         state="UPDATED",
         revision=1,
         pending_count=0,
         error_code=None,
+        analyzed_through_sequence=1,
     )
+
+
+def test_analysis_watermark_uses_shared_sequence_across_both_sources(
+    tmp_path: Path,
+) -> None:
+    core, _backend, _clock = _make_core(
+        tmp_path,
+        [_valid_output(watermark=2)],
+    )
+    core.handle(_start())
+    core.handle(_commit(2, 1, source=AudioSource.ME))
+    core.handle(_commit(3, 2, source=AudioSource.OTHERS))
+
+    outgoing = core.tick(600, NOW)
+
+    replacement = cast(DiscussionStateReplaced, outgoing[0].payload)
+    status = cast(DiscussionStatusPayload, outgoing[1].payload)
+    assert replacement.state.analyzed_through_sequence == 2
+    assert status.analyzed_through_sequence == 2
 
 
 def test_invalid_output_emits_metadata_only_failure_and_retries_after_new_commit(
@@ -272,7 +297,7 @@ def test_invalid_output_emits_metadata_only_failure_and_retries_after_new_commit
 ) -> None:
     core, backend, _clock = _make_core(
         tmp_path,
-        ["transcript-secret invalid", _valid_output()],
+        ["transcript-secret invalid", _valid_output(watermark=2)],
     )
     core.handle(_start())
     core.handle(_commit(2, 1, "transcript-secret"))
@@ -358,6 +383,7 @@ def test_stop_runs_one_final_request_then_reports_drained(tmp_path: Path) -> Non
         drained=True,
         final_revision=1,
         pending_count=0,
+        analyzed_through_sequence=1,
     )
     assert (
         core.handle(

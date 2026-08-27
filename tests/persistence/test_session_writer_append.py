@@ -288,7 +288,10 @@ def test_discussion_replacement_writes_history_then_snapshot(
 
     monkeypatch.setattr(JsonlAppender, "append", record_history)
     monkeypatch.setattr(AtomicJsonFile, "replace", record_snapshot)
-    state = make_discussion_state(revision=1)
+    state = replace(
+        make_discussion_state(revision=1),
+        analyzed_through_sequence=2,
+    )
 
     open_writer.replace_discussion_state(previous_revision=0, state=state)
 
@@ -300,8 +303,10 @@ def test_discussion_replacement_writes_history_then_snapshot(
     )
     assert order == ["history", "snapshot"]
     assert snapshot["revision"] == 1
+    assert snapshot["analyzed_through_sequence"] == 2
     assert history["previous_revision"] == 0
     assert history["new_revision"] == 1
+    assert history["state"]["analyzed_through_sequence"] == 2
 
 
 def test_discussion_invariant_failure_does_not_consume_revision(
@@ -325,6 +330,32 @@ def test_discussion_invariant_failure_does_not_consume_revision(
         .splitlines()
     )
     assert len(lines) == 1
+
+
+def test_discussion_replacement_rejects_regressing_analysis_watermark(
+    open_writer: SessionWriter,
+) -> None:
+    first = replace(
+        make_discussion_state(1),
+        analyzed_through_sequence=1,
+    )
+    open_writer.replace_discussion_state(0, first)
+
+    with pytest.raises(PersistenceInvariantError, match="watermark"):
+        open_writer.replace_discussion_state(
+            1,
+            replace(
+                make_discussion_state(2),
+                analyzed_through_sequence=0,
+            ),
+        )
+
+    history = (
+        (open_writer.session_dir / "state-history.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert len(history) == 1
 
 
 def test_discussion_state_is_strictly_revalidated_before_history_write(

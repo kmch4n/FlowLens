@@ -306,6 +306,7 @@ class DiscussionWorkerCore:
             drained=True,
             final_revision=self.state.revision,
             pending_count=self._pending_count_after_final(outgoing),
+            analyzed_through_sequence=self.state.analyzed_through_sequence,
         )
         return (*outgoing, self._emit(MessageType.WORKER_STOPPED, stopped))
 
@@ -355,6 +356,9 @@ class DiscussionWorkerCore:
                         revision=self.state.revision,
                         pending_count=len(scheduler_request.records),
                         error_code=_generation_error_code(error),
+                        analyzed_through_sequence=(
+                            self.state.analyzed_through_sequence
+                        ),
                     ),
                 ),
             )
@@ -374,6 +378,7 @@ class DiscussionWorkerCore:
                     revision=new_state.revision,
                     pending_count=0,
                     error_code=None,
+                    analyzed_through_sequence=(new_state.analyzed_through_sequence),
                 ),
             ),
         )

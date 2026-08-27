@@ -10,7 +10,8 @@
         "key_points": ["保存先はローカル"],
         "confirmed_outcomes": ["ローカル保存で確定"],
         "follow_up_items": [],
-        "updated_at": "2026-08-19T12:00:01.000+09:00"
+        "updated_at": "2026-08-19T12:00:01.000+09:00",
+        "analyzed_through_sequence": 2
     },
     "prohibited_phrases": ["おすすめ", "賛成材料", "反対材料", "すべき"]
 }

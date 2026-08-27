@@ -387,6 +387,13 @@ class SessionWriter:
             raise PersistenceInvariantError(
                 "discussion state mode must match the session manifest mode"
             )
+        if (
+            state.analyzed_through_sequence
+            < self._discussion_state.analyzed_through_sequence
+        ):
+            raise PersistenceInvariantError(
+                "discussion analysis watermark must not regress"
+            )
         history = self._canonical_state_history_record(
             StateHistoryRecord(
                 schema_version=1,

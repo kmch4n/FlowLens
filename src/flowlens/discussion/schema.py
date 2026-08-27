@@ -23,6 +23,7 @@ _FIELD_ORDER = (
     "confirmed_outcomes",
     "follow_up_items",
     "updated_at",
+    "analyzed_through_sequence",
 )
 _MILLISECOND_TIMESTAMP = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?:Z|[+-]\d{2}:\d{2})"
@@ -50,6 +51,7 @@ def discussion_state_schema(request: DiscussionRequest) -> dict[str, object]:
             "items": {"type": "string"},
         },
         "updated_at": {"const": _timestamp_text(request)},
+        "analyzed_through_sequence": {"const": request.analyzed_through_sequence},
     }
     return {
         "type": "object",
@@ -148,6 +150,16 @@ def parse_discussion_state(raw: str, request: DiscussionRequest) -> DiscussionSt
     if mode != request.current_state.mode.value:
         raise DiscussionOutputError("mode must match the current session mode")
 
+    analyzed_through_sequence = value["analyzed_through_sequence"]
+    if (
+        not isinstance(analyzed_through_sequence, int)
+        or isinstance(analyzed_through_sequence, bool)
+        or analyzed_through_sequence != request.analyzed_through_sequence
+    ):
+        raise DiscussionOutputError(
+            "analyzed_through_sequence must match the request watermark"
+        )
+
     return DiscussionState(
         revision=revision,
         mode=request.current_state.mode,
@@ -162,4 +174,5 @@ def parse_discussion_state(raw: str, request: DiscussionRequest) -> DiscussionSt
             "follow_up_items",
         ),
         updated_at=_require_timestamp(value["updated_at"], request),
+        analyzed_through_sequence=analyzed_through_sequence,
     )

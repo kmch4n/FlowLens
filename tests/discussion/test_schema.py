@@ -34,6 +34,7 @@ def _valid_output(*, revision: int = 1) -> dict[str, object]:
         "confirmed_outcomes": ["MVPの範囲を固定した"],
         "follow_up_items": ["遅延を測定する"],
         "updated_at": "2026-08-19T12:35:02.125+09:00",
+        "analyzed_through_sequence": 1,
     }
 
 
@@ -50,6 +51,7 @@ def test_schema_has_exact_closed_shape_and_request_constants() -> None:
         "confirmed_outcomes",
         "follow_up_items",
         "updated_at",
+        "analyzed_through_sequence",
     ]
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
@@ -57,6 +59,7 @@ def test_schema_has_exact_closed_shape_and_request_constants() -> None:
     assert properties["revision"] == {"const": 7}
     assert properties["mode"] == {"const": "INTERVIEW"}
     assert properties["updated_at"] == {"const": "2026-08-19T12:35:02.125+09:00"}
+    assert properties["analyzed_through_sequence"] == {"const": 1}
     assert properties["current_focus"] == {"type": "string"}
     assert properties["key_points"] == {
         "type": "array",
@@ -138,6 +141,7 @@ def test_parser_returns_new_immutable_normalized_snapshot() -> None:
         confirmed_outcomes=("MVPの範囲を固定した",),
         follow_up_items=("遅延を測定する",),
         updated_at=NOW,
+        analyzed_through_sequence=1,
     )
     assert isinstance(parsed.key_points, tuple)
 

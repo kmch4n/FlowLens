@@ -10,7 +10,8 @@
         "key_points": ["出発時刻を確認中"],
         "confirmed_outcomes": [],
         "follow_up_items": ["出発時刻の確認"],
-        "updated_at": "2026-08-19T12:00:01.000+09:00"
+        "updated_at": "2026-08-19T12:00:01.000+09:00",
+        "analyzed_through_sequence": 2
     },
     "prohibited_phrases": ["賛成", "反対", "おすすめ", "すべき"]
 }

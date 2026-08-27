@@ -71,6 +71,7 @@ def test_prompt_uses_complete_mode_semantics_and_anti_advice_rules(
         "confirmed_outcomes",
         "follow_up_items",
         "updated_at",
+        "analyzed_through_sequence",
     ):
         assert field_name in prompt
 
@@ -105,7 +106,7 @@ def test_prompt_has_deterministic_four_space_japanese_json_and_full_state() -> N
     assert transcript_json in first[1].content
     assert "\\u65e5" not in first[1].content
     assert "segment_id" not in first[1].content
-    assert "sequence" not in first[1].content
+    assert "source_start_sample" not in first[1].content
 
 
 def test_prompt_is_complete_even_without_new_transcript_records() -> None:

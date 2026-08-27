@@ -651,13 +651,19 @@ Each successful discussion-state replacement appends one record to
         "key_points": [],
         "confirmed_outcomes": [],
         "follow_up_items": [],
-        "updated_at": "2026-08-19T12:35:02.125+09:00"
+        "updated_at": "2026-08-19T12:35:02.125+09:00",
+        "analyzed_through_sequence": 42
     }
 }
 ```
 
 State-history records do not store transcript evidence IDs. Ordering is derived
 from the state revision and JSONL record order.
+`analyzed_through_sequence` is persisted in both the live snapshot and every
+history state. It is the greatest global transcript sequence included in the
+successful analysis request, across ME and OTHERS. A legacy snapshot without
+this field is migrated conservatively to `0`; other missing or unknown fields
+remain invalid.
 
 ## 20. Discussion Analysis
 
@@ -731,7 +737,8 @@ The model returns a complete new snapshot, not a list of mutations.
     "follow_up_items": [
         "具体的な成果を確認する"
     ],
-    "updated_at": "2026-08-19T12:35:02.125+09:00"
+    "updated_at": "2026-08-19T12:35:02.125+09:00",
+    "analyzed_through_sequence": 42
 }
 ```
 
@@ -748,6 +755,13 @@ The model returns a complete new snapshot, not a list of mutations.
 - The model must not create pro/con arguments.
 - State items do not include ME or OTHERS attribution.
 - State items do not include transcript evidence IDs.
+- `analyzed_through_sequence` is a request constant derived from the greatest
+  included global transcript sequence; it is not inferred from wall-clock time.
+
+After a Discussion worker restart, the controller replays exactly the committed
+records whose global `sequence` is greater than the persisted
+`analyzed_through_sequence`. `committed_at` and `updated_at` are display and
+latency timestamps, not delivery acknowledgements.
 
 An invalid or failed output is discarded. The previous state remains visible,
 and pending transcript entries are included in the next meaningful update.

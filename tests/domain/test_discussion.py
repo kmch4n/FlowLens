@@ -40,6 +40,7 @@ def test_initial_state_uses_revision_zero_and_empty_values() -> None:
     assert state.key_points == ()
     assert state.confirmed_outcomes == ()
     assert state.follow_up_items == ()
+    assert state.analyzed_through_sequence == 0
 
 
 def test_discussion_state_serializes_exact_keys_and_millisecond_time() -> None:
@@ -53,9 +54,28 @@ def test_discussion_state_serializes_exact_keys_and_millisecond_time() -> None:
         "confirmed_outcomes",
         "follow_up_items",
         "updated_at",
+        "analyzed_through_sequence",
     ]
     assert serialized["updated_at"] == "2026-08-19T12:35:02.125+09:00"
     assert serialized["key_points"] == ["業務改善に関わった経験"]
+
+
+def test_discussion_state_migrates_legacy_snapshot_to_safe_zero_watermark() -> None:
+    serialized = make_state().to_dict()
+    del serialized["analyzed_through_sequence"]
+
+    restored = DiscussionState.from_dict(serialized)
+
+    assert restored.analyzed_through_sequence == 0
+    assert restored.to_dict()["analyzed_through_sequence"] == 0
+
+
+def test_discussion_state_rejects_negative_analysis_watermark() -> None:
+    serialized = make_state().to_dict()
+    serialized["analyzed_through_sequence"] = -1
+
+    with pytest.raises(ValueError, match="analyzed_through_sequence"):
+        DiscussionState.from_dict(serialized)
 
 
 def test_discussion_state_normalizes_updated_at_to_milliseconds() -> None:

@@ -71,6 +71,15 @@ class DiscussionRequest:
             _normalize_aware_datetime(self.updated_at, "updated_at"),
         )
 
+    @property
+    def analyzed_through_sequence(self) -> int:
+        """Return the greatest global transcript sequence in this request."""
+
+        return max(
+            (record.sequence for record in self.records),
+            default=self.current_state.analyzed_through_sequence,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class DiscussionStatusPayload:
@@ -80,11 +89,16 @@ class DiscussionStatusPayload:
     revision: int
     pending_count: int
     error_code: str | None
+    analyzed_through_sequence: int = 0
 
     def __post_init__(self) -> None:
         _require_nonblank_str(self.state, "state")
         require_non_negative_int(self.revision, "revision")
         require_non_negative_int(self.pending_count, "pending_count")
+        require_non_negative_int(
+            self.analyzed_through_sequence,
+            "analyzed_through_sequence",
+        )
         if self.error_code is not None:
             _require_nonblank_str(self.error_code, "error_code")
 
@@ -97,6 +111,7 @@ class DiscussionStoppedPayload:
     drained: bool
     final_revision: int
     pending_count: int
+    analyzed_through_sequence: int = 0
 
     def __post_init__(self) -> None:
         if self.worker != "DISCUSSION":
@@ -105,6 +120,10 @@ class DiscussionStoppedPayload:
             raise ContractValidationError("drained must be true")
         require_non_negative_int(self.final_revision, "final_revision")
         require_non_negative_int(self.pending_count, "pending_count")
+        require_non_negative_int(
+            self.analyzed_through_sequence,
+            "analyzed_through_sequence",
+        )
 
 
 class DiscussionBackend(Protocol):
