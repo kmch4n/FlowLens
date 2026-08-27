@@ -115,4 +115,5 @@ QLineEdit[flowlensRole="inputMeter"]:focus {{
 QProgressBar[flowlensRole="inputMeter"]::chunk {{
     background-color: {accent};
     border-radius: 4px;
+    margin: 2px 0;
 }}

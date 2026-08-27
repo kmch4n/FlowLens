@@ -5,11 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flowlens.controller.models import PreflightSelection
 from flowlens.controller.session_controller import SessionState

@@ -166,7 +166,7 @@ class PreflightPage(QWidget):
     def _build_layout(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 28, 32, 28)
-        layout.setSpacing(12)
+        layout.setSpacing(4)
 
         title = QLabel("Preflight")
         title.setProperty("flowlensRole", "metric")

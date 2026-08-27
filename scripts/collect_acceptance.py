@@ -6,11 +6,15 @@ import argparse
 import json
 import math
 import os
+import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.validate_session import SessionValidationResult, validate_session
 

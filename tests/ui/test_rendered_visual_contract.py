@@ -19,7 +19,7 @@ from flowlens.controller.session_controller import ControllerSnapshot, SessionSt
 from flowlens.domain.discussion import DiscussionState
 from flowlens.domain.enums import SessionMode
 from flowlens.ui.completion_page import CompletionPage, CompletionSummary
-from flowlens.ui.design import DesignTokens, build_stylesheet
+from flowlens.ui.design import DesignTokens, build_stylesheet, load_bundled_fonts
 from flowlens.ui.discussion_panel import DiscussionPanel, labels_for
 from flowlens.ui.live_page import LivePage
 from flowlens.ui.preflight_page import PreflightPage
@@ -106,6 +106,7 @@ def test_rendered_page_uses_no_pure_extremes_and_limits_exact_accent_pixels(
 ) -> None:
     app = QApplication.instance()
     assert isinstance(app, QApplication)
+    load_bundled_fonts(Path("assets"))
     app.setStyleSheet(build_stylesheet(DesignTokens.approved(), reduced_motion=False))
     widget = page()
     qtbot.addWidget(widget)
@@ -113,6 +114,7 @@ def test_rendered_page_uses_no_pure_extremes_and_limits_exact_accent_pixels(
     widget.show()
 
     image = widget.grab().toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+    assert (image.width(), image.height()) == (1280, 800)
     pixels = [
         QColor(image.pixel(x, y)).name().upper()
         for y in range(image.height())
