@@ -72,6 +72,19 @@ def make_commit_buffer() -> ChronologicalCommitBuffer:
     )
 
 
+def test_recovery_commit_buffer_continues_the_global_transcript_sequence() -> None:
+    buffer = ChronologicalCommitBuffer(
+        segment_id_factory=lambda: "01J00000000000000000000009",
+        now=lambda: NOW,
+        initial_sequence=8,
+    )
+    buffer.push(candidate(AudioSource.ME, "再開", start_ms=1_000))
+
+    records = buffer.release_ready()
+
+    assert [record.sequence for record in records] == [8]
+
+
 def test_prefix_commits_only_after_two_matches_and_twelve_hundred_ms_age() -> None:
     tracker = StablePrefixTracker(stable_age_ms=1_200)
     assert tracker.observe(hypothesis("今回", "は", "方針"), 0, final=False) == ()

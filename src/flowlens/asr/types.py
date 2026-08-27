@@ -176,8 +176,21 @@ class AsrWorkerConfig:
     max_utterance_ms: int = 12_000
     delayed_threshold_ms: int = 2_000
     analysis_pause_threshold_ms: int = 5_000
+    allow_nonzero_initial_sample: bool = False
+    initial_transcript_sequence: int = 1
+    start_paused: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.allow_nonzero_initial_sample) is not bool:
+            raise ContractValidationError(
+                "allow_nonzero_initial_sample must be a boolean"
+            )
+        if type(self.start_paused) is not bool:
+            raise ContractValidationError("start_paused must be a boolean")
+        _require_positive_int(
+            self.initial_transcript_sequence,
+            "initial_transcript_sequence",
+        )
         session_id = require_str(self.session_id, "session_id")
         if _SESSION_ID_PATTERN.fullmatch(session_id) is None:
             raise ContractValidationError(

@@ -197,6 +197,9 @@ class MultiprocessingWorkerRuntime:
         self._control_queues: dict[ProcessSource, _QueueLike] = {}
         self._processes: dict[ProcessSource, _ProcessLike] = {}
         self._response_queue: _QueueLike | None = None
+        self._worker_response_queues: dict[ProcessSource, _QueueLike] = {}
+        self._retired_response_sources: set[ProcessSource] = set()
+        self._last_control_sequences: dict[ProcessSource, int] = {}
         self._writer_audio_queue: _QueueLike | None = None
         self._asr_audio_queue: _QueueLike | None = None
         self._writer_stop_event: _EventLike | None = None
@@ -305,6 +308,7 @@ class MultiprocessingWorkerRuntime:
             raise ValueError("PCM and drain fences must use dedicated audio queues")
         try:
             _put_nowait(self._control_queues[target], envelope)
+            self._last_control_sequences[target] = envelope.sequence
         except Exception as error:
             self._fail_closed(f"{target.value} control queue became unavailable", error)
 
@@ -312,28 +316,53 @@ class MultiprocessingWorkerRuntime:
         """Drain at most the fixed per-tick budget without blocking Qt."""
 
         messages: list[MessageEnvelope[object]] = []
-        response_queue = self.response_queue
-        for _ in range(self._poll_budget):
-            try:
-                value = response_queue.get_nowait()
-            except queue.Empty:
-                break
-            except Exception as error:
-                self._fail_closed("response queue became unavailable", error)
-            if not isinstance(value, MessageEnvelope):
-                self._fail_closed(
-                    "response queue yielded a non-envelope item",
-                    ValueError("invalid response payload"),
-                )
-            messages.append(value)
+        response_queues_list: list[_QueueLike] = []
+        response_queue_ids: set[int] = set()
+        for response_queue in self._worker_response_queues.values():
+            if id(response_queue) not in response_queue_ids:
+                response_queue_ids.add(id(response_queue))
+                response_queues_list.append(response_queue)
+        response_queues = tuple(response_queues_list)
+        exhausted: set[int] = set()
+        reads = 0
+        while reads < self._poll_budget and len(exhausted) < len(response_queues):
+            for response_queue in response_queues:
+                if id(response_queue) in exhausted or reads >= self._poll_budget:
+                    continue
+                try:
+                    value = response_queue.get_nowait()
+                except queue.Empty:
+                    exhausted.add(id(response_queue))
+                    continue
+                except Exception as error:
+                    self._fail_closed("response queue became unavailable", error)
+                if not isinstance(value, MessageEnvelope):
+                    self._fail_closed(
+                        "response queue yielded a non-envelope item",
+                        ValueError("invalid response payload"),
+                    )
+                reads += 1
+                if (
+                    response_queue is self._response_queue
+                    and value.source in self._retired_response_sources
+                ):
+                    continue
+                messages.append(value)
         return tuple(messages)
 
-    def restart(self, target: ProcessSource) -> None:
+    def restart(self, target: ProcessSource, launch: object | None = None) -> None:
         """Replace an ASR or Discussion child with fresh process handles."""
 
         if target not in _RESTARTABLE:
             raise ValueError("only ASR and Discussion workers can be restarted")
-        launch = self._require_launch()
+        active_launch = self._require_launch()
+        if launch is not None:
+            if not isinstance(launch, SessionLaunch):
+                raise TypeError("restart launch must be a SessionLaunch")
+            if launch.session_id != active_launch.session_id:
+                raise ValueError("restart launch must target the active session")
+            active_launch = launch
+            self._launch = launch
         old_process = self._processes.get(target)
         if old_process is None:
             raise RuntimeError(f"{target.value} process is not active")
@@ -351,7 +380,11 @@ class MultiprocessingWorkerRuntime:
         errors = errors + self._close_queues((old_queue,))
         fresh_queue = self.context.Queue()
         self._control_queues[target] = fresh_queue
-        process = self._create_process(target, launch)
+        fresh_response_queue = self.context.Queue()
+        self._worker_response_queues[target] = fresh_response_queue
+        self._retired_response_sources.add(target)
+        self._last_control_sequences[target] = 0
+        process = self._create_process(target, active_launch)
         self._processes[target] = process
         try:
             process.start()
@@ -360,6 +393,9 @@ class MultiprocessingWorkerRuntime:
                 target,
                 process,
                 fresh_queue,
+            )
+            cleanup_errors = cleanup_errors + self._close_queues(
+                (fresh_response_queue,)
             )
             self._restart_cleanup_incomplete = bool(cleanup_errors)
             self._processes.pop(target, None)
@@ -404,20 +440,45 @@ class MultiprocessingWorkerRuntime:
     def shutdown(self) -> WorkerShutdownReport:
         """Send typed non-completion controls, join, and terminate if needed."""
 
+        return self._shutdown(drain_writer_audio=False)
+
+    def safe_stop(
+        self,
+        *,
+        audio_fence_required: bool = False,
+    ) -> WorkerShutdownReport:
+        """Drain captured audio before an ordered incomplete Writer shutdown."""
+
+        if type(audio_fence_required) is not bool:
+            raise TypeError("audio_fence_required must be a boolean")
+        return self._shutdown(
+            drain_writer_audio=True,
+            audio_fence_required=audio_fence_required,
+        )
+
+    def _shutdown(
+        self,
+        *,
+        drain_writer_audio: bool,
+        audio_fence_required: bool = False,
+    ) -> WorkerShutdownReport:
+        """Run one bounded shutdown with an optional emergency audio fence."""
+
         if self._shutdown_report is not None:
             return self._shutdown_report
         joined: list[ProcessSource] = []
         terminated: list[ProcessSource] = []
         errors: list[str] = []
-        try:
-            self.writer_stop_event.set()
-        except Exception as error:
-            errors.append(f"writer stop event: {_error_name(error)}")
+        audio_process = self._processes.get(ProcessSource.AUDIO)
+        audio_was_alive = (
+            False
+            if audio_process is None
+            else self._process_is_alive(ProcessSource.AUDIO, audio_process, errors)
+        )
         for worker in (
             ProcessSource.AUDIO,
             ProcessSource.ASR,
             ProcessSource.DISCUSSION,
-            ProcessSource.WRITER,
         ):
             process = self._processes.get(worker)
             control_queue = self._control_queues.get(worker)
@@ -431,11 +492,33 @@ class MultiprocessingWorkerRuntime:
             joined.extend(worker_joined)
             terminated.extend(worker_terminated)
             errors.extend(worker_errors)
+        if drain_writer_audio and (
+            audio_fence_required
+            or not audio_was_alive
+            or ProcessSource.AUDIO in terminated
+        ):
+            try:
+                _put_nowait(self.writer_audio_queue, AudioDrainFence())
+            except Exception as error:
+                errors.append(f"Writer audio drain fence: {_error_name(error)}")
+        writer = self._processes.get(ProcessSource.WRITER)
+        writer_queue = self._control_queues.get(ProcessSource.WRITER)
+        if writer is not None and writer_queue is not None:
+            writer_joined, writer_terminated, writer_errors = self._stop_process(
+                ProcessSource.WRITER,
+                writer,
+                writer_queue,
+                before_terminate=self.writer_stop_event.set,
+            )
+            joined.extend(writer_joined)
+            terminated.extend(writer_terminated)
+            errors.extend(writer_errors)
         if self._all_processes_stopped():
             errors.extend(
                 self._close_queues(
                     (
                         self._response_queue,
+                        *self._worker_response_queues.values(),
                         *self._control_queues.values(),
                         self._writer_audio_queue,
                         self._asr_audio_queue,
@@ -510,6 +593,11 @@ class MultiprocessingWorkerRuntime:
 
     def _create_queues(self, launch: SessionLaunch) -> None:
         self._response_queue = self.context.Queue()
+        self._worker_response_queues = {
+            worker: self._response_queue for worker in _PROCESS_ORDER
+        }
+        self._retired_response_sources.clear()
+        self._last_control_sequences.clear()
         self._control_queues = {
             worker: self.context.Queue() for worker in _PROCESS_ORDER
         }
@@ -561,13 +649,13 @@ class MultiprocessingWorkerRuntime:
                 launch.asr_config,
                 self.asr_audio_queue,
                 self._control_queues[ProcessSource.ASR],
-                self.response_queue,
+                self._worker_response_queues[ProcessSource.ASR],
             )
         if worker is ProcessSource.DISCUSSION:
             return (
                 launch.discussion_config,
                 self._control_queues[ProcessSource.DISCUSSION],
-                self.response_queue,
+                self._worker_response_queues[ProcessSource.DISCUSSION],
             )
         raise ValueError("worker must be a runtime process")
 
@@ -585,6 +673,8 @@ class MultiprocessingWorkerRuntime:
         worker: ProcessSource,
         process: _ProcessLike,
         control_queue: _QueueLike,
+        *,
+        before_terminate: Callable[[], None] | None = None,
     ) -> tuple[tuple[ProcessSource, ...], tuple[ProcessSource, ...], tuple[str, ...]]:
         errors: list[str] = []
         try:
@@ -594,6 +684,14 @@ class MultiprocessingWorkerRuntime:
         self._join_process(worker, process, errors)
         alive = self._process_is_alive(worker, process, errors)
         terminated: tuple[ProcessSource, ...] = ()
+        if alive:
+            if before_terminate is not None:
+                try:
+                    before_terminate()
+                except Exception as error:
+                    errors.append(f"{worker.value} stop event: {_error_name(error)}")
+                self._join_process(worker, process, errors)
+                alive = self._process_is_alive(worker, process, errors)
         if alive:
             try:
                 process.terminate()
@@ -680,7 +778,7 @@ class MultiprocessingWorkerRuntime:
             schema_version=1,
             session_id=launch.session_id,
             message_type=message_type,
-            sequence=1,
+            sequence=self._last_control_sequences.get(worker, 0) + 1,
             source=ProcessSource.GUI,
             created_monotonic_ms=launch.audio_config.session_started_monotonic_ms,
             payload=payload,
@@ -694,7 +792,7 @@ class MultiprocessingWorkerRuntime:
         additional_errors: tuple[str, ...] = (),
     ) -> NoReturn:
         try:
-            report = self.shutdown()
+            report = self.safe_stop()
             if additional_errors:
                 self._shutdown_report = replace(
                     report,
@@ -735,6 +833,9 @@ class MultiprocessingWorkerRuntime:
         self._control_queues = {}
         self._processes = {}
         self._response_queue = None
+        self._worker_response_queues = {}
+        self._retired_response_sources.clear()
+        self._last_control_sequences.clear()
         self._writer_audio_queue = None
         self._asr_audio_queue = None
         self._writer_stop_event = None
@@ -753,9 +854,11 @@ class MultiprocessingWorkerRuntime:
         queues: tuple[_QueueLike | None, ...],
     ) -> tuple[str, ...]:
         errors: list[str] = []
+        seen: set[int] = set()
         for queue_value in queues:
-            if queue_value is None:
+            if queue_value is None or id(queue_value) in seen:
                 continue
+            seen.add(id(queue_value))
             for operation_name in ("close", "join_thread"):
                 operation = getattr(queue_value, operation_name, None)
                 if not callable(operation):

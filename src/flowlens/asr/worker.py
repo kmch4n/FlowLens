@@ -262,7 +262,7 @@ def _asr_worker_loop(
                 and state == "READY"
                 and boundary is None
             ):
-                state = "RUNNING"
+                state = "PAUSED" if config.start_paused else "RUNNING"
                 _emit_status(emitter, "RUNNING", 0, False, lag.maximum_backlog_ms)
             elif (
                 command is MessageType.WORKER_PAUSE

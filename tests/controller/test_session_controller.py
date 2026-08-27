@@ -81,7 +81,9 @@ class FakeRuntime:
         self.sent: list[tuple[ProcessSource, MessageEnvelope[object]]] = []
         self.polled: tuple[MessageEnvelope[object], ...] = ()
         self.restarted: list[ProcessSource] = []
+        self.restart_launches: list[object | None] = []
         self.shutdown_count = 0
+        self.safe_stop_audio_fences: list[bool] = []
         self.force_close_requests: list[WriterForceCloseRequest] = []
         self.force_close_result_value: WriterForceCloseResult | None = None
         self.health_values: dict[ProcessSource, bool] = {
@@ -103,13 +105,19 @@ class FakeRuntime:
         self.polled = ()
         return result
 
-    def restart(self, target: ProcessSource) -> None:
+    def restart(self, target: ProcessSource, launch: object | None = None) -> None:
         self.restarted.append(target)
+        self.restart_launches.append(launch)
 
     def health(self) -> Mapping[ProcessSource, bool]:
         return self.health_values.copy()
 
     def shutdown(self) -> object:
+        self.shutdown_count += 1
+        return None
+
+    def safe_stop(self, *, audio_fence_required: bool = False) -> object:
+        self.safe_stop_audio_fences.append(audio_fence_required)
         self.shutdown_count += 1
         return None
 
@@ -595,8 +603,12 @@ def test_writer_exit_is_fatal_and_asr_restarts_only_once(tmp_path: Path) -> None
 
     controller.handle_worker_exit(ProcessSource.ASR)
     assert runtime.restarted == [ProcessSource.ASR]
+    restart_launch = runtime.restart_launches[-1]
+    assert isinstance(restart_launch, SessionLaunch)
+    assert restart_launch.asr_config.allow_nonzero_initial_sample is True
+    assert restart_launch.asr_config.initial_transcript_sequence == 1
     controller.handle_worker_exit(ProcessSource.ASR)
-    assert controller.snapshot().state is SessionState.STOPPING
+    assert controller.snapshot().state is SessionState.ERROR
 
     other, other_runtime, _, _ = recording_controller(tmp_path)
     other.handle_worker_exit(ProcessSource.WRITER)
@@ -605,6 +617,134 @@ def test_writer_exit_is_fatal_and_asr_restarts_only_once(tmp_path: Path) -> None
     assert fatal_error is not None
     assert fatal_error.startswith("Session storage is unsafe")
     assert other_runtime.shutdown_count == 1
+
+
+def test_audio_fatal_forces_an_ordered_fence_and_reaches_error_terminal(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, _, _ = recording_controller(tmp_path)
+
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.AUDIO,
+            MessageType.WORKER_ERROR,
+            2,
+            {"worker": "AUDIO", "code": "CAPTURE_FAILED", "detail": "device"},
+        )
+    )
+
+    assert controller.state is SessionState.ERROR
+    assert runtime.safe_stop_audio_fences == [True]
+
+
+def test_asr_restart_resets_sequences_and_records_success_after_running(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, _, _ = recording_controller(tmp_path)
+
+    controller.handle_worker_exit(ProcessSource.ASR)
+
+    assert runtime.restarted == [ProcessSource.ASR]
+    assert not any(
+        isinstance(message.payload, WriterAppendEvent)
+        and message.payload.record.event_type is EventType.WORKER_RESTARTED
+        for message in sent_to(runtime, ProcessSource.WRITER)
+    )
+
+    controller.handle_message(ready(ProcessSource.ASR, sequence=1))
+    assert (
+        sent_to(runtime, ProcessSource.ASR)[-1].message_type is MessageType.WORKER_START
+    )
+    assert sent_to(runtime, ProcessSource.ASR)[-1].sequence == 1
+    controller.handle_message(asr_status(2, 0, 0, state="READY"))
+    assert not any(
+        isinstance(message.payload, WriterAppendEvent)
+        and message.payload.record.event_type is EventType.WORKER_RESTARTED
+        for message in sent_to(runtime, ProcessSource.WRITER)
+    )
+    controller.handle_message(asr_status(3, 0, 0))
+
+    assert any(
+        isinstance(message.payload, WriterAppendEvent)
+        and message.payload.record.event_type is EventType.WORKER_RESTARTED
+        for message in sent_to(runtime, ProcessSource.WRITER)
+    )
+
+
+def test_asr_restart_preserves_paused_session_without_waiting_for_a_fence(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, _, _ = recording_controller(tmp_path)
+    controller.pause()
+
+    controller.handle_worker_exit(ProcessSource.ASR)
+
+    restart_launch = runtime.restart_launches[-1]
+    assert isinstance(restart_launch, SessionLaunch)
+    assert restart_launch.asr_config.start_paused is True
+    controller.handle_message(ready(ProcessSource.ASR, sequence=1))
+    controller.handle_message(asr_status(2, 0, 0, state="READY"))
+    controller.handle_message(asr_status(3, 0, 0))
+    assert controller.state is SessionState.PAUSED
+
+
+def test_discussion_restart_uses_latest_state_and_replays_only_pending_history(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, _, _ = recording_controller(tmp_path)
+    first = make_transcript_record()
+    second = replace(
+        make_transcript_record(2),
+        committed_at=datetime.fromisoformat("2026-08-19T12:06:00+09:00"),
+    )
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.ASR,
+            MessageType.TRANSCRIPT_COMMITTED,
+            2,
+            first.to_dict(),
+        )
+    )
+    state = replace(
+        make_discussion_state(revision=1),
+        updated_at=first.committed_at,
+    )
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.DISCUSSION,
+            MessageType.DISCUSSION_STATE_REPLACED,
+            2,
+            DiscussionStateReplaced(0, state),
+        )
+    )
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.ASR,
+            MessageType.TRANSCRIPT_COMMITTED,
+            3,
+            second.to_dict(),
+        )
+    )
+
+    controller.handle_worker_exit(ProcessSource.DISCUSSION)
+
+    restart_launch = runtime.restart_launches[-1]
+    assert isinstance(restart_launch, SessionLaunch)
+    assert restart_launch.initial_state == state
+    assert restart_launch.discussion_config.initial_state == state
+    assert sent_to(runtime, ProcessSource.DISCUSSION)[-1].sequence == 1
+    assert (
+        sent_to(runtime, ProcessSource.DISCUSSION)[-1].message_type
+        is MessageType.WORKER_START
+    )
+
+    controller.handle_message(ready(ProcessSource.DISCUSSION, sequence=1))
+
+    replay = sent_to(runtime, ProcessSource.DISCUSSION)[-1]
+    assert replay.sequence == 2
+    assert replay.message_type is MessageType.TRANSCRIPT_COMMITTED
+    assert isinstance(replay.payload, TranscriptCommitted)
+    assert replay.payload.record == second
 
 
 def test_gpu_oom_disables_analysis_while_recording_continues(tmp_path: Path) -> None:

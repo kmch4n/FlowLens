@@ -234,6 +234,7 @@ class SessionController:
         self._source_connected = {source: True for source in AudioSource}
         self._source_transition_generation = {source: 0 for source in AudioSource}
         self._finalization: FinalizationCoordinator | None = None
+        self._restart_pending: set[ProcessSource] = set()
         self._pause_started_ms: int | None = None
         self._pause_intervals: list[PauseInterval] = []
         self._stop_confirmed_ms: int | None = None
@@ -344,6 +345,7 @@ class SessionController:
         self._source_connected = {source: True for source in AudioSource}
         self._source_transition_generation = {source: 0 for source in AudioSource}
         self._finalization = None
+        self._restart_pending.clear()
         self._pause_started_ms = None
         self._pause_intervals = []
         self._stop_confirmed_ms = None
@@ -593,11 +595,17 @@ class SessionController:
         backlog = cast(int, payload["backlog_ms"])
         maximum = cast(int, payload["maximum_backlog_ms"])
         analysis_paused = cast(bool, payload["analysis_paused"])
-        if maximum < self._snapshot.maximum_asr_backlog_ms:
+        if (
+            envelope.source not in self._restart_pending
+            and maximum < self._snapshot.maximum_asr_backlog_ms
+        ):
             return False
         if state == "READY":
             return (
-                self._state is SessionState.STARTING
+                (
+                    self._state is SessionState.STARTING
+                    or ProcessSource.ASR in self._restart_pending
+                )
                 and backlog == 0
                 and not analysis_paused
             )
@@ -741,6 +749,9 @@ class SessionController:
                         slow_finalization_visible=False,
                         completion=None,
                     )
+                    self._terminate_incomplete(
+                        "Session was safely closed with incomplete data."
+                    )
                 return
             if finalization.completed:
                 if isinstance(payload, WriterAck | WriterForceCloseResult):
@@ -868,6 +879,16 @@ class SessionController:
         self._enter_recording_if_ready()
 
     def _worker_ready(self, worker: ProcessSource) -> None:
+        if worker in self._restart_pending:
+            if worker is ProcessSource.ASR:
+                self._send(
+                    ProcessSource.ASR,
+                    MessageType.WORKER_START,
+                    {"worker": "ASR"},
+                )
+            else:
+                self._complete_restart(worker)
+            return
         if self._state is not SessionState.STARTING:
             return
         if worker not in _START_WORKERS:
@@ -989,8 +1010,13 @@ class SessionController:
             self._snapshot,
             asr_status=status_label,
             asr_backlog_ms=backlog,
-            maximum_asr_backlog_ms=maximum,
+            maximum_asr_backlog_ms=max(
+                self._snapshot.maximum_asr_backlog_ms,
+                maximum,
+            ),
         )
+        if ProcessSource.ASR in self._restart_pending and state == "RUNNING":
+            self._complete_restart(ProcessSource.ASR)
         if self._state is not SessionState.RECORDING or state not in {
             "RUNNING",
             "DELAYED",
@@ -1107,7 +1133,7 @@ class SessionController:
             self._apply_recovery(self._require_supervisor().on_gpu_oom())
             return
         if worker is ProcessSource.AUDIO:
-            self._safe_stop("Audio worker failed.")
+            self._safe_stop("Audio worker failed.", audio_fence_required=True)
             return
         self.handle_worker_exit(worker)
 
@@ -1123,7 +1149,10 @@ class SessionController:
                 {"worker": worker.value},
             ):
                 return
-            self._safe_stop(f"{worker.value} worker exited.")
+            self._safe_stop(
+                f"{worker.value} worker exited.",
+                audio_fence_required=worker is ProcessSource.AUDIO,
+            )
             return
         if decision.action is RecoveryAction.RESTART:
             if not self._persist_operational(
@@ -1133,21 +1162,26 @@ class SessionController:
             ):
                 return
             try:
-                self._runtime.restart(worker)
+                restart_launch = self._restart_launch(worker)
+                tracker = self._sequence_tracker
+                if tracker is None:
+                    raise RuntimeError("sequence tracker is unavailable")
+                tracker.reset(worker)
+                self._outgoing_sequences[worker] = 0
+                self._runtime.restart(worker, restart_launch)
             except Exception:
                 self._safe_stop(f"{worker.value} worker restart failed.")
                 return
-            if not self._persist_operational(
-                EventType.WORKER_RESTARTED,
-                worker,
-                {"worker": worker.value},
-            ):
-                return
-            self._announce_once(
-                ("restart", worker.value),
-                f"{worker.value} worker restarted.",
-                True,
-            )
+            self._restart_pending.add(worker)
+            if worker is ProcessSource.DISCUSSION:
+                try:
+                    self._send(
+                        ProcessSource.DISCUSSION,
+                        MessageType.WORKER_START,
+                        {"worker": "DISCUSSION"},
+                    )
+                except Exception:
+                    self._safe_stop("DISCUSSION worker restart failed.")
             return
         if not self._persist_operational(
             EventType.ANALYSIS_FAILED,
@@ -1197,14 +1231,95 @@ class SessionController:
         )
         self._clear_runtime_session()
 
-    def _safe_stop(self, issue: str) -> None:
+    def _safe_stop(
+        self,
+        issue: str,
+        *,
+        audio_fence_required: bool = False,
+    ) -> None:
         if self._state not in {SessionState.ERROR, SessionState.STOPPING}:
             self._set_state(
                 SessionState.STOPPING,
                 issue=issue,
                 recording_status="Finalizing",
             )
-        self._bounded_shutdown()
+        self._bounded_safe_stop(audio_fence_required=audio_fence_required)
+        self._set_state(
+            SessionState.ERROR,
+            issue=issue,
+            fatal_error=issue,
+            recording_status="Error",
+            completion=None,
+            slow_finalization_visible=False,
+        )
+        self._announce_once(("fatal", "safe-stop"), issue, True)
+
+    def _restart_launch(self, worker: ProcessSource) -> SessionLaunch:
+        launch = self._require_launch()
+        if worker is ProcessSource.ASR:
+            next_sequence = (
+                max(
+                    (record.sequence for record in self._snapshot.transcript),
+                    default=0,
+                )
+                + 1
+            )
+            asr_config = replace(
+                launch.asr_config,
+                allow_nonzero_initial_sample=True,
+                initial_transcript_sequence=next_sequence,
+                start_paused=self._state is SessionState.PAUSED,
+            )
+            updated = replace(launch, asr_config=asr_config)
+            self._launch = updated
+            return updated
+        if worker is not ProcessSource.DISCUSSION:
+            return launch
+        state = self._snapshot.discussion_state
+        if state is None:
+            raise RuntimeError("discussion state is unavailable")
+        discussion_config = replace(launch.discussion_config, initial_state=state)
+        updated = replace(
+            launch,
+            initial_state=state,
+            discussion_config=discussion_config,
+        )
+        self._launch = updated
+        return updated
+
+    def _complete_restart(self, worker: ProcessSource) -> None:
+        if worker not in self._restart_pending:
+            return
+        if worker is ProcessSource.DISCUSSION:
+            state = self._snapshot.discussion_state
+            if state is None:
+                self._safe_stop("DISCUSSION worker restart failed.")
+                return
+            for record in self._snapshot.transcript:
+                if record.committed_at > state.updated_at:
+                    self._send(
+                        ProcessSource.DISCUSSION,
+                        MessageType.TRANSCRIPT_COMMITTED,
+                        TranscriptCommitted(record),
+                    )
+            if self._analysis_pause_reasons():
+                self._send(
+                    ProcessSource.DISCUSSION,
+                    MessageType.WORKER_PAUSE,
+                    {"worker": "DISCUSSION"},
+                )
+        self._restart_pending.remove(worker)
+        if not self._persist_operational(
+            EventType.WORKER_RESTARTED,
+            worker,
+            {"worker": worker.value},
+        ):
+            return
+        self._announce_once(
+            ("restart", worker.value),
+            f"{worker.value} worker restarted.",
+            True,
+        )
 
     def _is_finalization_ack(self, envelope: MessageEnvelope[object]) -> bool:
         return (
@@ -1255,6 +1370,20 @@ class SessionController:
                 SessionState.COMPLETED,
                 completion=self._completion_summary(),
             )
+        else:
+            self._terminate_incomplete(
+                "Session was safely closed with incomplete data."
+            )
+
+    def _terminate_incomplete(self, issue: str) -> None:
+        self._bounded_shutdown()
+        self._set_state(
+            SessionState.ERROR,
+            issue=issue,
+            recording_status="Incomplete",
+            completion=None,
+            slow_finalization_visible=False,
+        )
 
     def _consume_terminal_event_sequence(self) -> None:
         if self._terminal_event_consumed:
@@ -1552,6 +1681,15 @@ class SessionController:
         except Exception:
             pass
 
+    def _bounded_safe_stop(self, *, audio_fence_required: bool = False) -> None:
+        if self._runtime_shutdown:
+            return
+        self._runtime_shutdown = True
+        try:
+            self._runtime.safe_stop(audio_fence_required=audio_fence_required)
+        except Exception:
+            pass
+
     def _require_state(
         self,
         destination: str,
@@ -1588,6 +1726,7 @@ class SessionController:
         self._workers_started = False
         self._ready.clear()
         self._early_ready.clear()
+        self._restart_pending.clear()
 
 
 def _dbfs_level(value: object) -> float:

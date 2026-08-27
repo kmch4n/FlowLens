@@ -8,7 +8,12 @@ from threading import Lock
 import pytest
 
 from flowlens.asr.engine import AsrBatch, AsrEngine
-from flowlens.asr.types import DecodedToken, DecodeHypothesis, PartialTranscript
+from flowlens.asr.types import (
+    AsrWorkerConfig,
+    DecodedToken,
+    DecodeHypothesis,
+    PartialTranscript,
+)
 from flowlens.audio.types import AudioFrame
 from flowlens.domain.enums import AudioSource
 
@@ -159,6 +164,30 @@ def test_oldest_pending_source_is_decoded_first_with_one_shared_model() -> None:
     engine.process_ready(now_monotonic_ms=1_600)
     assert decoder.decoded_sources == [AudioSource.ME, AudioSource.OTHERS]
     assert decoder.max_concurrent_calls == 1
+
+
+def test_recovery_engine_accepts_the_first_frame_at_a_nonzero_source_offset() -> None:
+    engine = AsrEngine(
+        config=AsrWorkerConfig(
+            session_id="01J00000000000000000000000",
+            model_path=Path("C:/models/kotoba"),
+            allow_nonzero_initial_sample=True,
+            initial_transcript_sequence=8,
+        ),
+        decoder=RecordingDecoder.repeat(hypothesis("再開")),
+        speech_detector=PatternSpeechDetector(True),
+    )
+
+    engine.accept(
+        frame(
+            AudioSource.ME,
+            session_ms=20_000,
+            captured_ms=21_000,
+            source_sample=320_000,
+        )
+    )
+
+    assert engine.backlog_ms(21_020) == 20
 
 
 def test_exact_scheduler_tie_prefers_me_and_does_not_starve_others() -> None:

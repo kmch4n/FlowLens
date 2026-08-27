@@ -6,12 +6,13 @@ import ast
 import importlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -132,6 +133,7 @@ def test_package_self_check_loads_qt_platform_without_runtime_graph(
     import flowlens.app as app
 
     created: list[object] = []
+    configured: list[object] = []
     imported: list[str] = []
 
     class FakeGuiApplication:
@@ -148,8 +150,8 @@ def test_package_self_check_loads_qt_platform_without_runtime_graph(
 
     def fake_import_module(name: str) -> object:
         imported.append(name)
-        if name == "PySide6.QtGui":
-            return SimpleNamespace(QGuiApplication=FakeGuiApplication)
+        if name == "PySide6.QtWidgets":
+            return SimpleNamespace(QApplication=FakeGuiApplication)
         return object()
 
     def fail_build_application(*args: object, **kwargs: object) -> object:
@@ -158,12 +160,46 @@ def test_package_self_check_loads_qt_platform_without_runtime_graph(
 
     monkeypatch.setattr(importlib, "import_module", fake_import_module)
     monkeypatch.setattr(app, "build_application", fail_build_application)
+    monkeypatch.setattr(
+        app,
+        "_configure_qt_surface",
+        lambda application: configured.append(application),
+    )
     monkeypatch.setattr(app, "_PACKAGE_SELF_CHECK_APPLICATION", None, raising=False)
 
     assert app._package_self_check() == 0
     assert len(created) == 1
-    assert "PySide6.QtGui" in imported
+    assert configured == created
+    assert "PySide6.QtWidgets" in imported
     assert all(not name.startswith("flowlens.workers") for name in imported)
+
+
+def test_package_self_check_loads_surface_from_pyinstaller_layout(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The frozen self-check validates the same fonts and QSS as normal startup."""
+
+    import flowlens.app as app
+
+    bundle_root = tmp_path / "runtime"
+    shutil.copytree(Path("assets"), bundle_root / "assets")
+    real_import = importlib.import_module
+
+    def package_import(name: str) -> object:
+        if name == "PySide6.QtWidgets":
+            return real_import(name)
+        return object()
+
+    monkeypatch.setattr(importlib, "import_module", package_import)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle_root), raising=False)
+    monkeypatch.setattr(app, "_PACKAGE_SELF_CHECK_APPLICATION", None, raising=False)
+
+    assert app._package_self_check() == 0
+    application = app._PACKAGE_SELF_CHECK_APPLICATION
+    assert application is not None
+    assert "QWidget" in cast(Any, application).styleSheet()
 
 
 def final_snapshot() -> ControllerSnapshot:
@@ -212,8 +248,12 @@ def test_qt_setup_loads_bundled_fonts_and_applies_the_approved_stylesheet(
         calls.append(root)
         return object()
 
-    def build(tokens: object, reduced_motion: bool) -> str:
-        calls.append((tokens, reduced_motion))
+    def build(
+        tokens: object,
+        reduced_motion: bool,
+        resource_root: Path,
+    ) -> str:
+        calls.append((tokens, reduced_motion, resource_root))
         return "approved stylesheet"
 
     monkeypatch.setattr(design, "load_bundled_fonts", load_fonts)
@@ -221,11 +261,12 @@ def test_qt_setup_loads_bundled_fonts_and_applies_the_approved_stylesheet(
 
     app._configure_qt_surface(FakeApplication())
 
-    assert calls[0] == design._RESOURCE_ROOT
+    assert calls[0] == design.resolve_resource_root()
     stylesheet_call = calls[1]
     assert isinstance(stylesheet_call, tuple)
     assert stylesheet_call[0] == design.DesignTokens.approved()
     assert stylesheet_call[1] is True
+    assert stylesheet_call[2] == design.resolve_resource_root()
     assert calls[2] == "approved stylesheet"
 
 

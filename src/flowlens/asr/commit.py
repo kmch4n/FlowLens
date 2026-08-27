@@ -151,6 +151,8 @@ class ChronologicalCommitBuffer:
         self,
         segment_id_factory: Callable[[], str] = new_ulid,
         now: Callable[[], datetime] | None = None,
+        *,
+        initial_sequence: int = 1,
     ) -> None:
         if not callable(segment_id_factory):
             raise ContractValidationError("segment_id_factory must be callable")
@@ -172,7 +174,12 @@ class ChronologicalCommitBuffer:
             AudioSource.OTHERS: None,
         }
         self._last_released_key: _CommitKey | None = None
-        self._next_sequence = 1
+        self._next_sequence = require_non_negative_int(
+            initial_sequence,
+            "initial_sequence",
+        )
+        if self._next_sequence == 0:
+            raise ContractValidationError("initial_sequence must be positive")
         self._finalized = False
 
     def set_frontier(self, source: AudioSource, start_ms: int | None) -> None:

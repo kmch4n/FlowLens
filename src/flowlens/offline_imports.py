@@ -11,6 +11,7 @@ _ALLOWED_LOCAL_MODULES: Final[frozenset[str]] = frozenset(
     {
         "PySide6.QtCore",
         "PySide6.QtGui",
+        "PySide6.QtWidgets",
         "ctranslate2",
         "faster_whisper",
         "flowlens.asr.worker",

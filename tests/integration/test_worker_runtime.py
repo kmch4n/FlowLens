@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import multiprocessing
 import queue
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -21,18 +23,94 @@ from flowlens.domain.enums import AudioSource, EventType, MessageType, ProcessSo
 from flowlens.domain.messages import (
     AudioDrainFence,
     AudioWriteCommand,
+    DiscussionStateReplaced,
     MessageEnvelope,
+    TranscriptCommitted,
+    TranscriptRecord,
     WriterForceCloseOutcome,
     WriterForceCloseRequest,
     WriterShutdown,
 )
-from tests.factories import make_discussion_state, make_event_record, make_manifest
+from tests.factories import (
+    make_discussion_state,
+    make_event_record,
+    make_manifest,
+    make_transcript_record,
+)
 
 SESSION_ID = "01J00000000000000000000000"
 
 
 def _worker_target(*args: object) -> None:
     del args
+
+
+def _queue_worker(*args: Any) -> None:
+    control: Any = args[0]
+    if not hasattr(control, "get"):
+        control = args[1]
+    control.get(timeout=10)
+
+
+def _restart_asr_worker(
+    config: AsrWorkerConfig,
+    audio: Any,
+    control: Any,
+    output: Any,
+) -> None:
+    del audio
+    output.put(worker_envelope(ProcessSource.ASR, 1))
+    output.put(
+        MessageEnvelope(
+            1,
+            config.session_id,
+            MessageType.ASR_STATUS,
+            2,
+            ProcessSource.ASR,
+            1_002,
+            {
+                "state": "READY",
+                "backlog_ms": 0,
+                "maximum_backlog_ms": 0,
+                "analysis_paused": False,
+            },
+        )
+    )
+    control.get(timeout=10)
+    output.put(
+        MessageEnvelope(
+            1,
+            config.session_id,
+            MessageType.TRANSCRIPT_COMMITTED,
+            3,
+            ProcessSource.ASR,
+            1_003,
+            make_transcript_record(config.initial_transcript_sequence).to_dict(),
+        )
+    )
+
+
+def _restart_discussion_worker(config: Any, control: Any, output: Any) -> None:
+    control.get(timeout=10)
+    output.put(worker_envelope(ProcessSource.DISCUSSION, 1))
+    committed = control.get(timeout=10)
+    assert isinstance(committed.payload, TranscriptCommitted)
+    state = replace(
+        config.initial_state,
+        revision=config.initial_state.revision + 1,
+        updated_at=committed.payload.record.committed_at,
+    )
+    output.put(
+        MessageEnvelope(
+            1,
+            config.session_id,
+            MessageType.DISCUSSION_STATE_REPLACED,
+            2,
+            ProcessSource.DISCUSSION,
+            1_002,
+            DiscussionStateReplaced(config.initial_state.revision, state),
+        )
+    )
 
 
 @dataclass
@@ -610,10 +688,172 @@ def test_restart_is_limited_to_asr_and_discussion_with_bounded_old_process_stop(
     assert fresh_asr_process.args[1] is runtime.asr_audio_queue
     assert fresh_asr_process.args[2] is runtime.control_queues[ProcessSource.ASR]
     assert fresh_asr_process.args[2] is not old_asr_queue
-    assert fresh_asr_process.args[3] is runtime.response_queue
+    assert fresh_asr_process.args[3] is not runtime.response_queue
+
+    runtime.response_queue.items.append(worker_envelope(ProcessSource.ASR, 2))
+    fresh_asr_process.args[3].items.append(worker_envelope(ProcessSource.ASR, 1))
+    runtime.response_queue.items.append(worker_envelope(ProcessSource.AUDIO, 2))
+
+    polled = runtime.poll()
+
+    assert [(item.source, item.sequence) for item in polled] == [
+        (ProcessSource.ASR, 1),
+        (ProcessSource.AUDIO, 2),
+    ]
 
     with pytest.raises(ValueError, match="only ASR and Discussion"):
         runtime.restart(ProcessSource.AUDIO)
+
+
+def test_real_spawn_queues_restore_asr_transcript_and_discussion_update() -> None:
+    from flowlens.integration.worker_runtime import (
+        MultiprocessingWorkerRuntime,
+        WorkerTargets,
+    )
+
+    runtime = MultiprocessingWorkerRuntime(
+        context=multiprocessing.get_context("spawn"),
+        worker_targets=WorkerTargets(
+            writer=_queue_worker,
+            audio=_queue_worker,
+            asr=_restart_asr_worker,
+            discussion=_restart_discussion_worker,
+        ),
+        join_timeout_seconds=0.5,
+    )
+    launch_value = make_launch()
+    runtime.start_all(launch_value)
+
+    def wait_for(
+        source: ProcessSource,
+        message_type: MessageType,
+    ) -> MessageEnvelope[object]:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            for message in runtime.poll():
+                if message.source is source and message.message_type is message_type:
+                    return message
+            time.sleep(0.01)
+        raise AssertionError(
+            f"timed out waiting for {source.value} {message_type.value}"
+        )
+
+    wait_for(ProcessSource.ASR, MessageType.WORKER_READY)
+    runtime.send(
+        ProcessSource.ASR,
+        MessageEnvelope(
+            1,
+            SESSION_ID,
+            MessageType.WORKER_START,
+            1,
+            ProcessSource.GUI,
+            1_000,
+            {"worker": "ASR"},
+        ),
+    )
+    first_transcript = wait_for(ProcessSource.ASR, MessageType.TRANSCRIPT_COMMITTED)
+    assert TranscriptRecord.from_dict(first_transcript.payload).sequence == 1
+
+    recovered_asr = replace(
+        launch_value.asr_config,
+        allow_nonzero_initial_sample=True,
+        initial_transcript_sequence=2,
+    )
+    launch_value = replace(launch_value, asr_config=recovered_asr)
+    runtime.restart(ProcessSource.ASR, launch_value)
+    wait_for(ProcessSource.ASR, MessageType.WORKER_READY)
+    runtime.send(
+        ProcessSource.ASR,
+        MessageEnvelope(
+            1,
+            SESSION_ID,
+            MessageType.WORKER_START,
+            1,
+            ProcessSource.GUI,
+            1_000,
+            {"worker": "ASR"},
+        ),
+    )
+    second_transcript = wait_for(ProcessSource.ASR, MessageType.TRANSCRIPT_COMMITTED)
+    second_record = TranscriptRecord.from_dict(second_transcript.payload)
+    second_payload = TranscriptCommitted(second_record)
+    assert second_payload.record.sequence == 2
+
+    runtime.send(
+        ProcessSource.DISCUSSION,
+        MessageEnvelope(
+            1,
+            SESSION_ID,
+            MessageType.WORKER_START,
+            1,
+            ProcessSource.GUI,
+            1_000,
+            {"worker": "DISCUSSION"},
+        ),
+    )
+    wait_for(ProcessSource.DISCUSSION, MessageType.WORKER_READY)
+    runtime.send(
+        ProcessSource.DISCUSSION,
+        MessageEnvelope(
+            1,
+            SESSION_ID,
+            MessageType.TRANSCRIPT_COMMITTED,
+            2,
+            ProcessSource.GUI,
+            1_001,
+            second_payload,
+        ),
+    )
+    first_update = wait_for(
+        ProcessSource.DISCUSSION,
+        MessageType.DISCUSSION_STATE_REPLACED,
+    )
+    assert isinstance(first_update.payload, DiscussionStateReplaced)
+    recovered_state = first_update.payload.state
+
+    recovered_discussion = replace(
+        launch_value.discussion_config,
+        initial_state=recovered_state,
+    )
+    launch_value = replace(
+        launch_value,
+        initial_state=recovered_state,
+        discussion_config=recovered_discussion,
+    )
+    runtime.restart(ProcessSource.DISCUSSION, launch_value)
+    runtime.send(
+        ProcessSource.DISCUSSION,
+        MessageEnvelope(
+            1,
+            SESSION_ID,
+            MessageType.WORKER_START,
+            1,
+            ProcessSource.GUI,
+            1_000,
+            {"worker": "DISCUSSION"},
+        ),
+    )
+    wait_for(ProcessSource.DISCUSSION, MessageType.WORKER_READY)
+    runtime.send(
+        ProcessSource.DISCUSSION,
+        MessageEnvelope(
+            1,
+            SESSION_ID,
+            MessageType.TRANSCRIPT_COMMITTED,
+            2,
+            ProcessSource.GUI,
+            1_001,
+            second_payload,
+        ),
+    )
+    second_update = wait_for(
+        ProcessSource.DISCUSSION,
+        MessageType.DISCUSSION_STATE_REPLACED,
+    )
+    assert isinstance(second_update.payload, DiscussionStateReplaced)
+    assert second_update.payload.state.revision == recovered_state.revision + 1
+
+    runtime.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -733,8 +973,20 @@ def test_restart_start_failure_closes_fresh_queue_when_child_remains_alive() -> 
 def test_shutdown_sends_typed_controls_joins_bounded_and_never_completes() -> None:
     runtime = make_runtime()
     runtime.start_all(make_launch())
+    runtime.send(
+        ProcessSource.WRITER,
+        MessageEnvelope(
+            schema_version=1,
+            session_id=SESSION_ID,
+            message_type=MessageType.WRITER_SHUTDOWN,
+            sequence=3,
+            source=ProcessSource.GUI,
+            created_monotonic_ms=1_000,
+            payload=WriterShutdown(),
+        ),
+    )
 
-    report = runtime.shutdown()
+    report = runtime.safe_stop()
     second = runtime.shutdown()
 
     assert report is second
@@ -749,6 +1001,8 @@ def test_shutdown_sends_typed_controls_joins_bounded_and_never_completes() -> No
     writer_control = runtime.control_queues[ProcessSource.WRITER].items[-1]
     assert writer_control.message_type is MessageType.WRITER_SHUTDOWN
     assert isinstance(writer_control.payload, WriterShutdown)
+    assert writer_control.sequence == 4
+    assert isinstance(runtime.writer_audio_queue.items[-1], AudioDrainFence)
     assert runtime.control_queues[ProcessSource.AUDIO].items[-1].payload == {
         "worker": "AUDIO"
     }
@@ -760,11 +1014,38 @@ def test_shutdown_sends_typed_controls_joins_bounded_and_never_completes() -> No
         "worker": "DISCUSSION",
         "finalize": True,
     }
+    assert runtime.processes[ProcessSource.WRITER].join_calls == [0.25, 0.25, 0.25]
     assert all(
-        process.join_calls == [0.25, 0.25] for process in runtime.processes.values()
+        process.join_calls == [0.25, 0.25]
+        for worker, process in runtime.processes.items()
+        if worker is not ProcessSource.WRITER
     )
     assert all(process.closed is True for process in runtime.processes.values())
     assert all(queue.closed and queue.joined for queue in runtime.context.queues)
+
+
+def test_normal_shutdown_does_not_inject_a_duplicate_audio_fence() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+
+    runtime.shutdown()
+
+    assert not any(
+        isinstance(item, AudioDrainFence) for item in runtime.writer_audio_queue.items
+    )
+
+
+def test_safe_stop_relies_on_a_gracefully_stopped_audio_worker_fence() -> None:
+    context = FakeMultiprocessingContext()
+    context.exit_on_join = True
+    runtime = make_runtime(context=context)
+    runtime.start_all(make_launch())
+
+    runtime.safe_stop()
+
+    assert not any(
+        isinstance(item, AudioDrainFence) for item in runtime.writer_audio_queue.items
+    )
 
 
 def test_runtime_recreates_queues_events_and_processes_after_shutdown() -> None:

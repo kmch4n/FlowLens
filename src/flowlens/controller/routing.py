@@ -76,6 +76,13 @@ class SequenceTracker:
             raise ValueError("source must be a ProcessSource")
         return self._expected.get(source, 1)
 
+    def reset(self, source: ProcessSource) -> None:
+        """Begin a fresh sequence generation for exactly one restarted sender."""
+
+        if not isinstance(source, ProcessSource):
+            raise ValueError("source must be a ProcessSource")
+        self._expected.pop(source, None)
+
 
 def validate_worker_payload(envelope: MessageEnvelope[object]) -> object:
     """Return one defensively validated and normalized worker payload."""

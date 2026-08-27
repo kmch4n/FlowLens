@@ -93,6 +93,18 @@ def test_sequence_tracker_is_independent_per_sender() -> None:
     assert audio.gap is None
 
 
+def test_sequence_tracker_resets_only_the_restarted_sender_generation() -> None:
+    tracker = SequenceTracker(SESSION_ID)
+    assert tracker.accept(envelope(source=ProcessSource.ASR, sequence=4)).accepted
+    assert tracker.accept(envelope(source=ProcessSource.AUDIO, sequence=3)).accepted
+
+    tracker.reset(ProcessSource.ASR)
+
+    assert tracker.expected(ProcessSource.ASR) == 1
+    assert tracker.expected(ProcessSource.AUDIO) == 4
+    assert tracker.accept(envelope(source=ProcessSource.ASR, sequence=1)).accepted
+
+
 def test_sequence_tracker_randomized_model_matches_sender_local_oracle() -> None:
     rng = random.Random(20260822)
     tracker = SequenceTracker(SESSION_ID)

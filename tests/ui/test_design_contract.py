@@ -1,6 +1,8 @@
 import re
+import sys
 from pathlib import Path
 
+from pytest import MonkeyPatch
 from pytestqt.qtbot import QtBot
 
 from flowlens.ui.design import (
@@ -8,6 +10,7 @@ from flowlens.ui.design import (
     build_stylesheet,
     contrast_ratio,
     load_bundled_fonts,
+    resolve_resource_root,
 )
 
 
@@ -83,3 +86,40 @@ def test_bundled_fonts_load_expected_qt_family_names(qtbot: QtBot) -> None:
     families = load_bundled_fonts(Path("assets"))
     assert families.interface == "IBM Plex Sans JP"
     assert families.mono == "IBM Plex Mono"
+
+
+def test_resource_root_uses_source_assets_when_not_frozen(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+
+    root = resolve_resource_root()
+
+    assert root == Path(__file__).resolve().parents[2] / "assets"
+
+
+def test_resource_root_uses_pyinstaller_bundle_assets_when_frozen(
+    monkeypatch: MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bundle_root = tmp_path / "runtime"
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(bundle_root), raising=False)
+
+    assert resolve_resource_root() == bundle_root / "assets"
+
+
+def test_stylesheet_reads_from_selected_package_resource_root(tmp_path: Path) -> None:
+    styles = tmp_path / "assets" / "styles"
+    styles.mkdir(parents=True)
+    source = Path("assets/styles/flowlens.qss").read_text(encoding="utf-8")
+    (styles / "flowlens.qss").write_text(source, encoding="utf-8", newline="\n")
+
+    stylesheet = build_stylesheet(
+        DesignTokens.approved(),
+        reduced_motion=True,
+        resource_root=tmp_path / "assets",
+    )
+
+    assert stylesheet.startswith("/* Hallmark")

@@ -1,13 +1,13 @@
 """Hallmark Midnight design contract for the FlowLens Qt surface."""
 
+import sys
 from dataclasses import astuple, dataclass
 from pathlib import Path
 from string import Formatter
 
 from PySide6.QtGui import QFontDatabase
 
-_RESOURCE_ROOT = Path(__file__).resolve().parents[3] / "assets"
-_STYLESHEET_PATH = _RESOURCE_ROOT / "styles" / "flowlens.qss"
+_SOURCE_RESOURCE_ROOT = Path(__file__).resolve().parents[3] / "assets"
 _EXPECTED_PLACEHOLDERS = {
     "background",
     "surface",
@@ -84,10 +84,26 @@ def contrast_ratio(foreground: str, background: str) -> float:
     return (lighter + 0.05) / (darker + 0.05)
 
 
-def build_stylesheet(tokens: DesignTokens, reduced_motion: bool) -> str:
+def resolve_resource_root() -> Path:
+    """Return the source or PyInstaller-owned asset root for this process."""
+
+    if getattr(sys, "frozen", False) is True:
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if type(bundle_root) is not str or not bundle_root:
+            raise RuntimeError("Frozen application resource root is unavailable")
+        return Path(bundle_root) / "assets"
+    return _SOURCE_RESOURCE_ROOT
+
+
+def build_stylesheet(
+    tokens: DesignTokens,
+    reduced_motion: bool,
+    resource_root: Path | None = None,
+) -> str:
     """Resolve the QSS template against semantic tokens exactly once."""
 
-    template = _STYLESHEET_PATH.read_text(encoding="utf-8")
+    root = resolve_resource_root() if resource_root is None else resource_root
+    template = (root / "styles" / "flowlens.qss").read_text(encoding="utf-8")
     placeholders = {
         field_name
         for _, field_name, _, _ in Formatter().parse(template)

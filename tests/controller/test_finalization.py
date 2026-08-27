@@ -910,7 +910,7 @@ def test_tick_after_force_close_preserves_incomplete_snapshot(tmp_path: Path) ->
 
     controller.tick()
 
-    assert controller_state(controller) is SessionState.STOPPING
+    assert controller_state(controller) is SessionState.ERROR
     assert controller.snapshot().recording_status == "Incomplete"
     assert runtime.restarted == []
     assert runtime.shutdown_count == 1

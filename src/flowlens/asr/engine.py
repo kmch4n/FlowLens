@@ -100,7 +100,11 @@ class AsrEngine:
         self._decoder = decoder
         self._speech_detector = speech_detector
         self._now = _utc_now if now is None else now
-        self._commits = ChronologicalCommitBuffer(segment_id_factory, self._now)
+        self._commits = ChronologicalCommitBuffer(
+            segment_id_factory,
+            self._now,
+            initial_sequence=config.initial_transcript_sequence,
+        )
         self._states = {
             source: self._new_state() for source in (AudioSource.ME, AudioSource.OTHERS)
         }
@@ -115,9 +119,13 @@ class AsrEngine:
         if not isinstance(frame, AudioFrame):
             raise ContractValidationError("frame must be an AudioFrame")
         state = self._states[frame.source]
-        expected_source_sample = (
-            0 if state.next_source_sample is None else state.next_source_sample
-        )
+        expected_source_sample = state.next_source_sample
+        if expected_source_sample is None:
+            expected_source_sample = (
+                frame.source_start_sample
+                if self._config.allow_nonzero_initial_sample
+                else 0
+            )
         if frame.source_start_sample != expected_source_sample:
             raise ContractValidationError(
                 "source sample offsets must be contiguous and non-overlapping"

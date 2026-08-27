@@ -287,6 +287,20 @@ def test_completion_close_saves_preferences_and_closes(qtbot: QtBot) -> None:
     assert store.saved.to_dict()["window"] == window.window_preferences().to_dict()
 
 
+def test_safe_stop_error_terminal_allows_orderly_close(qtbot: QtBot) -> None:
+    controller = ConfigurableController(state=SessionState.ERROR)
+    window = MainWindow()
+    presenter = QtSessionPresenter(controller, window, FakeAnnouncer())
+    qtbot.addWidget(window)
+    window.show()
+    presenter.render_current_snapshot(force=True)
+
+    window.close()
+
+    assert window.isVisible() is False
+    assert presenter.timer.isActive() is False
+
+
 def test_presenter_restores_only_still_available_saved_devices(
     qtbot: QtBot,
 ) -> None:

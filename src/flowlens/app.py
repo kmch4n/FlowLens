@@ -171,9 +171,10 @@ def _package_self_check() -> int:
         except Exception as error:
             failed.append(f"{module_name}: {type(error).__name__}")
     try:
-        _load_package_qt_platform()
+        application = _load_package_qt_platform()
+        _configure_qt_surface(application)
     except Exception as error:
-        failed.append(f"PySide6.QtGui platform: {type(error).__name__}")
+        failed.append(f"Qt UI resources: {type(error).__name__}")
     if failed:
         for item in failed:
             print(item, file=sys.stderr)
@@ -181,13 +182,13 @@ def _package_self_check() -> int:
     return 0
 
 
-def _load_package_qt_platform() -> None:
+def _load_package_qt_platform() -> object:
     """Load and retain the Qt platform plugin needed by packaged UI resources."""
 
     global _PACKAGE_SELF_CHECK_APPLICATION
 
-    qt_gui = import_local_module("PySide6.QtGui")
-    application_type = qt_gui.QGuiApplication
+    qt_widgets = import_local_module("PySide6.QtWidgets")
+    application_type = qt_widgets.QApplication
     application = application_type.instance()
     if application is None:
         application = application_type([])
@@ -195,6 +196,7 @@ def _load_package_qt_platform() -> None:
     if not isinstance(platform_name, str) or not platform_name:
         raise RuntimeError("Qt platform plugin did not initialize")
     _PACKAGE_SELF_CHECK_APPLICATION = application
+    return application
 
 
 def _run_qt(
@@ -265,17 +267,19 @@ def _configure_qt_surface(application: Any) -> None:
     """Load required bundled resources before creating any application window."""
 
     from flowlens.ui.design import (
-        _RESOURCE_ROOT,
         DesignTokens,
         build_stylesheet,
         load_bundled_fonts,
+        resolve_resource_root,
     )
 
-    load_bundled_fonts(_RESOURCE_ROOT)
+    resource_root = resolve_resource_root()
+    load_bundled_fonts(resource_root)
     application.setStyleSheet(
         build_stylesheet(
             DesignTokens.approved(),
             reduced_motion=_reduced_motion(application),
+            resource_root=resource_root,
         )
     )
 
