@@ -19,9 +19,9 @@ from flowlens.domain.enums import EventType
 from flowlens.domain.messages import EventRecord, TranscriptRecord
 from flowlens.domain.session import SessionManifest
 from flowlens.persistence.recovery_contract import (
+    RecoveredTimeline,
     RecoveryPauseContractError,
-    reconstruct_recovered_pause_intervals,
-    recovered_terminal_time_ms,
+    reconstruct_recovered_timeline,
 )
 
 REQUIRED_ARTIFACTS = frozenset(
@@ -367,6 +367,7 @@ def validate_session(
 
     events: list[EventRecord] = []
     event_pause_intervals: tuple[tuple[int, int], ...] = ()
+    recovered_timeline: RecoveredTimeline | None = None
     if "events.jsonl" in entries:
         try:
             events = [
@@ -391,15 +392,13 @@ def validate_session(
                     if event.event_type is not EventType.SESSION_RECOVERED
                 )
                 try:
-                    recovered_pauses, _closed_open_pause = (
-                        reconstruct_recovered_pause_intervals(
-                            base_events,
-                            manifest.active_duration_ms,
-                        )
+                    recovered_timeline = reconstruct_recovered_timeline(
+                        base_events,
+                        manifest.active_duration_ms,
                     )
                     event_pause_intervals = tuple(
                         (interval.started_ms, interval.ended_ms)
-                        for interval in recovered_pauses
+                        for interval in recovered_timeline.pause_intervals
                     )
                 except RecoveryPauseContractError as error:
                     errors.append(
@@ -471,16 +470,10 @@ def validate_session(
                         "session.json active duration does not match event timeline"
                     )
             else:
-                retained_base_events = tuple(
-                    event
-                    for event in events
-                    if event.event_type is not EventType.SESSION_RECOVERED
-                )
-                recovery_boundary_ms = recovered_terminal_time_ms(
-                    retained_base_events,
-                    manifest.active_duration_ms,
-                )
-                if terminal.session_time_ms != recovery_boundary_ms:
+                if (
+                    recovered_timeline is not None
+                    and terminal.session_time_ms != recovered_timeline.terminal_time_ms
+                ):
                     errors.append(
                         "SESSION_RECOVERED time does not match recovery boundary"
                     )

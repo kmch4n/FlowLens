@@ -170,7 +170,7 @@ def test_recovery_reconstructs_pauses_and_closes_final_open_pause(
     manifest = json.loads((session_dir / "session.json").read_text(encoding="utf-8"))
     assert manifest["pause_intervals"] == [
         {"started_ms": 100, "ended_ms": 200},
-        {"started_ms": 500, "ended_ms": 800},
+        {"started_ms": 500, "ended_ms": 900},
     ]
     assert any("unmatched PAUSE_START" in note for note in manifest["recovery_notes"])
 

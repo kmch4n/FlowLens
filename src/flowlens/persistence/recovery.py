@@ -20,7 +20,7 @@ from flowlens.domain.enums import (
     SessionStatus,
 )
 from flowlens.domain.messages import EventRecord, JsonValue, TranscriptRecord
-from flowlens.domain.session import PauseInterval, SessionManifest
+from flowlens.domain.session import SessionManifest
 from flowlens.persistence._recovery_artifacts import (
     ArtifactIdentity as _ArtifactIdentity,
 )
@@ -90,9 +90,9 @@ from flowlens.persistence.json_files import (
     _inspect_jsonl_tail_bytes as _inspect_jsonl_tail_bytes_impl,
 )
 from flowlens.persistence.recovery_contract import (
+    RecoveredTimeline,
     RecoveryPauseContractError,
-    reconstruct_recovered_pause_intervals,
-    recovered_terminal_time_ms,
+    reconstruct_recovered_timeline,
 )
 
 _REQUIRED_ARTIFACT_NAMES = frozenset(
@@ -302,7 +302,7 @@ def _apply_recovery_transaction(
         for event in inspection.event_records
         if event.event_type is not EventType.SESSION_RECOVERED
     )
-    pause_intervals, pause_notes = _reconstruct_pause_intervals(
+    recovered_timeline, pause_notes = _reconstruct_recovered_timeline(
         base_events,
         inspection.active_duration_ms,
         inspection.manifest_plan.identity.path,
@@ -314,10 +314,7 @@ def _apply_recovery_transaction(
             sequence=len(base_events) + 1,
             event_type=EventType.SESSION_RECOVERED,
             source=ProcessSource.GUI,
-            session_time_ms=recovered_terminal_time_ms(
-                base_events,
-                inspection.active_duration_ms,
-            ),
+            session_time_ms=recovered_timeline.terminal_time_ms,
             created_at=recovered_at,
             details=_recovery_event_details(inspection.report),
         )
@@ -335,7 +332,7 @@ def _apply_recovery_transaction(
         status=SessionStatus.RECOVERED,
         ended_at=event_time,
         active_duration_ms=inspection.active_duration_ms,
-        pause_intervals=pause_intervals,
+        pause_intervals=recovered_timeline.pause_intervals,
         transcript_entry_count=inspection.transcript_entry_count,
         final_discussion_state_revision=(inspection.final_discussion_state_revision),
         recovery_notes=inspection.manifest.recovery_notes + notes,
@@ -520,12 +517,12 @@ def _post_validate_repaired_content(
                 opened["state-history.jsonl"].path,
                 "recovered final revision differs from the manifest",
             )
-        pauses, _notes = _reconstruct_pause_intervals(
+        timeline, _notes = _reconstruct_recovered_timeline(
             base_events,
             recovered_manifest.active_duration_ms,
             opened["events.jsonl"].path,
         )
-        if pauses != recovered_manifest.pause_intervals:
+        if timeline.pause_intervals != recovered_manifest.pause_intervals:
             raise RecoveryError(
                 opened["events.jsonl"].path,
                 "reconstructed pauses differ from the recovered manifest",
@@ -854,25 +851,26 @@ def _report_from_recovery_event(
     )
 
 
-def _reconstruct_pause_intervals(
+def _reconstruct_recovered_timeline(
     events: tuple[EventRecord, ...],
     active_duration_ms: int,
     path: Path,
-) -> tuple[tuple[PauseInterval, ...], tuple[str, ...]]:
+) -> tuple[RecoveredTimeline, tuple[str, ...]]:
     try:
-        intervals, open_pause = reconstruct_recovered_pause_intervals(
+        timeline = reconstruct_recovered_timeline(
             events,
             active_duration_ms,
         )
     except RecoveryPauseContractError as error:
         raise RecoveryError(path, str(error)) from error
     notes: tuple[str, ...] = ()
-    if open_pause is not None:
+    if timeline.closed_open_pause_at_ms is not None:
         notes = (
-            f"Closed unmatched PAUSE_START at {open_pause} ms at recovery boundary "
-            f"{active_duration_ms} ms.",
+            "Closed unmatched PAUSE_START at "
+            f"{timeline.closed_open_pause_at_ms} ms at recovery boundary "
+            f"{timeline.terminal_time_ms} ms.",
         )
-    return intervals, notes
+    return timeline, notes
 
 
 def _build_recovery_notes(

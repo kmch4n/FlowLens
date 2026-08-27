@@ -46,6 +46,29 @@ def _jsonl(path: Path, values: Sequence[object]) -> None:
     )
 
 
+def _append_recovery_events(
+    session: Path,
+    values: Sequence[tuple[EventType, int]],
+) -> None:
+    path = session / "events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    started_at = datetime.fromisoformat("2026-08-19T12:00:00+09:00")
+    for event_type, session_time_ms in values:
+        events.append(
+            EventRecord(
+                schema_version=1,
+                session_id="01J00000000000000000000000",
+                sequence=len(events) + 1,
+                event_type=event_type,
+                source=ProcessSource.GUI,
+                session_time_ms=session_time_ms,
+                created_at=started_at + timedelta(milliseconds=session_time_ms),
+                details={},
+            ).to_dict()
+        )
+    _jsonl(path, events)
+
+
 def _wav(path: Path, duration_ms: int) -> None:
     with wave.open(str(path), "wb") as output:
         output.setnchannels(1)
@@ -348,6 +371,106 @@ def test_validator_accepts_production_recovery_closed_open_pause(
     )
 
     assert result.errors == ()
+
+
+def test_production_recovery_uses_wall_time_after_closed_pause(
+    tmp_path: Path,
+) -> None:
+    session = create_interrupted_session(tmp_path)
+    _append_recovery_events(
+        session,
+        (
+            (EventType.PAUSE_START, 700),
+            (EventType.PAUSE_END, 900),
+        ),
+    )
+
+    recover_incomplete_session(session, aware_recovery_time())
+
+    manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    assert manifest["active_duration_ms"] == 800
+    assert manifest["pause_intervals"] == [{"started_ms": 700, "ended_ms": 900}]
+    assert events[-1]["session_time_ms"] == 1_000
+    assert (
+        validate_session(
+            session,
+            minimum_active_seconds=0,
+            expected_status="recovered",
+        ).errors
+        == ()
+    )
+
+
+def test_production_recovery_accumulates_multiple_pause_durations(
+    tmp_path: Path,
+) -> None:
+    session = create_interrupted_session(tmp_path)
+    _append_recovery_events(
+        session,
+        (
+            (EventType.PAUSE_START, 100),
+            (EventType.PAUSE_END, 200),
+            (EventType.PAUSE_START, 500),
+            (EventType.PAUSE_END, 700),
+        ),
+    )
+
+    recover_incomplete_session(session, aware_recovery_time())
+
+    manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    assert manifest["pause_intervals"] == [
+        {"started_ms": 100, "ended_ms": 200},
+        {"started_ms": 500, "ended_ms": 700},
+    ]
+    assert events[-1]["session_time_ms"] == 1_100
+    assert (
+        validate_session(
+            session,
+            minimum_active_seconds=0,
+            expected_status="recovered",
+        ).errors
+        == ()
+    )
+
+
+def test_production_recovery_closes_second_open_pause_at_wall_boundary(
+    tmp_path: Path,
+) -> None:
+    session = create_interrupted_session(tmp_path)
+    _append_recovery_events(
+        session,
+        (
+            (EventType.PAUSE_START, 100),
+            (EventType.PAUSE_END, 200),
+            (EventType.PAUSE_START, 900),
+        ),
+    )
+
+    recover_incomplete_session(session, aware_recovery_time())
+
+    manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    assert manifest["pause_intervals"] == [
+        {"started_ms": 100, "ended_ms": 200},
+        {"started_ms": 900, "ended_ms": 900},
+    ]
+    assert events[-1]["session_time_ms"] == 900
+    assert (
+        validate_session(
+            session,
+            minimum_active_seconds=0,
+            expected_status="recovered",
+        ).errors
+        == ()
+    )
 
 
 def test_validator_rejects_linked_session_directory(tmp_path: Path) -> None:
