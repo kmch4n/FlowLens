@@ -13,12 +13,17 @@ from flowlens.domain.discussion import StateHistoryRecord
 from flowlens.domain.enums import EventType, ProcessSource, SessionMode, SessionStatus
 from flowlens.domain.messages import EventRecord
 from flowlens.domain.session import PauseInterval
+from flowlens.persistence.recovery import recover_incomplete_session
 from scripts.validate_session import REQUIRED_ARTIFACTS, validate_session
 from tests.factories import (
     make_discussion_state,
     make_event_record,
     make_manifest,
     make_transcript_record,
+)
+from tests.persistence.recovery_support import (
+    aware_recovery_time,
+    create_interrupted_session,
 )
 
 
@@ -244,6 +249,105 @@ def test_validator_recovered_never_accepts_completed_terminal_event(
         session, minimum_active_seconds=300, expected_status="recovered"
     )
     assert "Recovered session must not contain SESSION_COMPLETED" in result.errors
+
+
+def test_validator_accepts_session_from_production_recovery(tmp_path: Path) -> None:
+    session = create_interrupted_session(tmp_path)
+    recover_incomplete_session(session, aware_recovery_time())
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=0,
+        expected_status="recovered",
+    )
+
+    assert result.errors == ()
+
+
+def test_validator_completed_ended_at_matches_terminal_created_at(
+    tmp_path: Path,
+) -> None:
+    session = make_valid_session(tmp_path)
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    events[-1]["created_at"] = "2026-08-19T12:05:01.000+09:00"
+    _jsonl(session / "events.jsonl", events)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert "session.json ended_at must match terminal event created_at" in result.errors
+
+
+def test_validator_recovered_terminal_time_matches_production_rule(
+    tmp_path: Path,
+) -> None:
+    session = create_interrupted_session(tmp_path)
+    recover_incomplete_session(session, aware_recovery_time())
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    events[-1]["session_time_ms"] = 801
+    _jsonl(session / "events.jsonl", events)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=0,
+        expected_status="recovered",
+    )
+
+    assert "SESSION_RECOVERED time does not match recovery boundary" in result.errors
+
+
+def test_validator_recovered_ended_at_matches_terminal_created_at(
+    tmp_path: Path,
+) -> None:
+    session = create_interrupted_session(tmp_path)
+    recover_incomplete_session(session, aware_recovery_time())
+    manifest = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    manifest["ended_at"] = "2026-08-19T13:00:01.000+09:00"
+    _json(session / "session.json", manifest)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=0,
+        expected_status="recovered",
+    )
+
+    assert "session.json ended_at must match terminal event created_at" in result.errors
+
+
+def test_validator_accepts_production_recovery_closed_open_pause(
+    tmp_path: Path,
+) -> None:
+    session = create_interrupted_session(tmp_path)
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    pause = EventRecord(
+        schema_version=1,
+        session_id="01J00000000000000000000000",
+        sequence=2,
+        event_type=EventType.PAUSE_START,
+        source=ProcessSource.GUI,
+        session_time_ms=500,
+        created_at=datetime.fromisoformat("2026-08-19T12:00:00.500+09:00"),
+        details={},
+    )
+    _jsonl(session / "events.jsonl", [*events, pause.to_dict()])
+    recover_incomplete_session(session, aware_recovery_time())
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=0,
+        expected_status="recovered",
+    )
+
+    assert result.errors == ()
 
 
 def test_validator_rejects_linked_session_directory(tmp_path: Path) -> None:

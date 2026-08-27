@@ -18,6 +18,11 @@ from flowlens.domain.discussion import DiscussionState, StateHistoryRecord
 from flowlens.domain.enums import EventType
 from flowlens.domain.messages import EventRecord, TranscriptRecord
 from flowlens.domain.session import SessionManifest
+from flowlens.persistence.recovery_contract import (
+    RecoveryPauseContractError,
+    reconstruct_recovered_pause_intervals,
+    recovered_terminal_time_ms,
+)
 
 REQUIRED_ARTIFACTS = frozenset(
     {
@@ -379,7 +384,29 @@ def validate_session(
                 event.session_id != manifest.session_id for event in events
             ):
                 errors.append("events.jsonl session IDs must match session.json")
-            event_pause_intervals = _pause_intervals(events, errors)
+            if expected_status == "recovered" and manifest is not None:
+                base_events = tuple(
+                    event
+                    for event in events
+                    if event.event_type is not EventType.SESSION_RECOVERED
+                )
+                try:
+                    recovered_pauses, _closed_open_pause = (
+                        reconstruct_recovered_pause_intervals(
+                            base_events,
+                            manifest.active_duration_ms,
+                        )
+                    )
+                    event_pause_intervals = tuple(
+                        (interval.started_ms, interval.ended_ms)
+                        for interval in recovered_pauses
+                    )
+                except RecoveryPauseContractError as error:
+                    errors.append(
+                        f"events.jsonl recovery pause contract is invalid: {error}"
+                    )
+            else:
+                event_pause_intervals = _pause_intervals(events, errors)
             _validate_terminal_events(events, expected_status, errors)
             if require_pause:
                 pause_starts = sum(
@@ -423,25 +450,40 @@ def validate_session(
         )
         if event_pause_intervals != manifest_intervals:
             errors.append("session.json pause intervals do not match events.jsonl")
+        expected_terminal_type = (
+            EventType.SESSION_COMPLETED
+            if expected_status == "completed"
+            else EventType.SESSION_RECOVERED
+        )
         terminal_events = [
-            event
-            for event in events
-            if event.event_type
-            in {EventType.SESSION_COMPLETED, EventType.SESSION_RECOVERED}
+            event for event in events if event.event_type is expected_terminal_type
         ]
-        if len(terminal_events) == 1:
-            terminal_time_ms = terminal_events[0].session_time_ms
-            paused_ms = sum(end - start for start, end in event_pause_intervals)
-            if terminal_time_ms - paused_ms != manifest.active_duration_ms:
+        if len(terminal_events) == 1 and events and events[-1] is terminal_events[0]:
+            terminal = terminal_events[0]
+            if manifest.ended_at != terminal.created_at:
                 errors.append(
-                    "session.json active duration does not match event timeline"
+                    "session.json ended_at must match terminal event created_at"
                 )
-            if manifest.ended_at is not None:
-                elapsed_ms = round(
-                    (manifest.ended_at - manifest.started_at).total_seconds() * 1_000
+            if expected_status == "completed":
+                paused_ms = sum(end - start for start, end in event_pause_intervals)
+                if terminal.session_time_ms - paused_ms != manifest.active_duration_ms:
+                    errors.append(
+                        "session.json active duration does not match event timeline"
+                    )
+            else:
+                retained_base_events = tuple(
+                    event
+                    for event in events
+                    if event.event_type is not EventType.SESSION_RECOVERED
                 )
-                if elapsed_ms != terminal_time_ms:
-                    errors.append("session.json ended_at does not match event timeline")
+                recovery_boundary_ms = recovered_terminal_time_ms(
+                    retained_base_events,
+                    manifest.active_duration_ms,
+                )
+                if terminal.session_time_ms != recovery_boundary_ms:
+                    errors.append(
+                        "SESSION_RECOVERED time does not match recovery boundary"
+                    )
 
     wav_error: float | None = None
     if manifest is not None and len(durations) == 2:

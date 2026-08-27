@@ -89,6 +89,11 @@ from flowlens.persistence.json_files import (
 from flowlens.persistence.json_files import (
     _inspect_jsonl_tail_bytes as _inspect_jsonl_tail_bytes_impl,
 )
+from flowlens.persistence.recovery_contract import (
+    RecoveryPauseContractError,
+    reconstruct_recovered_pause_intervals,
+    recovered_terminal_time_ms,
+)
 
 _REQUIRED_ARTIFACT_NAMES = frozenset(
     {
@@ -303,14 +308,16 @@ def _apply_recovery_transaction(
         inspection.manifest_plan.identity.path,
     )
     if existing_recovery is None:
-        last_event_time = base_events[-1].session_time_ms if base_events else 0
         recovery_event = EventRecord(
             schema_version=1,
             session_id=inspection.manifest.session_id,
             sequence=len(base_events) + 1,
             event_type=EventType.SESSION_RECOVERED,
             source=ProcessSource.GUI,
-            session_time_ms=max(inspection.active_duration_ms, last_event_time),
+            session_time_ms=recovered_terminal_time_ms(
+                base_events,
+                inspection.active_duration_ms,
+            ),
             created_at=recovered_at,
             details=_recovery_event_details(inspection.report),
         )
@@ -852,30 +859,20 @@ def _reconstruct_pause_intervals(
     active_duration_ms: int,
     path: Path,
 ) -> tuple[tuple[PauseInterval, ...], tuple[str, ...]]:
-    intervals: list[PauseInterval] = []
-    open_pause: int | None = None
-    for event in events:
-        if event.event_type is EventType.PAUSE_START:
-            if open_pause is not None:
-                raise RecoveryError(path, "PAUSE_START occurred while already paused")
-            if event.session_time_ms > active_duration_ms:
-                raise RecoveryError(path, "PAUSE_START exceeds recovered duration")
-            open_pause = event.session_time_ms
-        elif event.event_type is EventType.PAUSE_END:
-            if open_pause is None:
-                raise RecoveryError(path, "PAUSE_END occurred without PAUSE_START")
-            if event.session_time_ms > active_duration_ms:
-                raise RecoveryError(path, "PAUSE_END exceeds recovered duration")
-            intervals.append(PauseInterval(open_pause, event.session_time_ms))
-            open_pause = None
+    try:
+        intervals, open_pause = reconstruct_recovered_pause_intervals(
+            events,
+            active_duration_ms,
+        )
+    except RecoveryPauseContractError as error:
+        raise RecoveryError(path, str(error)) from error
     notes: tuple[str, ...] = ()
     if open_pause is not None:
-        intervals.append(PauseInterval(open_pause, active_duration_ms))
         notes = (
             f"Closed unmatched PAUSE_START at {open_pause} ms at recovery boundary "
             f"{active_duration_ms} ms.",
         )
-    return tuple(intervals), notes
+    return intervals, notes
 
 
 def _build_recovery_notes(
