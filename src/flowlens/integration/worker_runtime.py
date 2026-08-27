@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import multiprocessing
 import queue
 from collections.abc import Callable, Mapping
@@ -19,6 +18,7 @@ from flowlens.domain.messages import (
     WriterForceCloseResult,
     WriterShutdown,
 )
+from flowlens.offline_imports import import_local_module
 from flowlens.workers.finalization_gate import WriterFinalizationGate
 
 _PROCESS_ORDER = (
@@ -97,7 +97,7 @@ class WorkerTargetReference:
     attribute: str
 
     def __call__(self, *args: object) -> None:
-        target = getattr(importlib.import_module(self.module), self.attribute)
+        target = getattr(import_local_module(self.module), self.attribute)
         if not callable(target):
             raise TypeError(f"{self.module}.{self.attribute} is not callable")
         target(*args)

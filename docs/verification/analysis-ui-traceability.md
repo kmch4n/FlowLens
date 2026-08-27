@@ -32,7 +32,7 @@ not currently exist and are therefore `DEFERRED/BLOCKED`, not passing:
 
 | Spec | Implementation | Automated evidence | Designated-PC evidence/status |
 | --- | --- | --- | --- |
-| 6 Privacy and offline contract | `src/flowlens/adapters/local_models.py`, `src/flowlens/config/`, `src/flowlens/integration/composition.py` | `tests/test_no_network_dependencies.py`, `tests/adapters/test_local_models.py`, `tests/config/` via `AUTO-DOMAIN`/`AUTO-GATES` | `acceptance-30m.json` — `DEFERRED/BLOCKED`; firewall isolation has not run |
+| 6 Privacy and offline contract | `src/flowlens/offline_imports.py`, `src/flowlens/adapters/local_models.py`, `src/flowlens/config/`, `src/flowlens/integration/composition.py` | Static, aliased, literal dynamic, and guarded nonliteral import cases in `tests/test_no_network_dependencies.py`; isolated side-effect traps in `tests/smoke/test_cli_entrypoints.py`; local-model/config tests via `AUTO-DOMAIN`/`AUTO-GATES` | `acceptance-30m.json` — `DEFERRED/BLOCKED`; firewall isolation has not run |
 | 7 User modes | `src/flowlens/domain/enums.py`, `src/flowlens/ui/discussion_panel.py`, `src/flowlens/discussion/prompt.py` | `tests/domain/test_enums.py`, `tests/ui/test_live_page.py`, `tests/discussion/test_prompt.py` via `AUTO-DOMAIN`/`AUTO-ANALYSIS`/`AUTO-UI` | `discussion-smoke.json` — `DEFERRED/BLOCKED`; real three-mode inference has not run |
 | 8 Primary user flow | `src/flowlens/ui/main_window.py`, `src/flowlens/ui/presenter.py`, `src/flowlens/controller/session_controller.py` | `tests/ui/test_main_window.py`, `tests/ui/test_presenter.py`, `tests/controller/test_session_controller.py` via `AUTO-ANALYSIS`/`AUTO-UI` | `integration-smoke.json` — `DEFERRED/BLOCKED`; real end-to-end flow has not run |
 | 9 Preflight screen | `src/flowlens/controller/preflight.py`, `src/flowlens/ui/preflight_page.py` | `tests/controller/test_preflight.py`, `tests/ui/test_preflight_page.py` via `AUTO-ANALYSIS`/`AUTO-UI` | `integration-smoke.json` — `DEFERRED/BLOCKED`; physical meters, devices, and model readiness have not run |
@@ -70,7 +70,7 @@ supersede the required real evidence in the last column.
 | Required status and failure states are visible | Supervision, live-page, status, and presenter tests (`AUTO-ANALYSIS`, `AUTO-UI`) | `acceptance-30m.json` — `BLOCKED` |
 | All seven session files are saved | Persistence and session-validator tests (`AUTO-DOMAIN`, `AUTO-GATES`) | `integration-smoke.json` — `BLOCKED` |
 | Interrupted artifacts can be recovered | Production recovery and validator tests (`AUTO-DOMAIN`, `AUTO-GATES`) | `acceptance-recovery.json` — `BLOCKED` |
-| Live session requires no network | AST import guard (`AUTO-GATES`) | Firewall evidence within `acceptance-30m.json` — `BLOCKED` |
+| Live session requires no network | Static/dynamic AST import guard and runtime exact-name allowlist (`AUTO-GATES`) | Firewall evidence within `acceptance-30m.json` — `BLOCKED` |
 | Final 30-minute acceptance passes | Acceptance collector boundary tests (`AUTO-GATES`) | `acceptance-30m.json` — `BLOCKED` |
 | Folder-based executable runs on designated PC | Spec/audit/build-script tests (`AUTO-GATES`) | Real `dist/FlowLens/FlowLens.exe` audit and launch — `BLOCKED` |
 

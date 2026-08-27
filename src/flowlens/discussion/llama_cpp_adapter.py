@@ -1,7 +1,6 @@
 """Strictly local llama.cpp adapter for Qwen discussion analysis."""
 
 import hashlib
-import importlib
 import math
 import os
 import re
@@ -15,6 +14,7 @@ from flowlens.discussion.contracts import (
     ChatMessage,
     DiscussionGenerationError,
 )
+from flowlens.offline_imports import import_local_module
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -218,7 +218,7 @@ def _hash_file(path: Path) -> str:
 
 def _default_factory(**kwargs: object) -> _LlamaClient:
     try:
-        module = importlib.import_module("llama_cpp")
+        module = import_local_module("llama_cpp")
         constructor = module.Llama
         return cast(_LlamaClient, constructor(**kwargs))
     except Exception:

@@ -1,6 +1,5 @@
 """Offline-only adapter for the fixed Kotoba-Whisper model."""
 
-import importlib
 import math
 from collections.abc import Iterable
 from pathlib import Path
@@ -10,6 +9,7 @@ import numpy as np
 import numpy.typing as npt
 
 from flowlens.asr.types import DecodedToken, DecodeHypothesis
+from flowlens.offline_imports import import_local_module
 
 
 class ModelPathError(ValueError):
@@ -40,7 +40,7 @@ def _default_model_factory(
     model_size_or_path: str,
     **kwargs: object,
 ) -> WhisperModelPort:
-    module = importlib.import_module("faster_whisper")
+    module = import_local_module("faster_whisper")
     factory = cast(WhisperModelFactory, vars(module)["WhisperModel"])
     return factory(model_size_or_path, **kwargs)
 

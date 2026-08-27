@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import stat
@@ -17,6 +16,7 @@ from typing import Any, TypedDict, cast
 
 from flowlens.config.store import ConfigStore
 from flowlens.integration.composition import AppOptions, build_application
+from flowlens.offline_imports import import_local_module
 from flowlens.persistence.paths import AppPaths
 from flowlens.persistence.recovery import recover_incomplete_sessions
 
@@ -167,7 +167,7 @@ def _package_self_check() -> int:
     failed: list[str] = []
     for module_name in _SELF_CHECK_MODULES:
         try:
-            importlib.import_module(module_name)
+            import_local_module(module_name)
         except Exception as error:
             failed.append(f"{module_name}: {type(error).__name__}")
     try:
@@ -186,7 +186,7 @@ def _load_package_qt_platform() -> None:
 
     global _PACKAGE_SELF_CHECK_APPLICATION
 
-    qt_gui = importlib.import_module("PySide6.QtGui")
+    qt_gui = import_local_module("PySide6.QtGui")
     application_type = qt_gui.QGuiApplication
     application = application_type.instance()
     if application is None:
