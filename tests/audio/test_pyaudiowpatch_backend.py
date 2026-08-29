@@ -47,35 +47,45 @@ class FakePyAudio:
             {
                 "index": 3,
                 "name": "USB Mic",
+                "hostApi": 2,
                 "maxInputChannels": 1,
+                "maxOutputChannels": 0,
                 "defaultSampleRate": 48_000.0,
                 "isLoopbackDevice": False,
             },
             {
                 "index": 5,
                 "name": "Stereo Input",
+                "hostApi": 2,
                 "maxInputChannels": 2,
+                "maxOutputChannels": 0,
                 "defaultSampleRate": 44_100.0,
                 "isLoopbackDevice": False,
             },
             {
                 "index": 7,
                 "name": "Speakers",
+                "hostApi": 2,
                 "maxInputChannels": 0,
+                "maxOutputChannels": 2,
                 "defaultSampleRate": 48_000.0,
                 "isLoopbackDevice": False,
             },
             {
                 "index": 11,
                 "name": "Speakers [Loopback]",
+                "hostApi": 2,
                 "maxInputChannels": 2,
+                "maxOutputChannels": 0,
                 "defaultSampleRate": 48_000.0,
                 "isLoopbackDevice": True,
             },
             {
                 "index": 12,
                 "name": "Unavailable Output",
+                "hostApi": 2,
                 "maxInputChannels": 0,
+                "maxOutputChannels": 2,
                 "defaultSampleRate": 96_000.0,
                 "isLoopbackDevice": False,
             },
@@ -86,6 +96,18 @@ class FakePyAudio:
 
     def get_device_info_generator(self) -> Iterator[dict[str, object]]:
         return iter(self.devices)
+
+    def get_host_api_info_by_type(self, host_api_type: int) -> dict[str, object]:
+        del host_api_type
+        return {
+            "index": 2,
+            "structVersion": 1,
+            "type": 13,
+            "name": "Windows WASAPI",
+            "deviceCount": len(self.devices),
+            "defaultInputDevice": 3,
+            "defaultOutputDevice": 7,
+        }
 
     def get_wasapi_loopback_analogue_by_index(
         self,
@@ -129,6 +151,41 @@ def test_enumerates_microphones_and_resolved_outputs_in_vendor_order() -> None:
     ]
     assert outputs[0].display_name == "Speakers"
     assert outputs[0].is_loopback is True
+
+
+def test_enumeration_ignores_non_wasapi_device_duplicates() -> None:
+    api = FakePyAudio()
+    api.devices = (
+        {
+            "index": 1,
+            "name": "USB Mic",
+            "hostApi": 0,
+            "maxInputChannels": 1,
+            "maxOutputChannels": 0,
+            "defaultSampleRate": 44_100.0,
+            "isLoopbackDevice": False,
+        },
+        {
+            "index": 4,
+            "name": "Speakers",
+            "hostApi": 0,
+            "maxInputChannels": 0,
+            "maxOutputChannels": 2,
+            "defaultSampleRate": 44_100.0,
+            "isLoopbackDevice": False,
+        },
+        *api.devices,
+    )
+    api.loopbacks[4] = dict(api.loopbacks[7])
+    backend = _backend(api)
+
+    assert [item.device_id for item in backend.list_microphones()] == [
+        "input:3",
+        "input:5",
+    ]
+    assert [item.device_id for item in backend.list_loopback_outputs()] == [
+        "wasapi-output:7",
+    ]
 
 
 @pytest.mark.parametrize(

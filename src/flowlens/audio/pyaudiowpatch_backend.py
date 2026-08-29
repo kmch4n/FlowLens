@@ -39,6 +39,11 @@ class PyAudioApi(Protocol):
 
     def get_device_info_generator(self) -> Iterator[Mapping[str, object]]: ...
 
+    def get_host_api_info_by_type(
+        self,
+        host_api_type: int,
+    ) -> Mapping[str, object]: ...
+
     def get_wasapi_loopback_analogue_by_index(
         self,
         index: int,
@@ -106,6 +111,9 @@ class PyAudioWPatchBackend:
         self._api = py_audio_factory()
         self._monotonic_ms = monotonic_ms
         self._closed = False
+        self._wasapi_host_api_index = _parse_wasapi_host_api_index(
+            self._api.get_host_api_info_by_type(int(pyaudiowpatch.paWASAPI))
+        )
 
     def list_microphones(self) -> tuple[CaptureDevice, ...]:
         """Return selectable non-loopback input devices in vendor order."""
@@ -113,6 +121,8 @@ class PyAudioWPatchBackend:
         self._require_open()
         devices: list[CaptureDevice] = []
         for raw in self._api.get_device_info_generator():
+            if raw.get("hostApi") != self._wasapi_host_api_index:
+                continue
             parsed = _parse_device(raw)
             if parsed is None:
                 continue
@@ -137,6 +147,8 @@ class PyAudioWPatchBackend:
         self._require_open()
         devices: list[CaptureDevice] = []
         for raw in self._api.get_device_info_generator():
+            if raw.get("hostApi") != self._wasapi_host_api_index:
+                continue
             parsed = _parse_device(raw)
             if parsed is None:
                 continue
@@ -278,3 +290,12 @@ def _parse_device(
         sample_rate_hz,
         loopback_value,
     )
+
+
+def _parse_wasapi_host_api_index(raw: Mapping[str, object]) -> int:
+    """Return the native WASAPI Host API index or fail closed."""
+
+    index = raw.get("index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        raise RuntimeError("Windows WASAPI Host API is unavailable")
+    return index
