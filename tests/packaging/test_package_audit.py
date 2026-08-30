@@ -18,6 +18,8 @@ from typing import Protocol, cast
 
 import pytest
 
+from scripts.collect_licenses import collect_dependency_licenses
+
 _CHECK_PACKAGE_PATH = Path("scripts/check_package.py")
 _SPEC = importlib.util.spec_from_file_location(
     "flowlens_package_audit", _CHECK_PACKAGE_PATH
@@ -96,7 +98,7 @@ def make_fake_package(tmp_path: Path) -> Path:
         licenses,
         fonts,
         styles,
-        runtime / "PySide6" / "Qt" / "plugins" / "platforms",
+        runtime / "PySide6" / "plugins" / "platforms",
         runtime / "llama_cpp",
         runtime / "ctranslate2",
     ):
@@ -107,7 +109,7 @@ def make_fake_package(tmp_path: Path) -> Path:
         runtime / "base_library.zip",
         runtime / "PySide6" / "QtCore.pyd",
         runtime / "PySide6" / "QtGui.pyd",
-        runtime / "PySide6" / "Qt" / "plugins" / "platforms" / "qwindows.dll",
+        runtime / "PySide6" / "plugins" / "platforms" / "qwindows.dll",
         runtime / "llama_cpp" / "llama_cpp.pyd",
         runtime / "llama_cpp" / "llama.dll",
         runtime / "ctranslate2" / "ctranslate2.pyd",
@@ -120,6 +122,7 @@ def make_fake_package(tmp_path: Path) -> Path:
     ):
         path.write_bytes(b"fixture")
     for name in (
+        "CTranslate2-MIT.txt",
         "PySide6-LGPL-3.0-only.txt",
         "llama-cpp-python-MIT.txt",
         "IBM-Plex-OFL.txt",
@@ -128,6 +131,7 @@ def make_fake_package(tmp_path: Path) -> Path:
     ):
         source = Path("licenses") / name
         (licenses / name).write_bytes(source.read_bytes())
+    collect_dependency_licenses(licenses, Path("licenses").resolve())
     return package
 
 
@@ -155,6 +159,29 @@ def test_package_audit_requires_structure_and_rejects_models(tmp_path: Path) -> 
     )
 
 
+def test_package_audit_accepts_ctypes_only_llama_cpp(tmp_path: Path) -> None:
+    """llama-cpp-python loads llama.dll through ctypes and ships no package pyd."""
+
+    package = make_fake_package(tmp_path)
+    (package / "runtime" / "llama_cpp" / "llama_cpp.pyd").unlink()
+
+    assert _audit(package).errors == ()
+
+
+def test_package_audit_rejects_foreign_top_level_icu_dlls(tmp_path: Path) -> None:
+    """A PATH-sourced ICU must not override the Windows ICU proxy used by Qt."""
+
+    package = make_fake_package(tmp_path)
+    runtime = package / "runtime"
+    (runtime / "icuuc.dll").write_bytes(b"foreign ICU")
+    (runtime / "icudt78.dll").write_bytes(b"foreign ICU data")
+
+    assert _audit(package).errors == (
+        "Runtime package must not contain foreign ICU DLL: runtime/icudt78.dll",
+        "Runtime package must not contain foreign ICU DLL: runtime/icuuc.dll",
+    )
+
+
 def test_package_audit_requires_every_license_and_font(tmp_path: Path) -> None:
     """License and font resources are mandatory package contents."""
 
@@ -166,6 +193,35 @@ def test_package_audit_requires_every_license_and_font(tmp_path: Path) -> None:
     (package / "runtime" / "assets" / "fonts" / "IBMPlexMono-Regular.ttf").unlink()
     errors = _audit(package).errors
     assert "Missing bundled font: IBMPlexMono-Regular.ttf" in errors
+
+
+def test_package_audit_requires_complete_dependency_license_inventory(
+    tmp_path: Path,
+) -> None:
+    """Removing the inventory or one listed file invalidates the package."""
+
+    package = make_fake_package(tmp_path)
+    inventory = package / "licenses" / "dependency-licenses.json"
+    inventory.unlink()
+    assert "Missing dependency license inventory" in _audit(package).errors
+
+    package = make_fake_package(tmp_path / "second")
+    dependency_license = next((package / "licenses" / "dependencies").rglob("*.txt"))
+    dependency_license.unlink()
+    assert "Dependency license inventory is incomplete" in _audit(package).errors
+
+
+@pytest.mark.parametrize("payload", [b"[]", b"not-json", b"\xff"])
+def test_package_audit_contains_malformed_dependency_inventory(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    """Malformed inventory data becomes an audit error instead of escaping."""
+
+    package = make_fake_package(tmp_path)
+    (package / "licenses" / "dependency-licenses.json").write_bytes(payload)
+
+    assert "Invalid dependency license inventory" in _audit(package).errors
 
 
 def test_package_audit_probes_help_and_native_imports_without_fixture_execution(

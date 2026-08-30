@@ -1,6 +1,19 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Test-IsTraversalLink {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileSystemInfo] $Item
+    )
+
+    $isReparsePoint = (
+        $Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint
+    ) -ne 0
+    return $isReparsePoint -and -not [string]::IsNullOrEmpty(
+        [string] $Item.LinkType
+    )
+}
+
 function Get-ValidatedRepoChild {
     param(
         [Parameter(Mandatory = $true)][string] $RepositoryRoot,
@@ -25,13 +38,8 @@ function Assert-NoReparsePathComponents {
         [Parameter(Mandatory = $true)][string] $TargetPath
     )
 
-    $rootItem = Get-Item -LiteralPath $RepositoryRoot -Force
-    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Refusing repository root reparse point: $RepositoryRoot"
-    }
-
     $relative = $TargetPath.Substring($RepositoryRoot.Length).TrimStart(
-        [char[]]@("\\", "/")
+        [char[]]@("\", "/")
     )
     if ([string]::IsNullOrEmpty($relative)) {
         return
@@ -46,7 +54,7 @@ function Assert-NoReparsePathComponents {
             continue
         }
         $item = Get-Item -LiteralPath $current -Force
-        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        if (Test-IsTraversalLink -Item $item) {
             throw "Refusing reparse-point path component: $current"
         }
     }
@@ -60,7 +68,7 @@ function Remove-ValidatedPackageTarget {
 
     $target = Get-ValidatedRepoChild -RepositoryRoot $RepositoryRoot -RelativePath $RelativePath
     $root = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd(
-        [char[]]@("\\", "/")
+        [char[]]@("\", "/")
     )
     $allowedTargets = @(
         [System.IO.Path]::GetFullPath((Join-Path $root "build\\FlowLens")),
@@ -73,7 +81,7 @@ function Remove-ValidatedPackageTarget {
         return
     }
     $item = Get-Item -LiteralPath $target -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+    if (Test-IsTraversalLink -Item $item) {
         throw "Refusing to remove reparse-point target: $target"
     }
     Remove-Item -LiteralPath $target -Recurse -Force
@@ -103,7 +111,7 @@ Remove-ValidatedPackageTarget -RepositoryRoot $repositoryRoot -RelativePath "dis
 
 Push-Location -LiteralPath $repositoryRoot
 try {
-    & $python -m PyInstaller --clean --noconfirm --additional-hooks-dir packaging/hooks packaging/FlowLens.spec
+    & $python -m PyInstaller --clean --noconfirm packaging/FlowLens.spec
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -113,9 +121,16 @@ try {
     if (Test-Path -LiteralPath $licenseDestination) {
         throw "PyInstaller unexpectedly created the licenses target: $licenseDestination"
     }
-    New-Item -ItemType Directory -LiteralPath $licenseDestination | Out-Null
+    New-Item -ItemType Directory -Path $licenseDestination | Out-Null
     Get-ChildItem -LiteralPath $licenseSource -File | ForEach-Object {
         Copy-Item -LiteralPath $_.FullName -Destination $licenseDestination
+    }
+
+    & $python scripts/collect_licenses.py `
+        --destination $licenseDestination `
+        --fallback-root $licenseSource
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
     }
 
     & $python scripts/check_package.py --package dist/FlowLens

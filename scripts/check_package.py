@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import stat
 import subprocess
@@ -21,6 +22,7 @@ from typing import Protocol, cast
 
 _EXPECTED_TOP_LEVEL = frozenset({"FlowLens.exe", "runtime", "licenses"})
 _REQUIRED_LICENSES = (
+    "CTranslate2-MIT.txt",
     "PySide6-LGPL-3.0-only.txt",
     "llama-cpp-python-MIT.txt",
     "IBM-Plex-OFL.txt",
@@ -45,6 +47,9 @@ _MODEL_DIRECTORY_NAMES = frozenset(
     }
 )
 _LICENSE_SHA256 = {
+    "CTranslate2-MIT.txt": (
+        "54aa79d9fe3c09e67a16dcd95b9e88676405a6ec174efda31036983cf7672ecb"
+    ),
     "IBM-Plex-OFL.txt": (
         "d741e57d5f865e294df801f96b7b5161a88b211df65887e4358d271c9fc5fb4f"
     ),
@@ -60,6 +65,42 @@ _LICENSE_SHA256 = {
     "llama-cpp-python-MIT.txt": (
         "2aa1e22f6de50309ec505631695f95b308e980efa318e15bb45732d2c5e07a34"
     ),
+}
+_PINNED_DEPENDENCIES = {
+    "av": "18.1.0",
+    "certifi": "2026.7.22",
+    "charset-normalizer": "3.5.1",
+    "colorama": "0.4.6",
+    "ctranslate2": "4.7.2",
+    "diskcache": "5.6.3",
+    "faster-whisper": "1.2.1",
+    "filelock": "3.32.4",
+    "flatbuffers": "25.12.19",
+    "fsspec": "2026.7.0",
+    "huggingface_hub": "0.36.2",
+    "idna": "3.19",
+    "Jinja2": "3.1.6",
+    "llama-cpp-python": "0.3.35",
+    "MarkupSafe": "3.0.3",
+    "numpy": "2.5.2",
+    "onnxruntime": "1.29.0",
+    "packaging": "26.3",
+    "protobuf": "4.25.9",
+    "PyAudioWPatch": "0.2.12.8",
+    "PySide6": "6.11.2",
+    "PySide6_Addons": "6.11.2",
+    "PySide6_Essentials": "6.11.2",
+    "python-ulid": "3.1.0",
+    "PyYAML": "6.0.3",
+    "requests": "2.34.2",
+    "setuptools": "81.0.0",
+    "shiboken6": "6.11.2",
+    "soxr": "1.1.0",
+    "tokenizers": "0.22.2",
+    "tqdm": "4.70.0",
+    "typing_extensions": "4.16.0",
+    "urllib3": "2.7.0",
+    "webrtcvad-wheels": "2.0.14",
 }
 
 
@@ -410,6 +451,8 @@ def _check_runtime_entries(
     for package in ("PySide6", "llama_cpp", "ctranslate2"):
         package_root = runtime / package
         _require_directory(entries, package_root, errors)
+    for package in ("PySide6", "ctranslate2"):
+        package_root = runtime / package
         _require_any_file_matching(
             entries,
             package_root,
@@ -439,9 +482,15 @@ def _check_runtime_entries(
     )
     _require_regular_file(
         entries,
-        runtime / "PySide6" / "Qt" / "plugins" / "platforms" / "qwindows.dll",
+        runtime / "PySide6" / "plugins" / "platforms" / "qwindows.dll",
         errors,
     )
+    for path in sorted(entries):
+        name = path.name.casefold()
+        if path.parent == runtime and (
+            name == "icuuc.dll" or (name.startswith("icudt") and name.endswith(".dll"))
+        ):
+            errors.append(f"Runtime package must not contain foreign ICU DLL: {path}")
 
 
 def _check_fonts(
@@ -496,6 +545,78 @@ def _check_licenses(
             continue
         if digest != _LICENSE_SHA256[name]:
             errors.append(f"Invalid license SHA-256: {name}")
+    _check_dependency_license_inventory(entries, errors)
+
+
+def _check_dependency_license_inventory(
+    entries: dict[PurePosixPath, _ScannedPath],
+    errors: list[str],
+) -> None:
+    relative = PurePosixPath("licenses/dependency-licenses.json")
+    inventory = entries.get(relative)
+    if inventory is None or not inventory.is_file():
+        errors.append("Missing dependency license inventory")
+        return
+    try:
+        _assert_unchanged(inventory)
+        value = json.loads(inventory.path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("invalid inventory")
+        dependencies = value["dependencies"]
+        if value.get("schema_version") != 1 or not isinstance(dependencies, list):
+            raise ValueError("invalid schema")
+        found: dict[str, str] = {}
+        listed_paths: set[PurePosixPath] = set()
+        for dependency in dependencies:
+            if not isinstance(dependency, dict):
+                raise ValueError("invalid dependency")
+            name = dependency.get("name")
+            version = dependency.get("version")
+            license_files = dependency.get("license_files")
+            if (
+                not isinstance(name, str)
+                or not isinstance(version, str)
+                or not isinstance(license_files, list)
+                or not license_files
+                or name in found
+            ):
+                raise ValueError("invalid dependency entry")
+            found[name] = version
+            for license_file in license_files:
+                if not isinstance(license_file, dict):
+                    raise ValueError("invalid license entry")
+                path_value = license_file.get("path")
+                expected_hash = license_file.get("sha256")
+                if not isinstance(path_value, str) or not isinstance(
+                    expected_hash, str
+                ):
+                    raise ValueError("invalid license fields")
+                path = PurePosixPath("licenses") / PurePosixPath(path_value)
+                if (
+                    path.parts[:2] != ("licenses", "dependencies")
+                    or ".." in path.parts
+                    or path in listed_paths
+                ):
+                    raise ValueError("invalid license path")
+                listed_paths.add(path)
+                entry = entries.get(path)
+                if entry is None or not entry.is_file():
+                    raise FileNotFoundError(path.as_posix())
+                if _sha256_entry(entry) != expected_hash:
+                    raise FileNotFoundError(path.as_posix())
+        if found != _PINNED_DEPENDENCIES:
+            raise FileNotFoundError("dependency set")
+        actual_paths = {
+            path
+            for path, entry in entries.items()
+            if path.parts[:2] == ("licenses", "dependencies") and entry.is_file()
+        }
+        if actual_paths != listed_paths:
+            raise FileNotFoundError("license set")
+    except FileNotFoundError:
+        errors.append("Dependency license inventory is incomplete")
+    except (KeyError, OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        errors.append("Invalid dependency license inventory")
 
 
 def _check_model_artifacts(

@@ -34,6 +34,11 @@ APPLICATION_HIDDEN_IMPORTS = [
     "flowlens.audio.pyaudiowpatch_backend",
     "flowlens.asr.kotoba_whisper",
     "flowlens.discussion.llama_cpp_adapter",
+    "PySide6.QtWidgets",
+    "pyaudiowpatch",
+    "faster_whisper",
+    "ctranslate2",
+    "llama_cpp",
 ]
 
 a = Analysis(
@@ -45,9 +50,19 @@ a = Analysis(
     hookspath=[str(PROJECT_ROOT / "packaging" / "hooks")],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["pytest", "_pytest", "pygments"],
     noarchive=False,
 )
+
+
+def is_foreign_icu_binary(entry):
+    """Reject unrelated ICU copies discovered through the build-process PATH."""
+
+    name = Path(entry[0]).name.casefold()
+    return name == "icuuc.dll" or (name.startswith("icudt") and name.endswith(".dll"))
+
+
+a.binaries = [entry for entry in a.binaries if not is_foreign_icu_binary(entry)]
 pyz = PYZ(a.pure)
 
 exe = EXE(

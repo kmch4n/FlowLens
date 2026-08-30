@@ -46,6 +46,11 @@ def test_spec_collects_application_resources_and_worker_modules() -> None:
         "flowlens.audio.worker",
         "flowlens.asr.worker",
         "flowlens.discussion.worker",
+        "PySide6.QtWidgets",
+        "pyaudiowpatch",
+        "faster_whisper",
+        "ctranslate2",
+        "llama_cpp",
     ):
         assert module in text
 
@@ -63,3 +68,38 @@ def test_native_hooks_collect_dynamic_libraries_and_submodules() -> None:
         encoding="utf-8"
     )
     assert '"_portaudiowpatch"' in pyaudio_hook
+
+    webrtcvad_hook = Path("packaging/hooks/hook-webrtcvad.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'copy_metadata("webrtcvad-wheels")' in webrtcvad_hook
+    assert '"_webrtcvad"' in webrtcvad_hook
+
+
+def test_spec_build_uses_hook_path_only_inside_the_spec() -> None:
+    """PyInstaller forbids makespec-only hook options with a spec file."""
+
+    spec = Path("packaging/FlowLens.spec").read_text(encoding="utf-8")
+    build_script = Path("scripts/build_windows.ps1").read_text(encoding="utf-8")
+
+    assert "hookspath=" in spec
+    assert "--additional-hooks-dir" not in build_script
+
+
+def test_spec_excludes_path_sourced_icu_binaries() -> None:
+    """Qt must resolve Windows ICU instead of an unrelated PATH copy."""
+
+    text = Path("packaging/FlowLens.spec").read_text(encoding="utf-8")
+
+    assert '"icuuc.dll"' in text
+    assert '"icudt"' in text
+    assert "a.binaries =" in text
+
+
+def test_spec_excludes_test_only_packages_from_runtime() -> None:
+    """Development-only test stacks must not become product dependencies."""
+
+    text = Path("packaging/FlowLens.spec").read_text(encoding="utf-8")
+
+    for package in ('"pytest"', '"_pytest"', '"pygments"'):
+        assert package in text

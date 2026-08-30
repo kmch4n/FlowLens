@@ -69,3 +69,33 @@ def test_build_cleanup_rejects_parent_junctions_and_non_package_targets(
         _invoke_target_validator(ordinary_repository, "build\\unexpected").returncode
         == 7
     )
+
+
+def test_build_cleanup_allows_an_explicit_repository_root_junction(
+    tmp_path: Path,
+) -> None:
+    """A trusted workspace junction must not block an exact package target."""
+
+    backing_repository = tmp_path / "backing-repository"
+    backing_repository.mkdir()
+    repository = tmp_path / "repository-junction"
+    creation = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(repository), str(backing_repository)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if creation.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable for this test")
+
+    assert _invoke_target_validator(repository, "build\\FlowLens").returncode == 0
+
+
+def test_build_uses_a_supported_parameter_to_create_the_license_directory() -> None:
+    """PowerShell New-Item accepts Path, not LiteralPath."""
+
+    source = Path("scripts/build_windows.ps1").read_text(encoding="utf-8")
+
+    assert "New-Item -ItemType Directory -Path $licenseDestination" in source
+    assert "New-Item -ItemType Directory -LiteralPath" not in source
