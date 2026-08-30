@@ -133,3 +133,18 @@ def test_prompt_defines_full_state_transition_semantics() -> None:
         "Keep each follow_up_items entry until the conversation resolves or "
         "supersedes it"
     ) in prompt
+
+
+def test_meeting_prompt_preserves_explicit_confirmation_wording() -> None:
+    meeting = "\n".join(
+        message.content
+        for message in build_messages(make_request(mode=SessionMode.MEETING))
+    )
+    interview = "\n".join(
+        message.content
+        for message in build_messages(make_request(mode=SessionMode.INTERVIEW))
+    )
+
+    instruction = "Preserve explicit confirmation wording in confirmed_outcomes"
+    assert instruction in meeting
+    assert instruction not in interview

@@ -677,10 +677,12 @@ class MultiprocessingWorkerRuntime:
         before_terminate: Callable[[], None] | None = None,
     ) -> tuple[tuple[ProcessSource, ...], tuple[ProcessSource, ...], tuple[str, ...]]:
         errors: list[str] = []
-        try:
-            _put_nowait(control_queue, self._shutdown_envelope(worker))
-        except Exception as error:
-            errors.append(f"{worker.value} control: {_error_name(error)}")
+        alive = self._process_is_alive(worker, process, errors)
+        if alive:
+            try:
+                _put_nowait(control_queue, self._shutdown_envelope(worker))
+            except Exception as error:
+                errors.append(f"{worker.value} control: {_error_name(error)}")
         self._join_process(worker, process, errors)
         alive = self._process_is_alive(worker, process, errors)
         terminated: tuple[ProcessSource, ...] = ()

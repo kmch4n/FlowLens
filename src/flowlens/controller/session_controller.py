@@ -9,7 +9,7 @@ from typing import Any, Protocol, cast
 
 from flowlens.asr.types import AsrWorkerConfig, PartialTranscript
 from flowlens.audio.types import AudioWorkerConfig
-from flowlens.controller.finalization import FinalizationCoordinator
+from flowlens.controller.finalization import FinalizationCoordinator, FinalizationStep
 from flowlens.controller.models import (
     CompletionSummary,
     PreflightReport,
@@ -219,6 +219,7 @@ class SessionController:
         self._outgoing_sequences: dict[ProcessSource, int] = {}
         self._writer_open_sequence: int | None = None
         self._started_ms: int | None = None
+        self._recording_started_ms: int | None = None
         self._last_clock_ms: int | None = None
         self._workers_started = False
         self._ready: set[ProcessSource] = set()
@@ -334,6 +335,7 @@ class SessionController:
         self._supervisor = WorkerSupervisor(launch.session_id)
         self._writer_open_sequence = open_envelope.sequence
         self._started_ms = started_ms
+        self._recording_started_ms = None
         self._workers_started = False
         self._ready = set()
         self._early_ready = set()
@@ -604,6 +606,9 @@ class SessionController:
             return (
                 (
                     self._state is SessionState.STARTING
+                    or (
+                        self._state is SessionState.RECORDING and envelope.sequence == 2
+                    )
                     or ProcessSource.ASR in self._restart_pending
                 )
                 and backlog == 0
@@ -672,6 +677,31 @@ class SessionController:
             if self._state is SessionState.STOPPING and self._finalization is not None:
                 if self._finalization.snapshot().incomplete:
                     return
+                finalization_snapshot = self._finalization.snapshot()
+                if (
+                    finalization_snapshot.step is FinalizationStep.FINALIZE_WRITER
+                    and not finalization_snapshot.force_requested
+                ):
+                    result = self._runtime.writer_force_close_result()
+                    if (
+                        result is not None
+                        and result.outcome is WriterForceCloseOutcome.COMPLETED
+                    ):
+                        self._finalization.resolve_completed_result(result)
+                        self._consume_terminal_event_sequence()
+                        self._snapshot = replace(
+                            self._snapshot,
+                            latest_successful_save_at=(
+                                result.latest_successful_save_at
+                            ),
+                        )
+                        self._set_state(
+                            SessionState.COMPLETED,
+                            recording_status="Completed",
+                            slow_finalization_visible=False,
+                            completion=self._completion_summary(),
+                        )
+                        return
                 finalization_tick = self._finalization.tick(now_ms)
                 if finalization_tick.show_slow_message:
                     self._snapshot = replace(
@@ -866,7 +896,7 @@ class SessionController:
             self._snapshot,
             latest_successful_save_at=payload.latest_successful_save_at,
         )
-        for worker in _START_WORKERS:
+        for worker in (ProcessSource.ASR, ProcessSource.DISCUSSION):
             self._send(
                 worker,
                 MessageType.WORKER_START,
@@ -906,6 +936,13 @@ class SessionController:
             ProcessSource.ASR,
             ProcessSource.DISCUSSION,
         }:
+            if self._recording_started_ms is None:
+                self._send(
+                    ProcessSource.AUDIO,
+                    MessageType.WORKER_START,
+                    {"worker": "AUDIO"},
+                )
+                self._recording_started_ms = self._read_clock()
             self._set_state(
                 SessionState.RECORDING,
                 recording_status="Recording",
@@ -1431,7 +1468,7 @@ class SessionController:
 
     def _active_duration_ms_at_stop(self) -> int:
         now_ms = self._stop_confirmed_ms
-        started_ms = self._started_ms
+        started_ms = self._recording_started_ms
         if now_ms is None or started_ms is None:
             raise RuntimeError("stop timing is unavailable")
         paused_ms = sum(
@@ -1723,6 +1760,7 @@ class SessionController:
         self._outgoing_sequences.clear()
         self._writer_open_sequence = None
         self._started_ms = None
+        self._recording_started_ms = None
         self._workers_started = False
         self._ready.clear()
         self._early_ready.clear()

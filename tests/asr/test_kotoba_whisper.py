@@ -7,11 +7,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from flowlens.asr.kotoba_whisper import (
-    KotobaWhisperDecoder,
-    ModelPathError,
-)
+from flowlens.asr.kotoba_whisper import KotobaWhisperDecoder, ModelPathError
 from flowlens.asr.types import DecodedToken, DecodeHypothesis
+
+REQUIRED_MODEL_FILES = (
+    "model.bin",
+    "config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "vocabulary.json",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +50,16 @@ class FakeModel:
         return iter(self._segments), object()
 
 
+def create_model_directory(root: Path, name: str = "model") -> Path:
+    """Create the complete local runtime shape expected by the decoder."""
+
+    model_dir = root / name
+    model_dir.mkdir()
+    for filename in REQUIRED_MODEL_FILES:
+        (model_dir / filename).write_bytes(b"fixture")
+    return model_dir
+
+
 def make_decoder(
     model_dir: Path,
     fake: FakeModel,
@@ -59,8 +74,7 @@ def make_decoder(
 
 
 def test_decoder_uses_fixed_offline_settings_and_converts_pcm(tmp_path: Path) -> None:
-    model_dir = tmp_path / "kotoba-whisper-v2.0-faster"
-    model_dir.mkdir()
+    model_dir = create_model_directory(tmp_path, "kotoba-whisper-v2.0-faster")
     fake = FakeModel(
         [
             FakeSegment(
@@ -123,9 +137,29 @@ def test_decoder_rejects_file_model_path_before_factory_call(tmp_path: Path) -> 
         KotobaWhisperDecoder(model_file, model_factory=factory)
 
 
+@pytest.mark.parametrize("missing_name", REQUIRED_MODEL_FILES)
+def test_decoder_rejects_incomplete_local_model_before_factory_call(
+    tmp_path: Path,
+    missing_name: str,
+) -> None:
+    model_dir = create_model_directory(tmp_path)
+    (model_dir / missing_name).unlink()
+    calls = 0
+
+    def factory(model_size_or_path: str, **kwargs: object) -> FakeModel:
+        del model_size_or_path, kwargs
+        nonlocal calls
+        calls += 1
+        return FakeModel([])
+
+    with pytest.raises(ModelPathError, match="complete local model"):
+        KotobaWhisperDecoder(model_dir, model_factory=factory)
+
+    assert calls == 0
+
+
 def test_decode_rejects_odd_length_pcm_without_transcribing(tmp_path: Path) -> None:
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
+    model_dir = create_model_directory(tmp_path)
     fake = FakeModel([])
     decoder, _ = make_decoder(model_dir, fake)
 
@@ -136,8 +170,7 @@ def test_decode_rejects_odd_length_pcm_without_transcribing(tmp_path: Path) -> N
 
 
 def test_decode_consumes_all_segments_and_preserves_input(tmp_path: Path) -> None:
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
+    model_dir = create_model_directory(tmp_path)
     consumed: list[str] = []
 
     def segments() -> Iterator[FakeSegment]:
@@ -164,8 +197,7 @@ def test_decode_consumes_all_segments_and_preserves_input(tmp_path: Path) -> Non
 def test_decode_falls_back_for_nonempty_segment_without_usable_words(
     tmp_path: Path,
 ) -> None:
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
+    model_dir = create_model_directory(tmp_path)
     fake = FakeModel(
         [
             FakeSegment(text="  \u4e00つ目  ", start=0.25, end=0.75, words=None),
@@ -211,8 +243,7 @@ def test_decode_ignores_segment_with_malformed_fallback_span(
     start: object,
     end: object,
 ) -> None:
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
+    model_dir = create_model_directory(tmp_path)
     decoder, _ = make_decoder(
         model_dir,
         FakeModel([FakeSegment(text="\u767a言", start=start, end=end)]),
@@ -222,8 +253,7 @@ def test_decode_ignores_segment_with_malformed_fallback_span(
 
 
 def test_decode_ignores_out_of_order_tokens_deterministically(tmp_path: Path) -> None:
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
+    model_dir = create_model_directory(tmp_path)
     decoder, _ = make_decoder(
         model_dir,
         FakeModel(

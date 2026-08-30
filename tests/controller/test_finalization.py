@@ -874,6 +874,28 @@ def test_tick_returns_immediately_after_polled_completion_ack(tmp_path: Path) ->
     assert runtime.shutdown_count == 1
 
 
+def test_tick_uses_durable_writer_result_when_completion_ack_is_lost(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, clock, _ = recording_controller(tmp_path)
+    controller.request_stop()
+    controller.confirm_stop()
+    controller.handle_message(stopped_envelope(ProcessSource.AUDIO))
+    controller.handle_message(stopped_envelope(ProcessSource.ASR))
+    controller.handle_message(stopped_envelope(ProcessSource.DISCUSSION))
+    runtime.force_close_result_value = WriterForceCloseResult(
+        WriterForceCloseOutcome.COMPLETED,
+        NOW,
+    )
+    clock.ms = 1_250
+
+    controller.tick()
+
+    assert controller_state(controller) is SessionState.COMPLETED
+    assert controller.snapshot().latest_successful_save_at == NOW
+    assert runtime.shutdown_count == 1
+
+
 def test_writer_finalize_duration_is_frozen_at_stop_confirmation(
     tmp_path: Path,
 ) -> None:

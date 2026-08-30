@@ -1,6 +1,7 @@
 """Offline-only adapter for the fixed Kotoba-Whisper model."""
 
 import math
+import stat
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Protocol, cast
@@ -10,6 +11,14 @@ import numpy.typing as npt
 
 from flowlens.asr.types import DecodedToken, DecodeHypothesis
 from flowlens.offline_imports import import_local_module
+
+_REQUIRED_MODEL_FILES = (
+    "model.bin",
+    "config.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "vocabulary.json",
+)
 
 
 class ModelPathError(ValueError):
@@ -43,6 +52,22 @@ def _default_model_factory(
     module = import_local_module("faster_whisper")
     factory = cast(WhisperModelFactory, vars(module)["WhisperModel"])
     return factory(model_size_or_path, **kwargs)
+
+
+def _safe_local_file(path: Path) -> bool:
+    try:
+        status = path.lstat()
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        attributes = getattr(status, "st_file_attributes", 0)
+        return (
+            stat.S_ISREG(status.st_mode)
+            and not stat.S_ISLNK(status.st_mode)
+            and not bool(attributes & reparse)
+            and status.st_nlink == 1
+            and path.resolve(strict=True) == path
+        )
+    except OSError:
+        return False
 
 
 def _read_attribute(value: object, name: str) -> object:
@@ -93,6 +118,11 @@ class KotobaWhisperDecoder:
     ) -> None:
         if not isinstance(model_path, Path) or not model_path.is_dir():
             raise ModelPathError("model_path must be an existing local directory")
+        if any(
+            not _safe_local_file(model_path / filename)
+            for filename in _REQUIRED_MODEL_FILES
+        ):
+            raise ModelPathError("model_path must contain the complete local model")
         self._model = model_factory(
             str(model_path),
             device="cuda",

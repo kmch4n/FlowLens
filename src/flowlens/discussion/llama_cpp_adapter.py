@@ -18,6 +18,7 @@ from flowlens.offline_imports import import_local_module
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _HASH_CHUNK_SIZE = 1024 * 1024
+_PROMPT_BATCH_SIZE = 128
 
 
 class _LlamaClient(Protocol):
@@ -242,6 +243,9 @@ def load_llama_cpp_backend(
             model_path=str(config.model_path),
             n_ctx=config.n_ctx,
             n_gpu_layers=config.n_gpu_layers,
+            n_batch=_PROMPT_BATCH_SIZE,
+            n_ubatch=_PROMPT_BATCH_SIZE,
+            offload_kqv=False,
             verbose=False,
             use_mmap=True,
         )

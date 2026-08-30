@@ -1050,6 +1050,22 @@ def test_normal_shutdown_does_not_inject_a_duplicate_audio_fence() -> None:
     )
 
 
+def test_shutdown_does_not_write_to_controls_for_already_exited_workers() -> None:
+    runtime = make_runtime()
+    runtime.start_all(make_launch())
+    for process in runtime.processes.values():
+        process.alive = False
+    before = {
+        worker: len(control.items) for worker, control in runtime.control_queues.items()
+    }
+
+    runtime.shutdown()
+
+    assert {
+        worker: len(control.items) for worker, control in runtime.control_queues.items()
+    } == before
+
+
 def test_safe_stop_relies_on_a_gracefully_stopped_audio_worker_fence() -> None:
     context = FakeMultiprocessingContext()
     context.exit_on_join = True

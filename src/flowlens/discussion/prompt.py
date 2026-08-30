@@ -33,6 +33,16 @@ def _json(value: object) -> str:
 
 def _system_content(request: DiscussionRequest) -> str:
     focus, points, outcomes, follow_up = _MODE_LABELS[request.current_state.mode]
+    mode_rules = (
+        (
+            "- Preserve explicit confirmation wording in confirmed_outcomes "
+            "when the meeting transcript confirms, agrees, or decides an outcome; "
+            "copy a qualifier such as 確定, 合意, or 決定 into that field and "
+            "do not paraphrase the qualifier away.",
+        )
+        if request.current_state.mode is SessionMode.MEETING
+        else ()
+    )
     return "\n".join(
         (
             "Organize only what is explicitly supported by the transcript.",
@@ -64,6 +74,7 @@ def _system_content(request: DiscussionRequest) -> str:
             "in the conversation.",
             f"- confirmed_outcomes ({outcomes}): only content explicitly confirmed.",
             f"- follow_up_items ({follow_up}): only open content explicitly raised.",
+            *mode_rules,
             "- updated_at: use the requested timestamp constant.",
             "- analyzed_through_sequence: use the requested watermark constant.",
         )

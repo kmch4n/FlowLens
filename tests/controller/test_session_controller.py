@@ -44,6 +44,7 @@ from flowlens.domain.messages import (
     TranscriptCommitted,
     WriterAck,
     WriterAppendEvent,
+    WriterFinalize,
     WriterForceCloseRequest,
     WriterForceCloseResult,
     WriterOpenSession,
@@ -312,19 +313,41 @@ def test_recording_waits_for_writer_open_then_all_worker_readiness(
     assert not sent_to(runtime, ProcessSource.AUDIO)
 
     controller.handle_message(writer_ack())
+    assert sent_to(runtime, ProcessSource.AUDIO) == []
     assert [
         sent_to(runtime, source)[0].message_type
-        for source in (
-            ProcessSource.AUDIO,
-            ProcessSource.ASR,
-            ProcessSource.DISCUSSION,
-        )
-    ] == [MessageType.WORKER_START] * 3
+        for source in (ProcessSource.ASR, ProcessSource.DISCUSSION)
+    ] == [MessageType.WORKER_START] * 2
     for source in (ProcessSource.AUDIO, ProcessSource.ASR):
         controller.handle_message(ready(source))
         assert controller.state is SessionState.STARTING
     controller.handle_message(ready(ProcessSource.DISCUSSION))
     assert controller.snapshot().state is SessionState.RECORDING
+    assert (
+        sent_to(runtime, ProcessSource.AUDIO)[-1].message_type
+        is MessageType.WORKER_START
+    )
+
+
+def test_active_duration_excludes_worker_startup_time(tmp_path: Path) -> None:
+    controller, runtime, clock, _, _ = make_controller(tmp_path)
+    controller.enter_preflight()
+    controller.start(selection())
+    controller.handle_message(writer_ack())
+    clock.ms = 11_000
+    for source in (ProcessSource.AUDIO, ProcessSource.ASR, ProcessSource.DISCUSSION):
+        controller.handle_message(ready(source))
+    clock.ms = 21_000
+
+    controller.request_stop()
+    controller.confirm_stop()
+    controller.handle_message(stopped_envelope(ProcessSource.AUDIO))
+    controller.handle_message(stopped_envelope(ProcessSource.ASR))
+    controller.handle_message(stopped_envelope(ProcessSource.DISCUSSION))
+
+    finalize = sent_to(runtime, ProcessSource.WRITER)[-1]
+    assert isinstance(finalize.payload, WriterFinalize)
+    assert finalize.payload.active_duration_ms == 10_000
 
 
 def test_illegal_transition_has_no_side_effect_of_any_kind(tmp_path: Path) -> None:
@@ -588,6 +611,22 @@ def test_asr_hysteresis_uses_strict_boundaries_and_emits_commands_once(
         is MessageType.WORKER_RESUME
     )
     assert controller.snapshot().maximum_asr_backlog_ms == 5_100
+
+
+def test_initial_asr_ready_status_remains_valid_after_recording_race(
+    tmp_path: Path,
+) -> None:
+    controller, runtime, _, _ = recording_controller(tmp_path)
+
+    controller.handle_message(asr_status(2, 0, 0, state="READY"))
+    controller.handle_message(asr_status(3, 0, 0))
+
+    assert controller.snapshot().asr_status == "Running"
+    assert not any(
+        isinstance(message.payload, WriterAppendEvent)
+        and message.payload.record.event_type is EventType.WORKER_EXITED
+        for message in sent_to(runtime, ProcessSource.WRITER)
+    )
 
 
 def test_duplicate_status_causes_no_command_or_snapshot_mutation(

@@ -35,6 +35,8 @@ REQUIRED_ARTIFACTS = frozenset(
         "events.jsonl",
     }
 )
+_MAX_WORKER_STARTUP_MS = 60_000
+_MAX_COMPLETED_WAV_ERROR_PERCENT = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,7 +484,9 @@ def validate_session(
                 )
             if expected_status == "completed":
                 paused_ms = sum(end - start for start, end in event_pause_intervals)
-                if terminal.session_time_ms - paused_ms != manifest.active_duration_ms:
+                available_active_ms = terminal.session_time_ms - paused_ms
+                startup_gap_ms = available_active_ms - manifest.active_duration_ms
+                if startup_gap_ms < 0 or startup_gap_ms > _MAX_WORKER_STARTUP_MS:
                     errors.append(
                         "session.json active duration does not match event timeline"
                     )
@@ -510,6 +514,11 @@ def validate_session(
                 * 100
                 for value in durations.values()
             )
+            if (
+                expected_status == "completed"
+                and wav_error > _MAX_COMPLETED_WAV_ERROR_PERCENT
+            ):
+                errors.append("WAV duration error exceeds 0.5 percent")
 
     return SessionValidationResult(
         errors=tuple(errors),

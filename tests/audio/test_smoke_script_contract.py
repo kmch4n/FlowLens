@@ -15,6 +15,7 @@ from flowlens.audio.types import AudioWorkerConfig
 from flowlens.audio.worker import run_audio_worker
 from flowlens.domain.enums import AudioSource, MessageType, ProcessSource
 from flowlens.domain.messages import MessageEnvelope
+from flowlens.persistence.wav_sink import WavSink
 from flowlens.smoke.asr import (
     AsrSmokeMetrics,
     _nearest_rank_p95,
@@ -28,6 +29,7 @@ from flowlens.smoke.asr import (
 )
 from flowlens.smoke.audio import (
     _cleanup_resources,
+    _repair_and_validate_wav,
     _validate_wav,
     _validate_worker_stopped,
 )
@@ -134,6 +136,17 @@ def test_wav_validation_enforces_format_nonempty_and_strict_duration(
         _validate_wav(lower, 60)
     with pytest.raises(ValueError, match="mono"):
         _validate_wav(stereo, 60)
+
+
+def test_smoke_repairs_the_intentionally_incomplete_writer_wav_header(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mic.wav"
+    sink = WavSink.open(path)
+    sink.append(bytes(16_000 * 2))
+    sink.close_incomplete()
+
+    assert _repair_and_validate_wav(path, 1) == 1_000
 
 
 def test_asr_metrics_use_envelope_monotonic_times_without_fabrication() -> None:

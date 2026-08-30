@@ -207,6 +207,7 @@ class PyAudioWPatchBackend:
         )
         if device is None:
             raise DeviceUnavailableError(device_id)
+        next_captured_monotonic_ms: int | None = None
 
         def stream_callback(
             in_data: bytes,
@@ -214,9 +215,19 @@ class PyAudioWPatchBackend:
             time_info: object,
             status_flags: int,
         ) -> tuple[None, int]:
+            nonlocal next_captured_monotonic_ms
+
             del time_info, status_flags
-            captured_monotonic_ms = self._monotonic_ms() - round(
+            observed_monotonic_ms = self._monotonic_ms() - round(
                 frame_count * 1_000 / device.sample_rate_hz
+            )
+            captured_monotonic_ms = (
+                observed_monotonic_ms
+                if next_captured_monotonic_ms is None
+                else max(observed_monotonic_ms, next_captured_monotonic_ms)
+            )
+            next_captured_monotonic_ms = (
+                captured_monotonic_ms + frame_count * 1_000 // device.sample_rate_hz
             )
             callback(
                 RawAudioChunk(

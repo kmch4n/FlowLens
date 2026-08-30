@@ -1,4 +1,5 @@
 import ast
+import os
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -176,6 +177,58 @@ def test_local_import_gateway_rejects_constructed_network_and_unknown_names(
         import_local_module("flowlens.unapproved")
 
     assert loaded == ["flowlens.audio.worker"]
+
+
+def test_local_import_gateway_registers_cuda_12_before_asr_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from flowlens import offline_imports
+
+    cuda_root = tmp_path / "CUDA" / "v12.8"
+    cuda_bin = cuda_root / "bin"
+    cuda_bin.mkdir(parents=True)
+    (cuda_bin / "cublas64_12.dll").write_bytes(b"cublas")
+    (cuda_bin / "cudart64_12.dll").write_bytes(b"cudart")
+    registered: list[str] = []
+    loaded: list[str] = []
+
+    def register_directory(path: str) -> object:
+        registered.append(path)
+        return object()
+
+    def import_module(name: str) -> object:
+        loaded.append(name)
+        return object()
+
+    monkeypatch.setenv("CUDA_PATH_V12_8", str(cuda_root))
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(
+        os,
+        "add_dll_directory",
+        register_directory,
+    )
+    monkeypatch.setattr(
+        "flowlens.offline_imports.importlib.import_module",
+        import_module,
+    )
+    monkeypatch.setattr(
+        offline_imports,
+        "_DLL_DIRECTORY_HANDLES",
+        [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        offline_imports,
+        "_REGISTERED_DLL_DIRECTORIES",
+        set(),
+        raising=False,
+    )
+
+    offline_imports.import_local_module("faster_whisper")
+
+    assert registered == [os.fspath(cuda_bin)]
+    assert loaded == ["faster_whisper"]
 
 
 def test_runtime_source_has_no_static_or_unguarded_dynamic_network_imports() -> None:

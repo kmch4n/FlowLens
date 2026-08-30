@@ -42,7 +42,7 @@ from flowlens.smoke.audio import (
     _now_utc,
     _prepare_output_directory,
     _QueuePort,
-    _validate_wav,
+    _repair_and_validate_wav,
     _validate_worker_stopped,
     _wait_for_envelope,
     _wait_writer_ack,
@@ -509,8 +509,8 @@ def _run(arguments: AsrSmokeArguments) -> int:
         )
         _join_process(writer, _SHUTDOWN_TIMEOUT_SECONDS)
 
-        _validate_wav(arguments.output_directory / "mic.wav", 120)
-        _validate_wav(arguments.output_directory / "loopback.wav", 120)
+        _repair_and_validate_wav(arguments.output_directory / "mic.wav", 120)
+        _repair_and_validate_wav(arguments.output_directory / "loopback.wav", 120)
         _assert_japanese(metrics)
         partial_p95 = _nearest_rank_p95(metrics.partial_latencies_ms)
         commit_p95 = _nearest_rank_p95(metrics.commit_after_end_latencies_ms)

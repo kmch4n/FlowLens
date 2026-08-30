@@ -264,6 +264,9 @@ def test_load_uses_verified_local_path_full_gpu_and_fixed_context(
         "model_path": str(model_path),
         "n_ctx": 8192,
         "n_gpu_layers": -1,
+        "n_batch": 128,
+        "n_ubatch": 128,
+        "offload_kqv": False,
         "verbose": False,
         "use_mmap": True,
     }

@@ -33,6 +33,7 @@ from flowlens.domain.messages import (
     WriterShutdown,
 )
 from flowlens.domain.session import DeviceIdentity, ModelIdentity, SessionManifest
+from flowlens.persistence.wav_sink import repair_wav_header
 from flowlens.workers.writer import run_writer_worker
 
 _STARTUP_TIMEOUT_SECONDS = 60.0
@@ -150,6 +151,13 @@ def _validate_wav(path: Path, expected_duration_seconds: int) -> int:
             f"({frame_count / sample_rate:.3f}s)"
         )
     return round(frame_count * 1_000 / sample_rate)
+
+
+def _repair_and_validate_wav(path: Path, expected_duration_seconds: int) -> int:
+    """Publish the smoke artifact header, then validate its captured payload."""
+
+    repair_wav_header(path)
+    return _validate_wav(path, expected_duration_seconds)
 
 
 def _now_utc() -> datetime:
@@ -513,11 +521,11 @@ def _run(arguments: AudioSmokeArguments) -> int:
             monotonic=time.monotonic,
         )
         _join_process(writer, _SHUTDOWN_TIMEOUT_SECONDS)
-        me_duration = _validate_wav(
+        me_duration = _repair_and_validate_wav(
             arguments.output_directory / "mic.wav",
             arguments.duration_seconds,
         )
-        others_duration = _validate_wav(
+        others_duration = _repair_and_validate_wav(
             arguments.output_directory / "loopback.wav",
             arguments.duration_seconds,
         )

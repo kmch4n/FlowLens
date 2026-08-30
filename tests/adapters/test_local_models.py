@@ -15,6 +15,25 @@ from flowlens.domain.enums import AudioSource
 QWEN_PATH = "qwen3-4b-instruct-2507/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 ASR_PATH = "kotoba-whisper-v2.0-faster/model.bin"
 ASR_REVISION = "f44edd35eaeb2274e85ac7b31fb2c6f59ff1c4bc"
+ASR_ALIGNMENT_HEADS = [[1, head] for head in range(20)]
+ASR_CONFIG = json.dumps({"alignment_heads": ASR_ALIGNMENT_HEADS}).encode("utf-8")
+ASR_SIDECARS = {
+    "config.json": ASR_CONFIG,
+    "preprocessor_config.json": b'{"sampling_rate":16000}',
+    "tokenizer.json": b'{"version":"1.0"}',
+    "vocabulary.json": b'{"<pad>":0}',
+}
+
+
+@pytest.fixture(autouse=True)
+def approved_asr_sidecars(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "flowlens.adapters.local_models._ASR_ARTIFACT_SHA256",
+        {
+            name: hashlib.sha256(payload).hexdigest()
+            for name, payload in ASR_SIDECARS.items()
+        },
+    )
 
 
 def manifest_entry(
@@ -37,6 +56,8 @@ def write_ready_manifest(root: Path) -> Path:
     asr.parent.mkdir(parents=True)
     qwen.write_bytes(b"qwen")
     asr.write_bytes(b"asr")
+    for name, payload in ASR_SIDECARS.items():
+        (asr.parent / name).write_bytes(payload)
     manifest = {
         "schema_version": 1,
         "models": {
@@ -85,6 +106,61 @@ def test_model_probe_rejects_wrong_asr_runtime_path(tmp_path: Path) -> None:
     asr["relative_path"] = "kotoba-whisper-v2.0-faster/other.bin"
     asr["sha256"] = hashlib.sha256(b"other").hexdigest()
     manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    result = LocalModelReadiness(root, manifest).check_required()
+
+    assert result["asr"].ready is False
+    assert result["asr"].reason == "invalid"
+
+
+@pytest.mark.parametrize(
+    "config_payload",
+    [
+        b"{}",
+        b'{"alignment_heads":[[0,0]]}',
+        b'{"alignment_heads":[[1,0]],"alignment_heads":[[1,1]]}',
+        b'\xef\xbb\xbf{"alignment_heads":[]}',
+        b"not-json",
+    ],
+)
+def test_model_probe_requires_corrected_kotoba_alignment_heads(
+    tmp_path: Path,
+    config_payload: bytes,
+) -> None:
+    root = tmp_path.resolve()
+    manifest = write_ready_manifest(root)
+    (root / "kotoba-whisper-v2.0-faster" / "config.json").write_bytes(config_payload)
+
+    result = LocalModelReadiness(root, manifest).check_required()
+
+    assert result["asr"].ready is False
+    assert result["asr"].reason == "invalid"
+
+
+def test_model_probe_requires_regular_kotoba_config_file(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    manifest = write_ready_manifest(root)
+    config = root / "kotoba-whisper-v2.0-faster" / "config.json"
+    config.unlink()
+    config.mkdir()
+
+    result = LocalModelReadiness(root, manifest).check_required()
+
+    assert result["asr"].ready is False
+    assert result["asr"].reason == "invalid"
+
+
+@pytest.mark.parametrize(
+    "sidecar_name",
+    ["preprocessor_config.json", "tokenizer.json", "vocabulary.json"],
+)
+def test_model_probe_requires_every_pinned_kotoba_sidecar(
+    tmp_path: Path,
+    sidecar_name: str,
+) -> None:
+    root = tmp_path.resolve()
+    manifest = write_ready_manifest(root)
+    (root / "kotoba-whisper-v2.0-faster" / sidecar_name).unlink()
 
     result = LocalModelReadiness(root, manifest).check_required()
 

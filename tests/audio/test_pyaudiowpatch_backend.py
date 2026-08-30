@@ -243,6 +243,21 @@ def test_portaudio_callback_only_builds_native_chunk_and_backdates_capture() -> 
     ]
 
 
+def test_portaudio_callback_clamps_scheduler_jitter_to_a_contiguous_timeline() -> None:
+    api = FakePyAudio()
+    ticks = iter((9_000, 9_019))
+    backend = _backend(api, monotonic_ms=lambda: next(ticks))
+    chunks: list[RawAudioChunk] = []
+    backend.open_stream(AudioSource.OTHERS, "wasapi-output:7", chunks.append)
+    callback = api.open_kwargs["stream_callback"]
+    assert callable(callback)
+
+    callback(bytes(3_840), 960, {}, 0)
+    callback(bytes(3_840), 960, {}, 0)
+
+    assert [chunk.captured_monotonic_ms for chunk in chunks] == [8_980, 9_000]
+
+
 @pytest.mark.parametrize(
     ("source", "device_id"),
     [

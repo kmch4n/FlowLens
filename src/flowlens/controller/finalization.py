@@ -281,6 +281,21 @@ class FinalizationCoordinator:
         self._slow_visible = False
         self._shutdown()
 
+    def resolve_completed_result(self, result: WriterForceCloseResult) -> None:
+        """Accept Writer's durable completed result if its queue ACK was lost."""
+
+        if type(result) is not WriterForceCloseResult:
+            raise TypeError("result must be an exact WriterForceCloseResult")
+        if self._step is not FinalizationStep.FINALIZE_WRITER:
+            raise RuntimeError("completed result requires Writer finalization")
+        if self._force_requested or self._incomplete:
+            raise RuntimeError("completed result conflicts with force close")
+        if result.outcome is not WriterForceCloseOutcome.COMPLETED:
+            raise RuntimeError("normal finalization requires a completed result")
+        self._step = FinalizationStep.COMPLETE
+        self._slow_visible = False
+        self._shutdown()
+
     def _advance_worker(
         self,
         worker: ProcessSource,

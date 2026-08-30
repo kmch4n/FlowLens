@@ -653,6 +653,59 @@ def test_validator_cross_checks_pause_events_manifest_and_active_time(
     assert "session.json active duration does not match event timeline" in result.errors
 
 
+def test_validator_allows_worker_startup_gap_before_active_capture(
+    tmp_path: Path,
+) -> None:
+    session = make_valid_session(tmp_path)
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    events[-1]["session_time_ms"] += 10_000
+    _jsonl(session / "events.jsonl", events)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert result.errors == ()
+
+
+def test_validator_rejects_startup_gap_beyond_readiness_timeout(
+    tmp_path: Path,
+) -> None:
+    session = make_valid_session(tmp_path)
+    events = [
+        json.loads(line) for line in (session / "events.jsonl").read_text().splitlines()
+    ]
+    events[-1]["session_time_ms"] += 60_001
+    _jsonl(session / "events.jsonl", events)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert "session.json active duration does not match event timeline" in result.errors
+
+
+def test_validator_rejects_completed_wav_duration_above_spec_limit(
+    tmp_path: Path,
+) -> None:
+    session = make_valid_session(tmp_path)
+    _wav(session / "mic.wav", duration_ms=298_000)
+
+    result = validate_session(
+        session,
+        minimum_active_seconds=300,
+        expected_status="completed",
+    )
+
+    assert "WAV duration error exceeds 0.5 percent" in result.errors
+
+
 def test_validator_rejects_pause_event_after_terminal_time(tmp_path: Path) -> None:
     interval = PauseInterval(100_000, 105_000)
     session = make_valid_session(tmp_path, pause_intervals=(interval,))

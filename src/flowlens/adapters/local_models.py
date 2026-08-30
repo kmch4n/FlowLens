@@ -1,6 +1,7 @@
 """Strictly local model readiness checks with no download fallback."""
 
 import hashlib
+import json
 import stat
 from collections.abc import Mapping
 from pathlib import Path
@@ -18,6 +19,20 @@ _ASR_REPOSITORY = "kotoba-tech/kotoba-whisper-v2.0-faster"
 _ASR_RUNTIME_PATH = "kotoba-whisper-v2.0-faster/model.bin"
 _ASR_SOURCE_REVISION = "f44edd35eaeb2274e85ac7b31fb2c6f59ff1c4bc"
 _ASR_LICENSE = "MIT"
+_ASR_CONFIG_NAME = "config.json"
+_ASR_ALIGNMENT_HEADS = [[1, head] for head in range(20)]
+_ASR_ARTIFACT_SHA256 = {
+    "config.json": "90c55f775cc4e0bb17293d0bf12f96557a486f20dea886fabd8e6075a3588b21",
+    "preprocessor_config.json": (
+        "902ea83da8365e6dab586b37f0e8deb8b925d323f726c2e8972c176f5dbfa201"
+    ),
+    "tokenizer.json": (
+        "79405583bbc27b16f69416241d4db38983d83dabf4c90811096528bf00f39101"
+    ),
+    "vocabulary.json": (
+        "697ee5a65726e46b4d294d1a243d98e1878f5d81caba17891b1c5ebab7a912a9"
+    ),
+}
 
 
 class LocalModelReadiness:
@@ -99,6 +114,11 @@ class LocalModelReadiness:
             return ModelCheck(model_id, target, False, "invalid")
         if actual != value["sha256"]:
             return ModelCheck(model_id, target, False, "checksum")
+        if model_id == _ASR_ID and not _valid_asr_artifacts(
+            target.parent,
+            self._chunk_size,
+        ):
+            return ModelCheck(model_id, target, False, "invalid")
         return ModelCheck(model_id, target, True, None)
 
     def _resolve_target(self, relative_path: str) -> Path:
@@ -178,3 +198,51 @@ def _hash_file(path: Path, chunk_size: int) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _valid_asr_artifacts(model_directory: Path, chunk_size: int) -> bool:
+    for filename, expected_hash in _ASR_ARTIFACT_SHA256.items():
+        artifact = model_directory / filename
+        if not _safe_regular_file(artifact):
+            return False
+        try:
+            if artifact.stat().st_size <= 0:
+                return False
+            if _hash_file(artifact, chunk_size) != expected_hash:
+                return False
+        except OSError:
+            return False
+    return _valid_asr_config(model_directory)
+
+
+def _valid_asr_config(model_directory: Path) -> bool:
+    config_path = model_directory / _ASR_CONFIG_NAME
+    if not _safe_regular_file(config_path):
+        return False
+    try:
+        payload = config_path.read_bytes()
+        if payload.startswith(b"\xef\xbb\xbf"):
+            return False
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(value, Mapping) and value.get("alignment_heads") == (
+        _ASR_ALIGNMENT_HEADS
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"invalid JSON constant: {value}")
