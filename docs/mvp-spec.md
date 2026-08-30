@@ -147,6 +147,21 @@ Models are stored under:
 %LOCALAPPDATA%\FlowLens\models\
 ```
 
+The model manifest and runtime artifacts are fixed as follows:
+
+| Model | Source revision | Runtime artifact | SHA-256 |
+| --- | --- | --- | --- |
+| `kotoba-whisper-v2.0-faster` | `f44edd35eaeb2274e85ac7b31fb2c6f59ff1c4bc` | `kotoba-whisper-v2.0-faster/model.bin` | `60d2bc2e33de9d43f2745be09caefe1161acab670f6796d4a750d8d848382b36` |
+| `qwen3-4b-instruct-2507` | `cdbee75f17c01a7cc42f958dc650907174af0554` | `qwen3-4b-instruct-2507/Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | `ec3b00d8dc7869381324060020192904a91da71cc6491a6b581c769c1c548824` |
+
+The Qwen artifact is converted with llama.cpp revision
+`2e92ecd0247d25f09797f8fdb044a166522fc05d` and quantized as `Q4_K_M`.
+The Kotoba CTranslate2 repository inherits teacher-model alignment heads that
+refer to nonexistent decoder layers. Its installed `config.json` must replace
+`alignment_heads` with decoder layer `1`, heads `0` through `19`, before the
+model is considered runnable. This correction does not alter `model.bin` or
+its manifest checksum.
+
 ### 6.3 Local Configuration
 
 Non-session preferences are stored at:
@@ -501,8 +516,8 @@ uses `multiprocessing.Queue` and typed Python messages.
 | Language | Python 3.12 |
 | GUI | PySide6 with Qt Widgets |
 | Microphone and loopback | PyAudioWPatch / WASAPI |
-| ASR runtime | faster-whisper with CTranslate2 and CUDA |
-| Discussion runtime | llama-cpp-python with CUDA |
+| ASR runtime | faster-whisper 1.2.1 with CTranslate2 4.7.2 and CUDA 12.8 |
+| Discussion runtime | llama-cpp-python 0.3.35 with CUDA 13.2 |
 | Packaging | Folder-based Windows executable |
 | Dependency management | pip and `requirements.txt` |
 | Formatting | Black and Ruff |
@@ -510,6 +525,21 @@ uses `multiprocessing.Queue` and typed Python messages.
 
 All dependency versions must be pinned before implementation is declared
 complete.
+
+### 15.2 CUDA Runtime Resolution
+
+The designated PC uses two CUDA major versions because the pinned native
+runtimes have different binary requirements:
+
+- CTranslate2 resolves CUDA 12 libraries from `CUDA_PATH_V12_8`, falling back
+  to `CUDA_PATH`. The selected directory must contain `bin/cublas64_12.dll`
+  and `bin/cudart64_12.dll`.
+- `llama-cpp-python` uses its CUDA 13.2 wheel and matching CUDA 13 runtime.
+- On Windows, FlowLens registers the verified CUDA 12 `bin` directory with
+  `os.add_dll_directory` before importing CTranslate2 or faster-whisper. It
+  does not depend on a global `PATH` edit for ASR startup.
+- Native imports and model inference remain local and must not download a
+  runtime, library, or fallback model.
 
 ## 16. Session Lifecycle
 
@@ -529,6 +559,11 @@ IDLE
 
 All required workers, devices, models, and storage must acknowledge readiness
 before `STARTING` can transition to `RECORDING`.
+
+ASR and Discussion receive their start commands while Audio remains ready but
+not capturing. After all workers acknowledge readiness, the controller sends
+Audio its start command and transitions to `RECORDING`. Active duration begins
+at that boundary, so model startup time is excluded from WAV-duration metrics.
 
 Worker readiness has a 60-second timeout. A timeout returns the application to
 preflight with the responsible worker named. It does not start a partial
@@ -586,6 +621,21 @@ condition_on_previous_text: false
 
 The model must not be replaced by `large-v3-turbo`, Qwen3-ASR, another
 Kotoba-Whisper version, or any other ASR model without a specification update.
+
+The CTranslate2 directory is accepted only when every runtime artifact below
+is a nonempty, non-linked local file with the pinned SHA-256:
+
+| File | SHA-256 |
+| --- | --- |
+| `model.bin` | `60d2bc2e33de9d43f2745be09caefe1161acab670f6796d4a750d8d848382b36` |
+| `config.json` | `90c55f775cc4e0bb17293d0bf12f96557a486f20dea886fabd8e6075a3588b21` |
+| `preprocessor_config.json` | `902ea83da8365e6dab586b37f0e8deb8b925d323f726c2e8972c176f5dbfa201` |
+| `tokenizer.json` | `79405583bbc27b16f69416241d4db38983d83dabf4c90811096528bf00f39101` |
+| `vocabulary.json` | `697ee5a65726e46b4d294d1a243d98e1878f5d81caba17891b1c5ebab7a912a9` |
+
+The decoder repeats the complete-file check before constructing
+faster-whisper. Missing tokenizer data must fail locally before the vendor
+runtime can attempt any model-name fallback.
 
 One loaded model instance services two logical stream states. Work is scheduled
 fairly between ME and OTHERS, with the oldest pending audio handled first.
@@ -678,6 +728,9 @@ Runtime format: GGUF Q4_K_M
 Runtime: llama-cpp-python
 Context: 8192 tokens
 GPU layers: all available layers
+Prompt batch: 128 tokens
+Physical batch: 128 tokens
+K/Q/V cache offload: disabled
 Temperature: 0
 Maximum output: 512 tokens
 Thinking mode: not supported by the selected model
@@ -688,6 +741,12 @@ The GGUF must be generated from the pinned official model using a pinned
 manifest.
 
 The model must not be replaced without a specification update.
+
+The smaller prompt batches and host-resident K/Q/V cache preserve enough of the
+designated 8 GB GPU for the fixed CUDA ASR model. Model layers remain fully
+offloaded. If the final Writer queue acknowledgement is lost after Writer has
+durably published a completed result through the shared finalization gate, the
+controller accepts that exact result only while awaiting Writer finalization.
 
 ### 20.2 Triggering
 
@@ -1078,6 +1137,8 @@ FlowLens\
     FlowLens.exe
     runtime\
     licenses\
+        dependency-licenses.json
+        dependencies\
 ```
 
 Models remain in `%LOCALAPPDATA%\FlowLens\models\` and are not duplicated in
@@ -1085,6 +1146,18 @@ the executable directory.
 
 The build must include licenses for the application dependencies, bundled
 fonts, and selected model artifacts.
+
+Every pinned Python distribution in the application dependency closure is
+listed in `dependency-licenses.json` with its exact installed version, copied
+license files, and SHA-256 values. Package audit fails if the Python
+distribution set, version, listed file, or file hash is incomplete.
+
+Python distribution metadata is not evidence for every native component
+bundled inside a wheel. Before the folder package is redistribution-ready, a
+separate inventory must cover bundled native DLL provenance and all required
+notices or source-offer obligations, including the FFmpeg-family components in
+the PyAV wheel. Until that inventory passes, package build and self-check may
+be reported as passing, but Packaging and the MVP remain incomplete.
 
 No installer and no automatic updater are produced for the MVP.
 
