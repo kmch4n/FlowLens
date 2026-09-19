@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -45,6 +46,8 @@ def _positive_number(value: object, name: str, *, allow_zero: bool = False) -> f
     if not isinstance(value, int | float) or isinstance(value, bool):
         raise ValueError(f"{name} must be numeric")
     parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
     if parsed < 0 or (parsed == 0 and not allow_zero):
         raise ValueError(f"{name} must be positive")
     return parsed
