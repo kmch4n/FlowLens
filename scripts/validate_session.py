@@ -516,9 +516,9 @@ def validate_session(
             )
             if (
                 expected_status == "completed"
-                and wav_error > _MAX_COMPLETED_WAV_ERROR_PERCENT
+                and wav_error >= _MAX_COMPLETED_WAV_ERROR_PERCENT
             ):
-                errors.append("WAV duration error exceeds 0.5 percent")
+                errors.append("WAV duration error must be below 0.5 percent")
 
     return SessionValidationResult(
         errors=tuple(errors),

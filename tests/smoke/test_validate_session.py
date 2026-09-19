@@ -691,11 +691,13 @@ def test_validator_rejects_startup_gap_beyond_readiness_timeout(
     assert "session.json active duration does not match event timeline" in result.errors
 
 
-def test_validator_rejects_completed_wav_duration_above_spec_limit(
+@pytest.mark.parametrize("duration_ms", [298_000, 298_500, 301_500])
+def test_validator_rejects_completed_wav_duration_at_or_above_spec_limit(
     tmp_path: Path,
+    duration_ms: int,
 ) -> None:
     session = make_valid_session(tmp_path)
-    _wav(session / "mic.wav", duration_ms=298_000)
+    _wav(session / "mic.wav", duration_ms=duration_ms)
 
     result = validate_session(
         session,
@@ -703,7 +705,7 @@ def test_validator_rejects_completed_wav_duration_above_spec_limit(
         expected_status="completed",
     )
 
-    assert "WAV duration error exceeds 0.5 percent" in result.errors
+    assert "WAV duration error must be below 0.5 percent" in result.errors
 
 
 def test_validator_rejects_pause_event_after_terminal_time(tmp_path: Path) -> None:
