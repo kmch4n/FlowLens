@@ -336,7 +336,9 @@ def run_asr_worker(
         control_in,
         control_out,
         decoder_factory=KotobaWhisperDecoder,
-        speech_detector_factory=WebRtcSpeechDetector,
+        speech_detector_factory=lambda: WebRtcSpeechDetector(
+            min_speech_rms=config.min_speech_rms
+        ),
         monotonic_ms=monotonic_ms,
     )
     if exit_code != 0:

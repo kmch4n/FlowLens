@@ -1,6 +1,7 @@
 """WebRTC speech detection and deterministic utterance boundaries."""
 
 from collections.abc import Callable
+from struct import iter_unpack
 from typing import Literal, Protocol, cast
 
 import webrtcvad  # type: ignore[import-untyped]
@@ -46,10 +47,17 @@ class WebRtcSpeechDetector:
         self,
         mode: int = 2,
         vad_factory: VadFactory = _default_vad_factory,
+        *,
+        min_speech_rms: int = 0,
     ) -> None:
         if not isinstance(mode, int) or isinstance(mode, bool) or mode != 2:
             raise ContractValidationError("mode must be 2")
         self._vad = vad_factory(mode)
+        self._min_speech_rms = require_non_negative_int(
+            min_speech_rms, "min_speech_rms"
+        )
+        if self._min_speech_rms > 2_000:
+            raise ContractValidationError("min_speech_rms must not exceed 2000")
 
     def is_speech(self, frame: AudioFrame) -> bool:
         """Return whether one canonical mono 16 kHz frame contains speech."""
@@ -67,7 +75,10 @@ class WebRtcSpeechDetector:
             or frame.source_end_sample - frame.source_start_sample != FRAME_SAMPLES
         ):
             raise ContractValidationError("frame must be a canonical 640-byte frame")
-        return self._vad.is_speech(frame.pcm_s16le, CANONICAL_RATE_HZ)
+        # Keep VAD history current, even when this frame is below the noise floor.
+        speech = self._vad.is_speech(frame.pcm_s16le, CANONICAL_RATE_HZ)
+        energy = sum(sample[0] ** 2 for sample in iter_unpack("<h", frame.pcm_s16le))
+        return speech and energy >= self._min_speech_rms**2 * FRAME_SAMPLES
 
 
 class UtteranceBoundaryTracker:

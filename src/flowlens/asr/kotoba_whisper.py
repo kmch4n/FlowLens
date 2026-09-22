@@ -80,6 +80,32 @@ def _normalized_text(value: object) -> str | None:
     return value if value.strip() else None
 
 
+def _reliable_segment(segment: object) -> bool:
+    """Reject unreliable or malformed scores without filtering actual words."""
+
+    missing = object()
+    for name, lower, upper, exclusive_upper in (
+        ("no_speech_prob", 0.0, 0.6, True),
+        ("avg_logprob", -1.0, 0.0, False),
+        ("compression_ratio", 0.0, 2.4, False),
+    ):
+        value = getattr(segment, name, missing)
+        # Minimal decoder integrations may not expose confidence metadata.
+        if value is missing:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return False
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            return False
+        if not math.isfinite(number) or number < lower or number > upper:
+            return False
+        if exclusive_upper and number == upper:
+            return False
+    return True
+
+
 def _timestamp_ms(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -149,7 +175,8 @@ class KotobaWhisperDecoder:
         )
         tokens: list[DecodedToken] = []
         for segment in segments:
-            self._append_segment_tokens(tokens, segment)
+            if _reliable_segment(segment):
+                self._append_segment_tokens(tokens, segment)
         return DecodeHypothesis(tuple(tokens))
 
     @staticmethod

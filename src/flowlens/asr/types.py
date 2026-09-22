@@ -179,8 +179,18 @@ class AsrWorkerConfig:
     allow_nonzero_initial_sample: bool = False
     initial_transcript_sequence: int = 1
     start_paused: bool = False
+    min_speech_rms: int = 200
+    min_speech_ms: int = 160
 
     def __post_init__(self) -> None:
+        rms = require_non_negative_int(self.min_speech_rms, "min_speech_rms")
+        if rms > 2_000:
+            raise ContractValidationError("min_speech_rms must not exceed 2000")
+        speech_ms = _require_positive_int(self.min_speech_ms, "min_speech_ms")
+        if speech_ms > 1_000 or speech_ms % 20 != 0:
+            raise ContractValidationError(
+                "min_speech_ms must be frame aligned and between 20 and 1000"
+            )
         if type(self.allow_nonzero_initial_sample) is not bool:
             raise ContractValidationError(
                 "allow_nonzero_initial_sample must be a boolean"

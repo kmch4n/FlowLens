@@ -260,7 +260,7 @@ class AsrEngine:
                 self._release_ready(committed)
 
     def _periodic_decode_due(self, state: _SourceState, now_ms: int) -> bool:
-        if not state.utterance:
+        if not self._has_sufficient_speech(state):
             return False
         cadence_start = (
             state.utterance[0][0].captured_monotonic_ms
@@ -268,6 +268,12 @@ class AsrEngine:
             else state.last_decode_monotonic_ms
         )
         return now_ms - cadence_start >= self._config.partial_interval_ms
+
+    def _has_sufficient_speech(self, state: _SourceState) -> bool:
+        return (
+            sum(speech for _frame, speech in state.utterance) * FRAME_DURATION_MS
+            >= self._config.min_speech_ms
+        )
 
     def _active_source_key(self, source: AudioSource) -> tuple[int, int]:
         state = self._states[source]
@@ -292,7 +298,7 @@ class AsrEngine:
         boundary_ms: int | None = None,
     ) -> DecodeHypothesis:
         state = self._states[source]
-        if not state.utterance:
+        if not self._has_sufficient_speech(state):
             return DecodeHypothesis(())
         decoded = (
             self._decoder.decode(
@@ -434,6 +440,9 @@ class AsrEngine:
         partials: list[PartialTranscript],
     ) -> None:
         state = self._states[source]
+        if not self._has_sufficient_speech(state):
+            self._final_decode_and_reset(source, now_ms, partials)
+            return
         decoded = self._decoder.decode(
             b"".join(item[0].pcm_s16le for item in state.utterance)
         )

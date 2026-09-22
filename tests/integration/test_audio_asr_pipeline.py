@@ -160,7 +160,9 @@ class HardwareFreePipeline:
         )
         self._engine = AsrEngine(
             AsrWorkerConfig(
-                session_id=_SESSION_ID, model_path=Path("C:/models/kotoba")
+                session_id=_SESSION_ID,
+                model_path=Path("C:/models/kotoba"),
+                min_speech_ms=20,
             ),
             decoder,
             _AlwaysSpeechDetector(),

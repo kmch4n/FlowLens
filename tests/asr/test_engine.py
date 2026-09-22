@@ -100,6 +100,7 @@ def make_engine(
         config=AsrWorkerConfig(
             session_id="01J00000000000000000000000",
             model_path=Path("C:/models/kotoba"),
+            min_speech_ms=20,  # Scheduling fixtures deliberately use single frames.
         ),
         decoder=decoder,
         speech_detector=PatternSpeechDetector(speech),
@@ -464,6 +465,7 @@ def test_default_wall_clock_produces_valid_millisecond_commit_time() -> None:
         config=AsrWorkerConfig(
             session_id="01J00000000000000000000000",
             model_path=Path("C:/models/kotoba"),
+            min_speech_ms=20,
         ),
         decoder=RecordingDecoder((hypothesis("内容"),)),
         speech_detector=PatternSpeechDetector(True),
