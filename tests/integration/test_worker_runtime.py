@@ -121,9 +121,9 @@ class FakeQueue:
     fail_get: bool = False
     fail_put: bool = False
     fail_close: bool = False
-    fail_join: bool = False
+    fail_cancel: bool = False
     closed: bool = False
-    joined: bool = False
+    join_cancelled: bool = False
     get_nowait_calls: int = 0
 
     def put(
@@ -152,10 +152,10 @@ class FakeQueue:
             raise OSError("cannot close queue")
         self.closed = True
 
-    def join_thread(self) -> None:
-        if self.fail_join:
-            raise OSError("cannot join queue thread")
-        self.joined = True
+    def cancel_join_thread(self) -> None:
+        if self.fail_cancel:
+            raise OSError("cannot cancel queue join")
+        self.join_cancelled = True
 
 
 class FakeEvent:
@@ -906,7 +906,7 @@ def test_restart_start_failure_cleans_unstarted_handles_and_allows_new_session(
     assert fresh_process.join_calls == []
     assert context.unstarted_lifecycle_calls == []
     assert fresh_queue.closed is True
-    assert fresh_queue.joined is True
+    assert fresh_queue.join_cancelled is True
     assert old_process.closed is True
     assert old_queue.closed is True
     assert any(
@@ -1036,7 +1036,9 @@ def test_shutdown_sends_typed_controls_joins_bounded_and_never_completes() -> No
         if worker is not ProcessSource.WRITER
     )
     assert all(process.closed is True for process in runtime.processes.values())
-    assert all(queue.closed and queue.joined for queue in runtime.context.queues)
+    assert all(
+        queue.closed and queue.join_cancelled for queue in runtime.context.queues
+    )
 
 
 def test_normal_shutdown_does_not_inject_a_duplicate_audio_fence() -> None:
@@ -1091,7 +1093,7 @@ def test_runtime_recreates_queues_events_and_processes_after_shutdown() -> None:
     second_report = runtime.shutdown()
 
     assert first_report is not second_report
-    assert all(queue.closed and queue.joined for queue in first_queues)
+    assert all(queue.closed and queue.join_cancelled for queue in first_queues)
     assert not any(process in runtime.processes.values() for process in first_processes)
     assert runtime.writer_finalization_gate is not first_gate
 
@@ -1109,7 +1111,7 @@ def test_runtime_allows_retry_after_partial_start_failure() -> None:
     runtime.start_all(make_launch("02J00000000000000000000000"))
 
     assert len(runtime.processes) == 4
-    assert all(queue.closed and queue.joined for queue in failed_queues)
+    assert all(queue.closed and queue.join_cancelled for queue in failed_queues)
 
 
 def test_shutdown_reports_a_process_that_survives_termination_without_closing_it() -> (

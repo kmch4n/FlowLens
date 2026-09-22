@@ -1,6 +1,7 @@
 """Pure preflight evaluation with exact user-facing blockers."""
 
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from flowlens.controller.models import (
@@ -16,6 +17,46 @@ from flowlens.domain.enums import AudioSource
 
 REQUIRED_FREE_BYTES = 500 * 1024 * 1024
 _MODEL_ORDER = ("asr", "discussion")
+
+
+def reselect_preflight(
+    report: PreflightReport, selection: PreflightSelection
+) -> PreflightReport:
+    """Preview a choice without repeating I/O; start still requires full checks."""
+    microphone_id = next(
+        (item.id for item in report.microphones if item.id == selection.microphone_id),
+        None,
+    )
+    output_id = next(
+        (
+            item.id
+            for item in report.loopbacks
+            if item.id == selection.loopback_output_id and item.loopback_capable
+        ),
+        None,
+    )
+    issues: list[BlockingIssue] = []
+    if microphone_id is None:
+        issues.append(BlockingIssue("microphone", "Select an available microphone."))
+    if output_id is None:
+        issues.append(
+            BlockingIssue(
+                "loopback", "Select a loopback-capable Windows output device."
+            )
+        )
+    issues.extend(
+        item
+        for item in report.issues
+        if item.control_id not in {"microphone", "loopback"}
+    )
+    return replace(
+        report,
+        selection=PreflightSelection(selection.mode, microphone_id, output_id),
+        issues=tuple(issues),
+        can_start=not issues,
+        mic_level=0.0,
+        loopback_level=0.0,
+    )
 
 
 class PreflightService:

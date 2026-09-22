@@ -861,7 +861,10 @@ class MultiprocessingWorkerRuntime:
             if queue_value is None or id(queue_value) in seen:
                 continue
             seen.add(id(queue_value))
-            for operation_name in ("close", "join_thread"):
+            # Consumers have stopped or this failed launch is being abandoned.
+            # Waiting for a feeder can deadlock when nobody can drain its pipe.
+            # Durable completion is verified separately by Writer's result gate.
+            for operation_name in ("cancel_join_thread", "close"):
                 operation = getattr(queue_value, operation_name, None)
                 if not callable(operation):
                     continue

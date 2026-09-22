@@ -16,6 +16,7 @@ from flowlens.controller.models import (
     PreflightSelection,
 )
 from flowlens.controller.ports import AccessibilityAnnouncer, Clock, WorkerRuntime
+from flowlens.controller.preflight import reselect_preflight
 from flowlens.controller.routing import (
     SequenceTracker,
     rewrap_for_gui,
@@ -227,6 +228,7 @@ class SessionController:
         self._event_sequence = 0
         self._terminal_event_consumed = False
         self._analysis_paused_for_lag = False
+        self._asr_generation_maximum_ms = 0
         self._analysis_disabled = False
         self._announced: set[tuple[str, str]] = set()
         self._protocol_event_in_progress = False
@@ -280,6 +282,26 @@ class SessionController:
             issue=report.issues[0].message if report.issues else None,
             microphone_level=report.mic_level,
             loopback_level=report.loopback_level,
+        )
+        return report
+
+    def update_preflight_selection(
+        self, selection: PreflightSelection
+    ) -> PreflightReport:
+        """Update a preview immediately without accessing devices or model files."""
+        self._require_state("PREFLIGHT", {SessionState.PREFLIGHT})
+        if not isinstance(selection, PreflightSelection):
+            raise TypeError("selection must be a PreflightSelection")
+        previous = self._snapshot.preflight
+        if previous is None:
+            raise InvalidTransition("Preflight inspection has not completed")
+        report = reselect_preflight(previous, selection)
+        self._snapshot = replace(
+            self._snapshot,
+            preflight=report,
+            issue=report.issues[0].message if report.issues else None,
+            microphone_level=0.0,
+            loopback_level=0.0,
         )
         return report
 
@@ -348,6 +370,7 @@ class SessionController:
         self._source_transition_generation = {source: 0 for source in AudioSource}
         self._finalization = None
         self._restart_pending.clear()
+        self._asr_generation_maximum_ms = 0
         self._pause_started_ms = None
         self._pause_intervals = []
         self._stop_confirmed_ms = None
@@ -361,6 +384,8 @@ class SessionController:
             transcript=(),
             partials=(),
             asr_status="Starting",
+            asr_backlog_ms=0,
+            maximum_asr_backlog_ms=0,
             analysis_status="Starting",
             fatal_error=None,
             completion=None,
@@ -597,10 +622,7 @@ class SessionController:
         backlog = cast(int, payload["backlog_ms"])
         maximum = cast(int, payload["maximum_backlog_ms"])
         analysis_paused = cast(bool, payload["analysis_paused"])
-        if (
-            envelope.source not in self._restart_pending
-            and maximum < self._snapshot.maximum_asr_backlog_ms
-        ):
+        if maximum < self._asr_generation_maximum_ms:
             return False
         if state == "READY":
             return (
@@ -1041,6 +1063,7 @@ class SessionController:
         maximum = cast(int, payload["maximum_backlog_ms"])
         analysis_paused = cast(bool, payload["analysis_paused"])
         was_delayed = self._snapshot.asr_status == "Delayed"
+        self._asr_generation_maximum_ms = maximum
         delayed = state == "DELAYED"
         status_label = state.title()
         self._snapshot = replace(
@@ -1058,7 +1081,8 @@ class SessionController:
             "RUNNING",
             "DELAYED",
         }:
-            self._analysis_paused_for_lag = analysis_paused
+            if state != "READY" or self._state is not SessionState.RECORDING:
+                self._analysis_paused_for_lag = analysis_paused
             if self._state is SessionState.PAUSED:
                 self._snapshot = replace(
                     self._snapshot,
@@ -1210,6 +1234,8 @@ class SessionController:
                 self._safe_stop(f"{worker.value} worker restart failed.")
                 return
             self._restart_pending.add(worker)
+            if worker is ProcessSource.ASR:
+                self._asr_generation_maximum_ms = 0
             if worker is ProcessSource.DISCUSSION:
                 try:
                     self._send(

@@ -18,7 +18,7 @@ This review does not close the outstanding designated-PC acceptance gates.
    nonfinite values before constructing the application. Nine CLI regression
    cases check all three timing options without accessing real devices.
 
-## Independent review findings awaiting approval to fix
+## Independent review findings (fixed in the September 20 follow-up)
 
 1. **P1 — unbounded queue cleanup.** `worker_runtime.py` calls `close()` and
    `join_thread()` without a deadline. After consumers exit, a feeder with pending
@@ -40,7 +40,8 @@ This review does not close the outstanding designated-PC acceptance gates.
    resume command after recovery, including manual-pause interactions.
 
 The reviewer reproduced these with fake controller dependencies or a bounded
-subprocess; no runtime fix from this review has been applied yet.
+subprocess. The initial review left these unmodified; the follow-up below records
+the subsequently authorized fixes.
 
 ## Verification
 
@@ -59,3 +60,48 @@ subprocess; no runtime fix from this review has been applied yet.
 The Qt abort requires further isolation around animation/event cleanup. No
 speculative UI change or claim of all-suite success has been made. At the time
 of the initial review, changes had not been committed or pushed.
+
+## September 20 follow-up
+
+Plan: `docs/superpowers/plans/2026-09-19-runtime-recovery.md`, independently
+reviewed before production edits.
+
+### Implemented
+
+- Queue disposal cancels the exit-time feeder join before closing abandoned
+  queues. Writer's durable-completion gate is unchanged. Cleanup continues after
+  individual cancellation/close failures. A subprocess containing an unconsumed
+  1 MB real Queue now returns and exits normally instead of timing out.
+- ASR status validation tracks a generation-local maximum separately from the
+  session aggregate. Restart accepts the new worker's smaller maximum, while
+  decreasing maxima within one generation remain rejected. New sessions reset
+  both current and aggregate backlog statistics.
+- READY while recording preserves the lag-pause reason until RUNNING sends
+  exactly one Discussion RESUME. Manual pause remains authoritative and disabled
+  analysis is not resumed.
+
+### Fresh evidence
+
+- Before implementation: 4 regression failures and 1 passing manual-pause case.
+  Failures covered maximum rejection, missing resume, stale new-session metrics,
+  and the real Queue subprocess exceeding its 10-second deadline.
+- After implementation: controller/runtime subset, 188 passed; subsequently
+  added cancellation/close error and disabled-analysis coverage.
+- Full offscreen suite: **1680 passed, 2 skipped**, 67.06 seconds.
+- Black: 166 files unchanged. Ruff: passed. `mypy src tests`: 160 files passed.
+
+### Not resolved
+
+- **Qt native abort:** UI-only diagnostic runs and the full suite passed, but
+  the original abort remains unexplained. Independent bounded probes covered
+  200 panels / 8000 renders with interruption, DeferredDelete and GC, plus 35
+  panels / 280 renders with natural animation completion and GC. Both exited
+  normally. No speculative UI fix was applied; this is not a resolved defect.
+- **Additional plan-review finding:** manual pause/resume during ASR restart
+  readiness can diverge from the launch-time `start_paused` value. The controller
+  snapshots this flag in `_restart_launch`, while the READY ASR worker ignores
+  PAUSE/RESUME until WORKER_START. Fixing this new finding awaits user approval.
+
+No playback, physical recording, or model inference was run. Existing physical
+acceptance and packaging gates remain unchanged. Follow-up changes are not yet
+committed or pushed.
