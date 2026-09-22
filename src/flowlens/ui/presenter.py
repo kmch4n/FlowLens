@@ -11,16 +11,18 @@ from PySide6.QtGui import (
     QAccessible,
     QAccessibleAnnouncementEvent,
 )
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from flowlens.adapters.windows_shell import WindowsFolderOpener
 from flowlens.config.model import AppConfig, DevicePreferences
 from flowlens.config.store import ConfigStore
+from flowlens.config.user_settings import SettingsStore, UserSettings
 from flowlens.controller.models import PreflightReport, PreflightSelection
 from flowlens.controller.ports import FolderOpener
 from flowlens.controller.session_controller import ControllerSnapshot, SessionState
 from flowlens.domain.enums import SessionMode
 from flowlens.ui.main_window import MainWindow
+from flowlens.ui.settings_dialog import SettingsDialog
 
 
 class _Controller(Protocol):
@@ -31,6 +33,10 @@ class _Controller(Protocol):
     def enter_preflight(self) -> None: ...
 
     def refresh_preflight(self, selection: PreflightSelection) -> PreflightReport: ...
+
+    def update_preflight_selection(
+        self, selection: PreflightSelection
+    ) -> PreflightReport: ...
 
     def start(self, selection: PreflightSelection) -> None: ...
 
@@ -100,8 +106,11 @@ class QtSessionPresenter:
         *,
         config_store: _ConfigStore | None = None,
         folder_opener: FolderOpener | None = None,
+        settings_store: SettingsStore | None = None,
     ) -> None:
         self.controller = controller
+        self.settings_store = settings_store
+        self.settings_dialog: SettingsDialog | None = None
         self.window = window
         self.announcer = announcer
         self.config_store = (
@@ -122,11 +131,38 @@ class QtSessionPresenter:
         self._completion_path: Path | None = None
 
         self._connect_signals()
+        self.window.settings_action.triggered.connect(self._show_settings)
+        if self.settings_store is not None:
+            try:
+                self._apply_settings(self.settings_store.load())
+            except (OSError, ValueError):
+                self._apply_settings(UserSettings())
         self._restore_preferences()
         self.render_current_snapshot(force=True)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start()
         self.window.destroyed.connect(self._stop_timer)
+
+    def _apply_settings(self, settings: UserSettings) -> None:
+        self.window.setStyleSheet(
+            f"QListView#transcriptList {{ font-size: {settings.text_size}px; }}"
+        )
+
+    def _show_settings(self) -> None:
+        if self.settings_dialog is not None and self.settings_dialog.isVisible():
+            self.settings_dialog.raise_()
+            return
+        store = self.settings_store or SettingsStore(
+            _default_store().path.with_name("settings.json")
+        )
+        try:
+            dialog = SettingsDialog(store, self.window)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self.window, "Settings unavailable", str(error))
+            return
+        dialog.saved.connect(self._apply_settings)
+        self.settings_dialog = dialog
+        dialog.open()
 
     def on_timer(self) -> None:
         """Drain worker-facing updates, tick the controller, then render changes."""
@@ -181,7 +217,7 @@ class QtSessionPresenter:
         self._selection = selection
         if self.controller.snapshot().state is SessionState.PREFLIGHT:
             try:
-                self.controller.refresh_preflight(selection)
+                self.controller.update_preflight_selection(selection)
             except Exception:
                 return
             self.render_current_snapshot()
@@ -203,6 +239,7 @@ class QtSessionPresenter:
 
     def _connect_signals(self) -> None:
         self.window.selection_changed.connect(self.on_selection_changed)
+        self.window.preflight_page.refresh_requested.connect(self._refresh_devices)
         self.window.start_requested.connect(self._start_requested)
         self.window.pause_resume_requested.connect(self._pause_or_resume_requested)
         self.window.stop_requested.connect(self._request_stop)
@@ -253,7 +290,12 @@ class QtSessionPresenter:
         )
         self._selection = sanitized
         if sanitized != selection:
-            self.controller.refresh_preflight(sanitized)
+            self.controller.update_preflight_selection(sanitized)
+
+    def _refresh_devices(self) -> None:
+        if self._controller_state() is SessionState.PREFLIGHT:
+            self._refresh_preflight_with_available_devices(self._selection)
+            self.render_current_snapshot(force=True)
 
     def _render_snapshot(self, snapshot: ControllerSnapshot) -> None:
         self.window.set_preflight_can_start(

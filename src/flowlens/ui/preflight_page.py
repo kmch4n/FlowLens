@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -66,9 +68,11 @@ class PreflightPage(QWidget):
 
     selection_changed = Signal(PreflightSelection)
     start_requested = Signal()
+    refresh_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("preflightSetup")
         self._selection = PreflightSelection(SessionMode.MEETING, None, None)
         self._can_start = False
         self._rendering = False
@@ -85,6 +89,8 @@ class PreflightPage(QWidget):
         self.storage_status = QLabel()
         self.destination_summary = QLabel()
         self.start_button = StatefulButton("Start session")
+        self.refresh_button = StatefulButton("Refresh devices")
+        self.readiness_summary = QLabel("Choose your audio devices to begin.")
 
         self.mode_error = self._stable_error_label()
         self.microphone_error = self._stable_error_label()
@@ -131,6 +137,11 @@ class PreflightPage(QWidget):
                 f"Session destination: {report.destination}"
             )
             self._can_start = report.can_start
+            self.readiness_summary.setText(
+                "Ready to start · checks run again before recording"
+                if report.can_start
+                else "Complete the setup above to start"
+            )
             self.start_button.set_ui_state(
                 "default" if report.can_start else "disabled",
                 "Start session" if report.can_start else "Resolve the listed blockers",
@@ -166,58 +177,135 @@ class PreflightPage(QWidget):
     def _build_layout(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 28, 32, 28)
-        layout.setSpacing(4)
-
-        title = QLabel("Preflight")
-        title.setProperty("flowlensRole", "metric")
+        layout.setSpacing(20)
+        title = QLabel("Set up your session")
+        title.setProperty("flowlensRole", "pageTitle")
         layout.addWidget(title)
-        layout.addWidget(self._separator())
+        introduction = QLabel(
+            "Choose the conversation and audio sources. "
+            "FlowLens keeps everything on this PC."
+        )
+        introduction.setProperty("flowlensTone", "muted")
+        introduction.setWordWrap(True)
+        layout.addWidget(introduction)
 
-        layout.addWidget(QLabel("Session mode"))
+        self.setup_scroll = QScrollArea()
+        self.setup_scroll.setWidgetResizable(True)
+        self.setup_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.setup_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        body = QWidget()
+        columns = QHBoxLayout(body)
+        columns.setContentsMargins(0, 0, 0, 0)
+        columns.setSpacing(24)
+        settings = QFrame()
+        settings.setProperty("flowlensRole", "setupPanel")
+        form = QVBoxLayout(settings)
+        form.setContentsMargins(24, 24, 24, 24)
+        form.setSpacing(12)
+        form.addWidget(self._section_heading("Conversation"))
         mode_layout = QHBoxLayout()
-        mode_layout.setSpacing(12)
+        mode_layout.setSpacing(8)
         for radio in self._mode_radios():
-            mode_layout.addWidget(radio)
-        mode_layout.addStretch(1)
-        layout.addLayout(mode_layout)
-        layout.addWidget(self.mode_error)
+            mode_layout.addWidget(radio, 1)
+        form.addLayout(mode_layout)
+        form.addWidget(self.mode_error)
+        form.addWidget(self._section_heading("Audio sources"))
+        mic_label = QLabel("Your voice · microphone")
+        mic_label.setBuddy(self.microphone_combo)
+        form.addWidget(mic_label)
+        form.addWidget(self.microphone_combo)
+        form.addWidget(self.microphone_error)
+        form.addWidget(self.mic_meter)
+        output_label = QLabel("Other participants · PC audio output")
+        output_label.setBuddy(self.loopback_combo)
+        form.addWidget(output_label)
+        form.addWidget(self.loopback_combo)
+        form.addWidget(self.loopback_error)
+        form.addWidget(self.loopback_meter)
+        hint = QLabel("Choose the output your meeting app uses, including headphones.")
+        hint.setWordWrap(True)
+        hint.setProperty("flowlensRole", "helper")
+        form.addWidget(hint)
+        form.addStretch(1)
 
-        layout.addWidget(self._separator())
-        layout.addWidget(QLabel("Microphone"))
-        layout.addWidget(self.microphone_combo)
-        layout.addWidget(self.microphone_error)
-        layout.addWidget(QLabel("Microphone activity"))
-        layout.addWidget(self.mic_meter)
+        readiness = QFrame()
+        readiness.setProperty("flowlensRole", "setupAside")
+        checks = QVBoxLayout(readiness)
+        checks.setContentsMargins(20, 24, 20, 24)
+        checks.setSpacing(16)
+        checks.addWidget(self._section_heading("On this PC"))
+        for label in (
+            self.model_status,
+            self.model_error,
+            self.storage_status,
+            self.storage_error,
+            self.destination_summary,
+        ):
+            label.setWordWrap(True)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
+            checks.addWidget(label)
+        checks.addStretch(1)
+        privacy = QLabel(
+            "No account. No cloud upload.\nAudio and transcripts stay local."
+        )
+        privacy.setWordWrap(True)
+        privacy.setProperty("flowlensTone", "muted")
+        checks.addWidget(privacy)
+        self.refresh_button.setText("Recheck setup")
+        self.refresh_button.setToolTip(
+            "Rediscover devices and verify model files and storage."
+        )
+        checks.addWidget(self.refresh_button)
+        columns.addWidget(settings, 2)
+        columns.addWidget(readiness, 1)
+        self.setup_scroll.setWidget(body)
+        layout.addWidget(self.setup_scroll, 1)
+        footer = QHBoxLayout()
+        self.readiness_summary.setWordWrap(True)
+        self.readiness_summary.setProperty("flowlensTone", "muted")
+        footer.addWidget(self.readiness_summary, 1)
+        self.start_button.setProperty("actionRole", "primary")
+        self.start_button.setMinimumWidth(180)
+        footer.addWidget(self.start_button)
+        layout.addLayout(footer)
 
-        layout.addWidget(self._separator())
-        layout.addWidget(QLabel("PC audio output"))
-        layout.addWidget(self.loopback_combo)
-        layout.addWidget(self.loopback_error)
-        layout.addWidget(QLabel("PC audio activity"))
-        layout.addWidget(self.loopback_meter)
-
-        layout.addWidget(self._separator())
-        layout.addWidget(QLabel("Local models"))
-        layout.addWidget(self.model_status)
-        layout.addWidget(self.model_error)
-        layout.addWidget(QLabel("Storage"))
-        layout.addWidget(self.storage_status)
-        layout.addWidget(self.storage_error)
-        layout.addWidget(self.destination_summary)
-        layout.addStretch(1)
-        layout.addWidget(self.start_button, alignment=Qt.AlignmentFlag.AlignRight)
+    @staticmethod
+    def _section_heading(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setProperty("flowlensRole", "sectionTitle")
+        return label
 
     def _configure_controls(self) -> None:
         self.setProperty("flowlensRole", "canvas")
+        for meter in (self.mic_meter, self.loopback_meter):
+            meter.setFixedHeight(10)
         self.mic_meter.setAccessibleName("Microphone activity")
         self.loopback_meter.setAccessibleName("PC audio activity")
         self.microphone_combo.setMinimumHeight(44)
         self.loopback_combo.setMinimumHeight(44)
+        self.meeting_radio.setText("Meeting")
+        self.interview_radio.setText("Interview")
+        self.general_radio.setText("General")
+        for combo in (self.microphone_combo, self.loopback_combo):
+            combo.setMinimumWidth(0)
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            combo.setMinimumContentsLength(12)
+            combo.setPlaceholderText("Select a device…")
+            combo.setMaxVisibleItems(10)
         for radio in self._mode_radios():
             radio.setMinimumHeight(44)
             radio.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.microphone_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.loopback_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.microphone_combo.setAccessibleName("Microphone")
+        self.loopback_combo.setAccessibleName("PC audio output")
         self.start_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.meeting_radio.setToolTip("Choose the meeting or discussion mode.")
@@ -253,6 +341,7 @@ class PreflightPage(QWidget):
         self.microphone_combo.currentIndexChanged.connect(self._on_microphone_changed)
         self.loopback_combo.currentIndexChanged.connect(self._on_loopback_changed)
         self.start_button.clicked.connect(self._request_start)
+        self.refresh_button.clicked.connect(self.refresh_requested.emit)
 
     def _render_readiness(self, report: PreflightReport) -> None:
         if all(check.ready for check in report.models):
@@ -286,6 +375,7 @@ class PreflightPage(QWidget):
                 if issue.control_id in control_ids
             )
             label.setText(text)
+            label.setVisible(bool(text))
             label.setAccessibleDescription(text or "No blocking issue")
             label.setProperty("uiState", "error" if text else "default")
 
@@ -303,9 +393,14 @@ class PreflightPage(QWidget):
         devices: tuple[DeviceOption, ...],
         selected_id: str | None,
     ) -> None:
-        combo.clear()
-        for device in devices:
-            combo.addItem(device.display_name, device.id)
+        current = tuple(
+            (combo.itemText(i), combo.itemData(i)) for i in range(combo.count())
+        )
+        desired = tuple((device.display_name, device.id) for device in devices)
+        if current != desired:
+            combo.clear()
+            for device in devices:
+                combo.addItem(device.display_name, device.id)
         selected_index = combo.findData(selected_id, Qt.ItemDataRole.UserRole)
         combo.setCurrentIndex(selected_index if selected_index >= 0 else -1)
 
@@ -356,7 +451,7 @@ class PreflightPage(QWidget):
         label = QLabel()
         label.setMinimumHeight(label.fontMetrics().height())
         label.setProperty("flowlensRole", "helper")
-        label.setWordWrap(False)
+        label.setWordWrap(True)
         return label
 
     @staticmethod

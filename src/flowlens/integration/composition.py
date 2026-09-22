@@ -15,6 +15,7 @@ from flowlens.adapters.storage import LocalStorageReadiness
 from flowlens.adapters.windows_devices import WindowsDeviceCatalog
 from flowlens.asr.types import AsrWorkerConfig
 from flowlens.audio.types import AudioWorkerConfig, CaptureDevice
+from flowlens.config.user_settings import SettingsStore
 from flowlens.controller.preflight import PreflightService
 from flowlens.controller.session_controller import SessionController, SessionLaunch
 from flowlens.discussion.llama_cpp_adapter import DiscussionModelConfig
@@ -196,6 +197,7 @@ def _build_launch(
     asr_entry = _model_entry(models, _ASR_MODEL_ID)
     discussion_entry = _model_entry(models, _DISCUSSION_MODEL_ID)
     initial_state = DiscussionState.initial(report.selection.mode, started_at)
+    settings = SettingsStore(paths.root / "settings.json").load()
     return SessionLaunch(
         session_id=session_id,
         session_dir=session_dir,
@@ -229,6 +231,8 @@ def _build_launch(
         asr_config=AsrWorkerConfig(
             session_id=session_id,
             model_path=asr_path.parent,
+            min_speech_rms=settings.min_speech_rms,
+            silence_end_ms=settings.silence_end_ms,
         ),
         discussion_config=DiscussionWorkerConfig(
             session_id=session_id,

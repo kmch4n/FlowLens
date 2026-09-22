@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 from flowlens.config.store import ConfigStore
+from flowlens.config.user_settings import SettingsStore
 from flowlens.integration.composition import AppOptions, build_application
 from flowlens.offline_imports import import_local_module
 from flowlens.persistence.paths import AppPaths
@@ -230,6 +231,7 @@ def _run_qt(
         window,
         QtAccessibilityAnnouncer(),
         config_store=ConfigStore(paths.config),
+        settings_store=SettingsStore(paths.root / "settings.json"),
         folder_opener=WindowsFolderOpener(),
     )
     cast(Any, window)._flowlens_presenter = presenter

@@ -23,6 +23,7 @@ class TranscriptView(QFrame):
         self.model = TranscriptListModel()
         self.auto_scroll_enabled = True
         self.list_view = QListView()
+        self.list_view.setObjectName("transcriptList")
         self.partial_labels = {
             AudioSource.ME: QLabel(),
             AudioSource.OTHERS: QLabel(),
@@ -101,7 +102,7 @@ class TranscriptView(QFrame):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
         title = QLabel("Transcript")
-        title.setProperty("flowlensRole", "metric")
+        title.setProperty("flowlensRole", "sectionTitle")
         layout.addWidget(title)
         layout.addWidget(self.list_view, 1)
         for label in self.partial_labels.values():

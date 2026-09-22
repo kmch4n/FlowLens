@@ -21,6 +21,7 @@ APPLICATION_DATA = [
         "assets/fonts",
     ),
     (str(ASSETS_ROOT / "styles" / "flowlens.qss"), "assets/styles"),
+    (str(ASSETS_ROOT / "icons" / "chevron-down.svg"), "assets/icons"),
 ]
 
 APPLICATION_HIDDEN_IMPORTS = [

@@ -41,6 +41,33 @@ def ready_report() -> PreflightReport:
     )
 
 
+def test_selection_render_does_not_rebuild_device_model(qtbot: QtBot) -> None:
+    page = PreflightPage()
+    qtbot.addWidget(page)
+    report = ready_report()
+    page.render(report)
+    removed: list[object] = []
+    page.microphone_combo.model().rowsRemoved.connect(
+        lambda *args: removed.append(args)
+    )
+    page.render(report)
+    assert removed == []
+
+
+def test_minimum_setup_size_keeps_action_visible_and_errors_scrollable(
+    qtbot: QtBot,
+) -> None:
+    page = PreflightPage()
+    qtbot.addWidget(page)
+    page.render(report_with_issue("asr_model", "Missing model. " * 30))
+    page.resize(900, 600)
+    page.show()
+    assert page.width() == 900
+    assert page.start_button.isVisibleTo(page)
+    assert page.setup_scroll.horizontalScrollBar().maximum() == 0
+    assert page.setup_scroll.verticalScrollBar().maximum() > 0
+
+
 def report_with_issue(control_id: str, message: str) -> PreflightReport:
     """Return the startable fixture with one exact blocking issue."""
 

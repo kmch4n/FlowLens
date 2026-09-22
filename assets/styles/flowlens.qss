@@ -1,6 +1,82 @@
 /* Hallmark · genre: atmospheric · macrostructure: Workbench · theme: Midnight · tone: technical-austere · enrichment: none */
 /* Hallmark · pre-emit critique: P5 H5 E4 S5 R5 V4 */
 /* motion-duration: {motion_duration} */
+/* Setup surface: native desktop controls, clear hierarchy and local readiness. */
+QLabel[flowlensRole="pageTitle"] {{
+    font-size: 28px;
+    font-weight: 600;
+}}
+QLabel[flowlensRole="sectionTitle"] {{
+    font-size: 18px;
+    font-weight: 600;
+}}
+QFrame[flowlensRole="setupPanel"] {{
+    background-color: {surface};
+    border: 1px solid {rule};
+    border-radius: 10px;
+}}
+QFrame[flowlensRole="setupAside"] {{
+    background-color: {background};
+    border-left: 1px solid {rule};
+}}
+QWidget#preflightSetup QComboBox {{
+    padding: 8px 16px;
+    border: 1px solid {rule};
+    border-radius: 6px;
+    background-color: {elevated_surface};
+    color: {primary_text};
+}}
+QWidget#preflightSetup QComboBox:hover, QWidget#preflightSetup QComboBox:focus {{
+    border-color: {focus};
+}}
+QWidget#preflightSetup QComboBox::drop-down {{
+    width: 32px;
+    border: none;
+}}
+QWidget#preflightSetup QComboBox::down-arrow {{
+    image: url("{chevron_icon}");
+    width: 16px;
+    height: 16px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {elevated_surface};
+    color: {primary_text};
+    selection-background-color: {rule};
+    selection-color: {primary_text};
+    border: 1px solid {focus};
+    outline: none;
+    padding: 4px;
+}}
+QComboBox QAbstractItemView::item {{
+    min-height: 36px;
+    padding: 4px 12px;
+}}
+QWidget#preflightSetup QRadioButton {{
+    background-color: {surface};
+    border: 1px solid {rule};
+    border-radius: 6px;
+    padding: 4px 8px;
+    spacing: 8px;
+}}
+QWidget#preflightSetup QRadioButton:checked {{
+    border-color: {accent};
+    background-color: {elevated_surface};
+}}
+QWidget#preflightSetup QRadioButton:focus, QWidget#preflightSetup QRadioButton:hover {{
+    border-color: {focus};
+}}
+QScrollBar:vertical {{
+    background-color: {background};
+    width: 10px;
+}}
+QScrollBar::handle:vertical {{
+    background-color: {rule};
+    min-height: 24px;
+    border-radius: 4px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+}}
 QWidget {{
     background-color: {background};
     color: {primary_text};
@@ -53,14 +129,56 @@ QLabel[uiState="success"] {{
 
 QPushButton[flowlensRole="stateful"] {{
     min-width: 44px;
-    min-height: 44px;
-    padding: 8px 16px;
+    min-height: 36px;
+    padding: 4px 16px;
     color: {primary_text};
     background-color: {surface};
-    border: 2px solid {rule};
+    border: 1px solid {rule};
     border-radius: 6px;
     font-family: "{font_interface}";
     font-weight: 600;
+}}
+
+QListView#transcriptList {{
+    border: none;
+    background-color: {elevated_surface};
+    outline: none;
+}}
+QListView#transcriptList::item {{
+    padding: 8px 12px;
+    border-bottom: 1px solid {rule};
+}}
+QListView#transcriptList::item:selected {{
+    background-color: {rule};
+    color: {primary_text};
+}}
+QFrame[flowlensRole="separator"] {{
+    color: {rule};
+    background-color: {rule};
+    border: none;
+    max-height: 1px;
+}}
+QMenuBar {{
+    background-color: {surface};
+    color: {muted_text};
+    padding: 4px 12px;
+}}
+QMenuBar::item:selected {{
+    background-color: {rule};
+    color: {primary_text};
+}}
+QDialog QComboBox, QDialog QSpinBox {{
+    background-color: {elevated_surface};
+    color: {primary_text};
+    border: 1px solid {rule};
+    border-radius: 6px;
+    padding: 4px 8px;
+}}
+QDialog QPushButton {{
+    padding: 8px 16px;
+    border: 1px solid {rule};
+    border-radius: 6px;
+    background-color: {elevated_surface};
 }}
 
 QPushButton[flowlensRole="stateful"]:hover {{
@@ -108,6 +226,21 @@ QProgressBar[flowlensRole="inputMeter"] {{
     border-radius: 6px;
 }}
 
+QPushButton[flowlensRole="stateful"][actionRole="primary"] {{
+    background-color: {accent};
+    color: {background};
+    border-color: {accent};
+}}
+QPushButton[flowlensRole="stateful"][actionRole="primary"]:hover,
+QPushButton[flowlensRole="stateful"][actionRole="primary"]:focus {{
+    border-color: {focus};
+}}
+QPushButton[flowlensRole="stateful"][actionRole="primary"]:disabled {{
+    background-color: {surface};
+    color: {muted_text};
+    border-color: {rule};
+}}
+
 QLineEdit[flowlensRole="inputMeter"]:focus {{
     border-color: {focus};
 }}
@@ -116,4 +249,16 @@ QProgressBar[flowlensRole="inputMeter"]::chunk {{
     background-color: {accent};
     border-radius: 4px;
     margin: 2px 0;
+}}
+
+QWidget#preflightSetup QProgressBar[flowlensRole="inputMeter"] {{
+    min-height: 8px;
+    max-height: 8px;
+    border: 1px solid {rule};
+    border-radius: 4px;
+}}
+QWidget#preflightSetup QProgressBar[flowlensRole="inputMeter"]::chunk {{
+    background-color: {success};
+    margin: 0px;
+    border-radius: 3px;
 }}

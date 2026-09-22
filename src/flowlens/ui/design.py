@@ -22,6 +22,7 @@ _EXPECTED_PLACEHOLDERS = {
     "font_interface",
     "font_mono",
     "motion_duration",
+    "chevron_icon",
 }
 
 
@@ -131,6 +132,7 @@ def build_stylesheet(
         "font_interface": tokens.font_interface,
         "font_mono": tokens.font_mono,
         "motion_duration": "0ms" if reduced_motion else "120ms",
+        "chevron_icon": (root / "icons" / "chevron-down.svg").as_posix(),
     }
     return template.format(**values)
 

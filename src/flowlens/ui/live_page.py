@@ -157,14 +157,14 @@ class LivePage(QWidget):
         return frame
 
     def _configure(self) -> None:
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(900, 540)
         self.setProperty("flowlensRole", "canvas")
-        self.product_label.setProperty("flowlensRole", "metric")
+        self.product_label.setProperty("flowlensRole", "sectionTitle")
         self.elapsed_timer.setProperty("flowlensRole", "timer")
         self.banner.setMinimumHeight(28)
         self.banner.setWordWrap(False)
         self.banner.setProperty("flowlensRole", "helper")
-        self.stop_button.set_ui_state("error", "Stop and finalize the session")
+        self.stop_button.set_ui_state("default", "Stop and finalize the session")
         self.always_on_top_toggle.setMinimumSize(44, 44)
         self.always_on_top_toggle.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.narrow_scroll_area.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -198,6 +198,7 @@ class LivePage(QWidget):
             )
         )
         self.banner.setText(text)
+        self.banner.setVisible(bool(text))
         self.banner.setAccessibleDescription(text or "No current live-session issue")
         self.banner.setProperty("uiState", "error" if text else "default")
 

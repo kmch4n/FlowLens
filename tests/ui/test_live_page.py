@@ -230,7 +230,7 @@ def test_live_page_renders_top_bar_banner_and_signals(qtbot: QtBot) -> None:
     assert page.banner.minimumHeight() > 0
     assert page.banner.text() == "ASR delay is high. Wait for processing."
     assert page.pause_resume_button.text() == "Pause"
-    assert page.stop_button.property("uiState") == "error"
+    assert page.stop_button.property("uiState") == "default"
 
     with qtbot.waitSignal(page.pause_requested, timeout=500):
         page.pause_resume_button.click()

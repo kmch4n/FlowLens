@@ -257,6 +257,23 @@ Start is blocked when:
 The UI must state the specific blocking reason next to the affected control.
 The storage check requires at least 500 MB of available space before start.
 
+### 9.1 Setup interaction revision (2026-09-22)
+
+Selection changes must update immediately from the last complete readiness
+report without rediscovering devices, hashing model files, reading audio levels,
+or probing storage on the UI thread. Preserve all model/storage blockers and
+normalize unavailable IDs to an unselected control. Reset stale meter readings.
+Initial inspection, `Recheck setup`, and actual session start perform the full
+checks; selection preview alone must never authorize capture. Recheck setup
+currently runs synchronously and may take time while model checksums are read.
+
+Keep dropdown contents stable when devices have not changed. Render native
+dropdowns and their popups consistently, with a visible disclosure arrow and
+keyboard focus. The setup screen uses a settings column and a local-readiness
+column, with a persistent start footer and a vertically scrollable body at the
+900 x 600 minimum. Errors wrap next to the affected control; empty errors do not
+reserve blank rows. Meter tracks are compact non-interactive indicators.
+
 ## 10. Live Screen
 
 ### 10.1 Layout
@@ -346,6 +363,13 @@ The approved Hallmark direction is:
 - Macrostructure: Workbench.
 - Tone: Technical, austere, and distraction-free.
 - Enrichment: None.
+
+The September 22 setup redesign uses the user-approved frontend-design method
+while retaining the existing color and bundled font tokens. Setup headings use
+28 px interface type, section headings 18 px, and controls 14 px. The primary
+action and selected mode use the amber accent; technical labels do not replace
+plain-language setup instructions. The live and completion screens retain their
+existing structure.
 
 ### 11.1 Visual Rules
 
@@ -1203,3 +1227,21 @@ The following decisions were explicitly approved during product design:
 - Worker-process architecture is approved.
 - Model selection is delegated and fixed by documented research.
 - Model comparison benchmarks are removed from the MVP plan.
+
+## 33. Recognition and Readability Settings
+
+The Settings menu (Ctrl+comma) exposes speech sensitivity (low / standard / high),
+end-of-speech silence (300-1200 ms, default 600 ms), and transcript font size
+(14-22 px, default 16 px). Recognition changes apply at the next session start;
+font size changes immediately. Settings are stored locally in `settings.json`
+beside `config.json`, using atomic replacement. Cancel discards edits.
+
+Sensitivity maps to canonical int16 PCM RMS floors of 400 / 200 / 80 for both
+sources. At least 160 ms of VAD-positive speech is required before decoding.
+Decoder confidence gates reject unreliable segments without blacklisting words
+or suppressing legitimate repetitions. See
+[implementation and verification notes](verification/live-settings-2026-09-22.md).
+
+The live surface uses compact native controls and sans-serif section headings.
+Stop and manual pause are not errors. Windows retains native caption controls,
+with best-effort DWM dark caption support rather than a frameless replacement.

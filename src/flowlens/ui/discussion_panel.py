@@ -122,12 +122,12 @@ class DiscussionPanel(QFrame):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
         heading = QLabel("Discussion state")
-        heading.setProperty("flowlensRole", "metric")
+        heading.setProperty("flowlensRole", "sectionTitle")
         layout.addWidget(heading)
         for _ in range(4):
             layout.addWidget(self._separator())
             title = QLabel()
-            title.setProperty("flowlensRole", "metric")
+            title.setProperty("flowlensRole", "sectionTitle")
             body = QLabel()
             body.setWordWrap(True)
             body.setProperty("flowlensTone", "muted")
@@ -170,6 +170,7 @@ class DiscussionPanel(QFrame):
     @staticmethod
     def _separator() -> QFrame:
         separator = QFrame()
+        separator.setProperty("flowlensRole", "separator")
         separator.setFrameShape(QFrame.Shape.HLine)
         separator.setFrameShadow(QFrame.Shadow.Plain)
         return separator

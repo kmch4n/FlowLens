@@ -140,6 +140,12 @@ class RecordingController:
         self.selection = selection
         self.state = SessionState.RECORDING
 
+    def update_preflight_selection(
+        self, selection: PreflightSelection
+    ) -> PreflightReport:
+        self.selection = selection
+        return ready_report(selection, can_start=self.can_start)
+
     def pause(self) -> None:
         if self.state is SessionState.RECORDING:
             self.state = SessionState.PAUSED

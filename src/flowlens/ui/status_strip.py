@@ -48,7 +48,11 @@ class StatusStrip(QFrame):
         self.asr_status.set_status(
             asr_state, f"{snapshot.asr} · {snapshot.delay_ms} ms"
         )
-        analysis_state = "error" if "paused" in snapshot.analysis.lower() else "success"
+        analysis_state = (
+            "error"
+            if snapshot.analysis.lower() in {"unavailable", "failed", "error"}
+            else "default" if "paused" in snapshot.analysis.lower() else "success"
+        )
         self.analysis_status.set_status(analysis_state, snapshot.analysis)
         save_state = "default" if snapshot.saved == "Not saved yet" else "success"
         self.save_status.set_status(save_state, snapshot.saved)

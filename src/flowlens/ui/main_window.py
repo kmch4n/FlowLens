@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QKeyEvent
+from PySide6.QtGui import QCloseEvent, QKeyEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -23,6 +23,7 @@ from flowlens.ui.completion_page import CompletionPage
 from flowlens.ui.dialogs import SlowFinalizationDialog, StopConfirmationDialog
 from flowlens.ui.live_page import LivePage
 from flowlens.ui.preflight_page import PreflightPage
+from flowlens.ui.window_theme import apply_dark_caption
 
 
 def clamp_geometry(
@@ -235,11 +236,19 @@ class MainWindow(QMainWindow):
 
     def _build(self) -> None:
         self.setWindowTitle("FlowLens")
+        self.settings_action = self.menuBar().addAction("Settings…")
+        self.settings_action.setShortcut("Ctrl+,")
         self.setCentralWidget(self.stack)
         self.stack.addWidget(self.preflight_page)
         self.stack.addWidget(self.live_page)
         self.stack.addWidget(self.completion_page)
         self.show_preflight()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Refresh the native caption after initial show or flag changes."""
+        super().showEvent(event)
+        if QApplication.platformName() != "offscreen":
+            apply_dark_caption(int(self.winId()))
 
     def _connect_static_signals(self) -> None:
         self.preflight_page.selection_changed.connect(self.selection_changed.emit)

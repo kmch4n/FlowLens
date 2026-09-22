@@ -109,6 +109,12 @@ class ConfigurableController:
         self.selection = selection
         self.state = SessionState.RECORDING
 
+    def update_preflight_selection(
+        self, selection: PreflightSelection
+    ) -> PreflightReport:
+        self.selection = selection
+        return self._report(selection)
+
     def pause(self) -> None:
         self.state = SessionState.PAUSED
 
