@@ -1245,3 +1245,47 @@ or suppressing legitimate repetitions. See
 The live surface uses compact native controls and sans-serif section headings.
 Stop and manual pause are not errors. Windows retains native caption controls,
 with best-effort DWM dark caption support rather than a frameless replacement.
+
+## 34. Startup and Single-instance Behavior
+
+Show the application shell before recovery, device discovery and full model
+integrity checks. Run those operations off the GUI thread; keep session controls
+disabled until they complete. Do not skip integrity checks to improve startup.
+Reuse the prepared preflight report when attaching the presenter.
+
+Initially select Meeting / discussion. Restore the saved mode when preferences
+exist, including while setup checks are still running.
+
+Acquire a per-user application-data-directory lock before recovery. Only the
+owner may inspect/recover sessions or initialize the controller. A second launch
+notifies the first window and exits. Use a local activation endpoint, not TCP.
+Keep the lock throughout startup and the application lifetime. Dead-process lock
+recovery is automatic on the designated Windows PC; do not expire a live lock
+based on elapsed time. Package self-checks and worker subprocesses do not acquire
+the UI instance lock.
+
+Closing while startup I/O is running keeps the window and activation endpoint
+alive with a visible shutdown-wait message. Controls remain disabled. Once the
+startup thread finishes, the window closes without attaching a presenter.
+
+## 35. Conversation Readability and Recognition Quality
+
+The desktop keeps the existing midnight palette and bundled IBM Plex Sans JP.
+Conversation rows separate source labels from the speech body, wrap to the
+available column width and preserve keyboard focus and accessible model text.
+Normal footer states remain visually quiet; failures retain explicit error text.
+Discussion section labels are subordinate to their content. Native Windows
+caption controls remain intact.
+
+Partial decoding uses beam 1; end-of-speech decoding uses beam 5. Already
+committed prefixes stay immutable;
+the higher-quality final pass does not rewrite them. Hard splits retain the
+existing low-latency boundary algorithm. No transcript text is invented by an
+LLM cleanup step and no cloud processing is introduced.
+
+Invalid recognition settings fall back to defaults without changing the file.
+The Settings action indicates that attention is needed. Saving replacement
+settings preserves corrupt bytes in a unique adjacent `.bak` file first.
+
+See [quality evidence](verification/quality-2026-10-03.md) for public-data
+measurements and their limitations.

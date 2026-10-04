@@ -40,6 +40,12 @@ Independent review found a corrupt-settings recovery gap: invalid settings can
 leave preflight Ready but prevent Start. The original file is not overwritten.
 Recovery behavior is awaiting approval; this is not a completed acceptance item.
 
+Follow-up on 2026-10-04: invalid settings now load defaults with a visible
+warning. The original bytes remain unchanged until an explicit Save, which
+creates a unique adjacent `.bak` before replacement. The focused corrupt-file
+recovery test is included in the current regression suite; see
+[quality evidence](quality-2026-10-03.md).
+
 ## References
 
 - [Microsoft DWM window attributes](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute)
