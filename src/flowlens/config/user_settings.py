@@ -5,6 +5,7 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from uuid import uuid4
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,9 +56,29 @@ class SettingsStore:
             value["sensitivity"], value["silence_end_ms"], value["text_size"]
         )
 
+    def load_for_use(self) -> tuple[UserSettings, str | None]:
+        """Use defaults on read failure without changing the original file."""
+        try:
+            return self.load(), None
+        except (OSError, ValueError, RecursionError):
+            return UserSettings(), (
+                "Saved settings could not be read. Defaults are in use. "
+                "Saving will preserve the original in a backup file."
+            )
+
     def save(self, settings: UserSettings) -> None:
         """Replace the settings file only after its new contents are flushed."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                self.load()
+            except (ValueError, RecursionError):
+                original = self.path.read_bytes()
+                backup = self.path.with_name(f"{self.path.name}.{uuid4().hex}.bak")
+                with backup.open("xb") as output:
+                    output.write(original)
+                    output.flush()
+                    os.fsync(output.fileno())
         descriptor, name = tempfile.mkstemp(
             prefix="settings-", suffix=".tmp", dir=self.path.parent
         )

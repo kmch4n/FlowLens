@@ -297,7 +297,7 @@ def test_qt_resource_failure_returns_nonzero_before_building_a_window(
     assert app._run_qt(fake_paths(tmp_path), AppOptions()) == 1
 
 
-def test_qt_launch_recovers_incomplete_sessions_before_acquiring_ui(
+def test_qt_launch_does_not_recover_sessions_before_acquiring_ui(
     monkeypatch: MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -321,7 +321,7 @@ def test_qt_launch_recovers_incomplete_sessions_before_acquiring_ui(
 
     with pytest.raises(AssertionError, match="ui boundary"):
         app._run_qt(paths, AppOptions())
-    assert calls == [paths]
+    assert calls == []
 
 
 def test_acceptance_report_serializes_only_local_safe_final_measurements(

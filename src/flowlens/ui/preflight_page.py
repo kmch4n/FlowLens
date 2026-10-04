@@ -102,6 +102,13 @@ class PreflightPage(QWidget):
         self._configure_controls()
         self._connect_signals()
 
+    def set_session_mode(self, mode: SessionMode) -> None:
+        """Show the default or restored mode before readiness checks complete."""
+        self._selection = PreflightSelection(
+            mode, self._selection.microphone_id, self._selection.loopback_output_id
+        )
+        self._set_mode(mode)
+
     def render(self, report: PreflightReport) -> None:  # type: ignore[override]
         """Render one complete immutable preflight report without emitting changes."""
 

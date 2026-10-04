@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QKeyEvent, QShowEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -78,6 +78,8 @@ class MainWindow(QMainWindow):
         self._active_close_requires_stop = False
         self._always_on_top = False
         self._event_filter_installed = False
+        self._startup_busy = False
+        self.startup_close_pending = False
 
         self._build()
         self._connect_static_signals()
@@ -223,9 +225,22 @@ class MainWindow(QMainWindow):
             return
         super().keyPressEvent(event)
 
+    def set_startup_busy(self, busy: bool) -> None:
+        """Keep the event loop alive until exclusive startup I/O completes."""
+        self._startup_busy = busy
+        if not busy and self.startup_close_pending:
+            QTimer.singleShot(0, self.close)
+
     def closeEvent(self, event: QCloseEvent) -> None:
         """Keep active sessions open and emit an orderly-close signal otherwise."""
 
+        if self._startup_busy:
+            event.ignore()
+            self.startup_close_pending = True
+            self.preflight_page.readiness_summary.setText(
+                "Closing safely… Waiting for local setup checks to finish."
+            )
+            return
         if self._active_close_requires_stop:
             event.ignore()
             self.active_close_requested.emit()

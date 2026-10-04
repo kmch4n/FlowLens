@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
@@ -207,11 +208,6 @@ def _run_qt(
 ) -> int:
     """Run the Qt loop after mandatory bundled-resource initialization."""
 
-    from flowlens.adapters.windows_shell import WindowsFolderOpener
-    from flowlens.ui.main_window import MainWindow
-    from flowlens.ui.presenter import QtAccessibilityAnnouncer, QtSessionPresenter
-
-    _recover_startup_sessions(paths)
     app, owns_application = _acquire_qapplication()
     try:
         _configure_qt_surface(app)
@@ -224,22 +220,113 @@ def _run_qt(
             app.quit()
         return 1
 
-    graph = build_application(paths, options)
+    from flowlens.ui.single_instance import SingleInstance
+
+    endpoint = hashlib.sha256(str(paths.root).casefold().encode("utf-8")).hexdigest()
+    instance = SingleInstance(f"FlowLens-{endpoint}", paths.root / "instance.lock")
+    try:
+        if not instance.acquire():
+            return 0
+        return _run_primary_qt(
+            paths, options, app, owns_application, instance, snapshot_callback
+        )
+    finally:
+        instance.close()
+
+
+def _run_primary_qt(
+    paths: AppPaths,
+    options: AppOptions,
+    app: Any,
+    owns_application: bool,
+    instance: Any,
+    snapshot_callback: Callable[[object], None] | None,
+) -> int:
+    """Show the shell before exclusive startup I/O and join that work on exit."""
+    from flowlens.adapters.windows_shell import WindowsFolderOpener
+    from flowlens.ui.main_window import MainWindow
+    from flowlens.ui.presenter import QtAccessibilityAnnouncer, QtSessionPresenter
+    from flowlens.ui.startup import StartupTask
+
+    graph = None
+    closing = False
+    presenter: QtSessionPresenter | None = None
     window = MainWindow()
-    presenter = QtSessionPresenter(
-        cast(Any, graph.controller.session),
-        window,
-        QtAccessibilityAnnouncer(),
-        config_store=ConfigStore(paths.config),
-        settings_store=SettingsStore(paths.root / "settings.json"),
-        folder_opener=WindowsFolderOpener(),
-    )
-    cast(Any, window)._flowlens_presenter = presenter
+    window.set_startup_busy(True)
+    config = ConfigStore(paths.config).load()
+    window.preflight_page.set_session_mode(config.last_mode)
+    window.preflight_page.setEnabled(False)
+    window.settings_action.setEnabled(False)
+    window.preflight_page.readiness_summary.setText("Checking local setup…")
+
+    def activate() -> None:
+        if window.isMinimized():
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    instance.activation_requested.connect(activate)
+
+    def prepare() -> object:
+        from flowlens.controller.models import PreflightSelection
+
+        _recover_startup_sessions(paths)
+        prepared = build_application(paths, options)
+        prepared.controller.session.enter_preflight()
+        prepared.controller.session.refresh_preflight(
+            PreflightSelection(
+                config.last_mode,
+                config.devices.microphone_id or None,
+                config.devices.loopback_output_id or None,
+            )
+        )
+        return prepared
+
+    def failed(error_name: str) -> None:
+        if window.startup_close_pending:
+            return
+        window.preflight_page.readiness_summary.setText(
+            f"Setup could not finish ({error_name}). Close FlowLens and retry."
+        )
+
+    def ready(result: object) -> None:
+        nonlocal graph, presenter
+        from flowlens.integration.composition import ApplicationGraph
+
+        if closing or window.startup_close_pending:
+            return
+        graph = cast(ApplicationGraph, result)
+        try:
+            presenter = QtSessionPresenter(
+                cast(Any, graph.controller.session),
+                window,
+                QtAccessibilityAnnouncer(),
+                config_store=ConfigStore(paths.config),
+                settings_store=SettingsStore(paths.root / "settings.json"),
+                folder_opener=WindowsFolderOpener(),
+            )
+        except Exception as error:
+            failed(type(error).__name__)
+            return
+        cast(Any, window)._flowlens_presenter = presenter
+        window.preflight_page.setEnabled(True)
+        window.settings_action.setEnabled(True)
+
+    task = StartupTask(prepare)
+    task.completed.connect(ready)
+    task.failed.connect(failed)
+    task.finished.connect(lambda: window.set_startup_busy(False))
     window.show()
+    task.start()
     try:
         return int(app.exec())
     finally:
-        if snapshot_callback is not None:
+        closing = True
+        task.wait()
+        if presenter is not None:
+            presenter.timer.stop()
+        if snapshot_callback is not None and graph is not None:
             try:
                 snapshot_callback(graph.controller.session.snapshot())
             except Exception:
@@ -249,7 +336,7 @@ def _run_qt(
 
 
 def _recover_startup_sessions(paths: AppPaths) -> None:
-    """Durably recover every incomplete session before opening the live UI."""
+    """Durably recover incomplete sessions before enabling session controls."""
 
     recover_incomplete_sessions(paths.sessions, _utc_now())
 

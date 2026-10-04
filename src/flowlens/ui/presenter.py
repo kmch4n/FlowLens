@@ -133,10 +133,11 @@ class QtSessionPresenter:
         self._connect_signals()
         self.window.settings_action.triggered.connect(self._show_settings)
         if self.settings_store is not None:
-            try:
-                self._apply_settings(self.settings_store.load())
-            except (OSError, ValueError):
-                self._apply_settings(UserSettings())
+            settings, warning = self.settings_store.load_for_use()
+            self._apply_settings(settings)
+            if warning:
+                self.window.settings_action.setText("Settings — review needed")
+                self.window.settings_action.setToolTip(warning)
         self._restore_preferences()
         self.render_current_snapshot(force=True)
         self.timer.timeout.connect(self.on_timer)
@@ -144,6 +145,8 @@ class QtSessionPresenter:
         self.window.destroyed.connect(self._stop_timer)
 
     def _apply_settings(self, settings: UserSettings) -> None:
+        self.window.settings_action.setText("Settings…")
+        self.window.settings_action.setToolTip("")
         self.window.setStyleSheet(
             f"QListView#transcriptList {{ font-size: {settings.text_size}px; }}"
         )
@@ -264,13 +267,17 @@ class QtSessionPresenter:
         if self._controller_state() is SessionState.IDLE:
             self.controller.enter_preflight()
         if self._controller_state() is SessionState.PREFLIGHT:
-            self._refresh_preflight_with_available_devices(self._selection)
+            self._refresh_preflight_with_available_devices(
+                self._selection, self.controller.snapshot().preflight
+            )
 
     def _refresh_preflight_with_available_devices(
         self,
         selection: PreflightSelection,
+        report: PreflightReport | None = None,
     ) -> None:
-        report = self.controller.refresh_preflight(selection)
+        if report is None:
+            report = self.controller.refresh_preflight(selection)
         microphone_ids = {device.id for device in report.microphones}
         loopback_ids = {
             device.id for device in report.loopbacks if device.loopback_capable
@@ -289,7 +296,7 @@ class QtSessionPresenter:
             ),
         )
         self._selection = sanitized
-        if sanitized != selection:
+        if sanitized != selection or report.selection != sanitized:
             self.controller.update_preflight_selection(sanitized)
 
     def _refresh_devices(self) -> None:

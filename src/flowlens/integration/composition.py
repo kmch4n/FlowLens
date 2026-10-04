@@ -197,7 +197,7 @@ def _build_launch(
     asr_entry = _model_entry(models, _ASR_MODEL_ID)
     discussion_entry = _model_entry(models, _DISCUSSION_MODEL_ID)
     initial_state = DiscussionState.initial(report.selection.mode, started_at)
-    settings = SettingsStore(paths.root / "settings.json").load()
+    settings, _ = SettingsStore(paths.root / "settings.json").load_for_use()
     return SessionLaunch(
         session_id=session_id,
         session_dir=session_dir,

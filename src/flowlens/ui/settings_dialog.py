@@ -23,7 +23,7 @@ class SettingsDialog(QDialog):
     def __init__(self, store: SettingsStore, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._store = store
-        current = store.load()
+        current, warning = store.load_for_use()
         self.setWindowTitle("FlowLens settings")
         self.setMinimumWidth(460)
         layout = QVBoxLayout(self)
@@ -64,6 +64,8 @@ class SettingsDialog(QDialog):
             widget.setMinimumHeight(36)
         layout.addLayout(form)
         self.error = QLabel()
+        if warning:
+            self.error.setText(warning)
         self.error.setWordWrap(True)
         self.error.setProperty("uiState", "error")
         layout.addWidget(self.error)
