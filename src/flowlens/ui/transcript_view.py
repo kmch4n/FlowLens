@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 from flowlens.domain.enums import AudioSource
 from flowlens.ui.transcript_delegate import TranscriptDelegate
+from flowlens.ui.transcript_group_model import GroupedTranscriptModel
 from flowlens.ui.transcript_model import TranscriptListModel
 from flowlens.ui.widgets import StatefulButton
 
@@ -22,6 +23,7 @@ class TranscriptView(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.model = TranscriptListModel()
+        self.display_model = GroupedTranscriptModel(self.model)
         self.auto_scroll_enabled = True
         self.list_view = QListView()
         self.list_view.setObjectName("transcriptList")
@@ -50,8 +52,14 @@ class TranscriptView(QFrame):
         """Return visible source labels in committed-row order plus partial."""
 
         labels = [
-            self.model.source_label(self.model.row(index).source)
-            for index in range(self.model.rowCount())
+            self.model.source_label(
+                AudioSource(
+                    self.display_model.data(
+                        self.display_model.index(index, 0), self.model.source_role
+                    )
+                )
+            )
+            for index in range(self.display_model.rowCount())
         ]
         for source in (AudioSource.ME, AudioSource.OTHERS):
             partial = self.model.partial(source)
@@ -64,11 +72,11 @@ class TranscriptView(QFrame):
 
         rows = [
             str(
-                self.model.data(
-                    self.model.index(index, 0), int(Qt.ItemDataRole.DisplayRole)
+                self.display_model.data(
+                    self.display_model.index(index, 0), int(Qt.ItemDataRole.DisplayRole)
                 )
             )
-            for index in range(self.model.rowCount())
+            for index in range(self.display_model.rowCount())
         ]
         for label in self.partial_labels.values():
             if label.text() and label.isVisibleTo(self):
@@ -117,7 +125,7 @@ class TranscriptView(QFrame):
     def _configure(self) -> None:
         self.setProperty("flowlensRole", "workAreaPrimary")
         self.setMinimumSize(360, 240)
-        self.list_view.setModel(self.model)
+        self.list_view.setModel(self.display_model)
         self.list_view.setUniformItemSizes(False)
         self.list_view.setWordWrap(True)
         self.list_view.setHorizontalScrollBarPolicy(
@@ -131,8 +139,9 @@ class TranscriptView(QFrame):
         self.return_to_latest_button.hide()
 
     def _connect(self) -> None:
-        self.model.modelReset.connect(self._on_rows_changed)
-        self.model.rowsInserted.connect(self._on_rows_changed)
+        self.display_model.modelReset.connect(self._on_rows_changed)
+        self.display_model.rowsInserted.connect(self._on_rows_changed)
+        self.display_model.dataChanged.connect(self._on_rows_changed)
         self.model.partials_changed.connect(self.sync_partials)
         self.return_to_latest_button.clicked.connect(self.return_to_latest)
         self.list_view.verticalScrollBar().valueChanged.connect(self._on_scroll_value)

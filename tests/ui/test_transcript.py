@@ -138,7 +138,9 @@ def test_manual_scroll_disables_auto_scroll_until_return_to_latest(
     view.resize(420, 180)
     view.show()
     for sequence in range(1, 28):
-        view.model.commit(make_record(sequence=sequence, start_ms=sequence * 1000))
+        view.model.commit(
+            make_record(sequence=sequence, text="確定。", start_ms=sequence * 1000)
+        )
     qtbot.waitUntil(lambda: view.scrollbar().maximum() > 0, timeout=1000)
     view.return_to_latest()
     latest = view.scrollbar().maximum()
@@ -162,7 +164,9 @@ def test_queued_auto_scroll_rechecks_user_scroll_state(qtbot: QtBot) -> None:
     view.resize(420, 180)
     view.show()
     for sequence in range(1, 28):
-        view.model.commit(make_record(sequence=sequence, start_ms=sequence * 1000))
+        view.model.commit(
+            make_record(sequence=sequence, text="確定。", start_ms=sequence * 1000)
+        )
     qtbot.waitUntil(lambda: view.scrollbar().maximum() > 0, timeout=1000)
     view.return_to_latest()
     qtbot.waitUntil(
