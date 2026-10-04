@@ -111,8 +111,13 @@ class PyAudioWPatchBackend:
         self._api = py_audio_factory()
         self._monotonic_ms = monotonic_ms
         self._closed = False
-        self._wasapi_host_api_index = _parse_wasapi_host_api_index(
-            self._api.get_host_api_info_by_type(int(pyaudiowpatch.paWASAPI))
+        wasapi = self._api.get_host_api_info_by_type(int(pyaudiowpatch.paWASAPI))
+        self._wasapi_host_api_index = _parse_wasapi_host_api_index(wasapi)
+        self._default_input_index = _optional_device_index(
+            wasapi.get("defaultInputDevice")
+        )
+        self._default_output_index = _optional_device_index(
+            wasapi.get("defaultOutputDevice")
         )
 
     def list_microphones(self) -> tuple[CaptureDevice, ...]:
@@ -139,6 +144,9 @@ class PyAudioWPatchBackend:
                     is_loopback=False,
                 )
             )
+        devices.sort(
+            key=lambda device: device.input_device_index != self._default_input_index
+        )
         return tuple(devices)
 
     def list_loopback_outputs(self) -> tuple[CaptureDevice, ...]:
@@ -179,6 +187,10 @@ class PyAudioWPatchBackend:
                     is_loopback=True,
                 )
             )
+        devices.sort(
+            key=lambda device: device.device_id
+            != f"wasapi-output:{self._default_output_index}"
+        )
         return tuple(devices)
 
     def open_stream(
@@ -310,3 +322,9 @@ def _parse_wasapi_host_api_index(raw: Mapping[str, object]) -> int:
     if not isinstance(index, int) or isinstance(index, bool) or index < 0:
         raise RuntimeError("Windows WASAPI Host API is unavailable")
     return index
+
+
+def _optional_device_index(value: object) -> int | None:
+    if type(value) is int and value >= 0:
+        return value
+    return None

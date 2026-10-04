@@ -153,6 +153,30 @@ def test_enumerates_microphones_and_resolved_outputs_in_vendor_order() -> None:
     assert outputs[0].is_loopback is True
 
 
+def test_windows_default_devices_appear_first_even_when_enumerated_later() -> None:
+    api = FakePyAudio()
+    other_output = dict(api.devices[2], index=9, name="Headphones")
+    api.loopbacks[9] = dict(api.devices[3], index=13, name="Headphones [Loopback]")
+    api.devices = (
+        api.devices[1],
+        other_output,
+        api.devices[4],
+        api.devices[0],
+        api.devices[2],
+        api.devices[3],
+    )
+    backend = _backend(api)
+
+    assert [device.device_id for device in backend.list_microphones()] == [
+        "input:3",
+        "input:5",
+    ]
+    assert [device.device_id for device in backend.list_loopback_outputs()] == [
+        "wasapi-output:7",
+        "wasapi-output:9",
+    ]
+
+
 def test_enumeration_ignores_non_wasapi_device_duplicates() -> None:
     api = FakePyAudio()
     api.devices = (

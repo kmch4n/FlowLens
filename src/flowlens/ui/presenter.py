@@ -287,12 +287,12 @@ class QtSessionPresenter:
             (
                 selection.microphone_id
                 if selection.microphone_id in microphone_ids
-                else None
+                else report.microphones[0].id if report.microphones else None
             ),
             (
                 selection.loopback_output_id
                 if selection.loopback_output_id in loopback_ids
-                else None
+                else report.loopbacks[0].id if report.loopbacks else None
             ),
         )
         self._selection = sanitized
@@ -366,6 +366,7 @@ class QtSessionPresenter:
         if snapshot.preflight is None or not snapshot.preflight.can_start:
             return
         self.controller.start(self._selection)
+        self.save_preferences()
         self.render_current_snapshot()
 
     def _pause_or_resume_requested(self) -> None:

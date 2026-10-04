@@ -343,6 +343,72 @@ def test_ctrl_enter_starts_only_valid_preflight(qtbot: QtBot) -> None:
     assert invalid_presenter.render_count >= 1
 
 
+def test_missing_saved_devices_fall_back_to_first_available_options(
+    qtbot: QtBot,
+) -> None:
+    presenter, window, controller = make_presenter()
+    qtbot.addWidget(window)
+    report = replace(
+        ready_report(controller.selection, can_start=True),
+        microphones=(
+            DeviceOption("mic-default", "Windows default mic", False),
+            DeviceOption("mic-other", "Other mic", False),
+        ),
+        loopbacks=(
+            DeviceOption("out-default", "Windows default output", True),
+            DeviceOption("out-other", "Other output", True),
+        ),
+    )
+
+    presenter._refresh_preflight_with_available_devices(
+        PreflightSelection(SessionMode.MEETING, "removed-mic", "removed-out"),
+        report,
+    )
+
+    assert controller.selection.microphone_id == "mic-default"
+    assert controller.selection.loopback_output_id == "out-default"
+
+
+def test_available_saved_devices_take_priority_over_windows_defaults(
+    qtbot: QtBot,
+) -> None:
+    presenter, window, controller = make_presenter()
+    qtbot.addWidget(window)
+    report = replace(
+        ready_report(controller.selection, can_start=True),
+        microphones=(
+            DeviceOption("mic-default", "Windows default mic", False),
+            DeviceOption("mic-saved", "Selected mic", False),
+        ),
+        loopbacks=(
+            DeviceOption("out-default", "Windows default output", True),
+            DeviceOption("out-saved", "Selected output", True),
+        ),
+    )
+
+    presenter._refresh_preflight_with_available_devices(
+        PreflightSelection(SessionMode.MEETING, "mic-saved", "out-saved"),
+        report,
+    )
+
+    assert controller.selection.microphone_id == "mic-saved"
+    assert controller.selection.loopback_output_id == "out-saved"
+
+
+def test_start_persists_selected_devices_before_session_completion(
+    qtbot: QtBot,
+) -> None:
+    presenter, window, controller = make_presenter(preflight_valid=True)
+    qtbot.addWidget(window)
+
+    presenter._start_requested()
+
+    saved = presenter.config_store.load()
+    assert controller.state is SessionState.RECORDING
+    assert saved.devices.microphone_id == "mic-1"
+    assert saved.devices.loopback_output_id == "out-1"
+
+
 def test_timer_drains_ticks_and_renders_only_changed_snapshots(
     qtbot: QtBot,
 ) -> None:

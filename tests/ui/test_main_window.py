@@ -307,7 +307,7 @@ def test_safe_stop_error_terminal_allows_orderly_close(qtbot: QtBot) -> None:
     assert presenter.timer.isActive() is False
 
 
-def test_presenter_restores_only_still_available_saved_devices(
+def test_presenter_restores_available_device_and_defaults_missing_one(
     qtbot: QtBot,
 ) -> None:
     store = FakeConfigStore(
@@ -329,10 +329,10 @@ def test_presenter_restores_only_still_available_saved_devices(
 
     assert controller.selection == PreflightSelection(
         SessionMode.INTERVIEW,
-        None,
+        "mic-1",
         "out-1",
     )
-    assert window.preflight_page.microphone_combo.currentIndex() == -1
+    assert window.preflight_page.microphone_combo.currentData() == "mic-1"
     assert window.preflight_page.loopback_combo.currentData() == "out-1"
 
 
