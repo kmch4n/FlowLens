@@ -1,7 +1,7 @@
 """Pure transactional session lifecycle and IPC coordination."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -29,6 +29,7 @@ from flowlens.controller.supervision import (
 )
 from flowlens.discussion.contracts import DiscussionStatusPayload
 from flowlens.discussion.worker import DiscussionWorkerConfig
+from flowlens.domain.diagnostics import STAGE_TIMING_NAMES, TIMING_SAMPLE_LIMIT
 from flowlens.domain.discussion import DiscussionState
 from flowlens.domain.enums import (
     AudioSource,
@@ -178,6 +179,10 @@ class ControllerSnapshot:
     discussion_latencies_ms: tuple[int, ...] = ()
     ui_feedback_latencies_ms: tuple[int, ...] = ()
     decode_durations_ms: tuple[int, ...] = ()
+    stage_timings_ms: tuple[tuple[str, tuple[int, ...]], ...] = field(
+        default=(), compare=False
+    )
+    asr_pending_presentations: tuple[tuple[int, AudioSource, int], ...] = ()
     finalization_step: FinalizationStep | None = None
     finalization_elapsed_ms: int = 0
 
@@ -350,6 +355,13 @@ class SessionController:
         launch = self._launch_factory(checked, now, started_ms)
         if not isinstance(launch, SessionLaunch):
             raise TypeError("launch_factory must return a SessionLaunch")
+        launch = replace(
+            launch,
+            asr_config=replace(
+                launch.asr_config,
+                acceptance_diagnostics=self._acceptance_enabled,
+            ),
+        )
 
         self._outgoing_sequences.clear()
         self._announced.clear()
@@ -419,6 +431,8 @@ class SessionController:
             discussion_latencies_ms=(),
             ui_feedback_latencies_ms=(),
             decode_durations_ms=(),
+            stage_timings_ms=(),
+            asr_pending_presentations=(),
         )
 
     def pause(self) -> None:
@@ -640,7 +654,10 @@ class SessionController:
         envelope: MessageEnvelope[object],
         payload: object,
     ) -> bool:
-        if envelope.message_type is MessageType.ASR_DECODE_TIMING:
+        if envelope.message_type in {
+            MessageType.ASR_DECODE_TIMING,
+            MessageType.ASR_INPUT_TIMING,
+        }:
             return (
                 self._state
                 in {SessionState.RECORDING, SessionState.PAUSED, SessionState.STOPPING}
@@ -867,6 +884,7 @@ class SessionController:
             payload, TranscriptCommitted
         ):
             self._route_transcript(envelope, payload)
+            self._queue_asr_presentation(envelope, payload.record.source)
             self._record_acceptance_latency(
                 "commit",
                 envelope,
@@ -877,6 +895,7 @@ class SessionController:
             payload, PartialTranscript
         ):
             self._replace_partial(payload)
+            self._queue_asr_presentation(envelope, payload.source)
             self._record_acceptance_latency(
                 "partial",
                 envelope,
@@ -899,6 +918,15 @@ class SessionController:
                     envelope,
                     max(item.session_end_ms for item in analyzed_records),
                 )
+            return
+        if message_type is MessageType.ASR_INPUT_TIMING and isinstance(payload, dict):
+            source = cast(str, payload["source"]).lower()
+            self._record_stage_timing(
+                f"capture_to_asr_{source}", cast(int, payload["capture_to_asr_ms"])
+            )
+            self._record_stage_timing(
+                f"backlog_{source}", cast(int, payload["backlog_ms"])
+            )
             return
         if message_type is MessageType.ASR_DECODE_TIMING and isinstance(payload, dict):
             if self._acceptance_enabled:
@@ -1086,6 +1114,62 @@ class SessionController:
             )
         else:
             raise ValueError("unknown acceptance latency metric")
+
+    def _record_stage_timing(self, name: str, duration_ms: int) -> None:
+        if (
+            name not in STAGE_TIMING_NAMES
+            or type(duration_ms) is not int
+            or duration_ms < 0
+        ):
+            raise ValueError("invalid stage timing")
+        if self._acceptance_enabled:
+            values = dict(self._snapshot.stage_timings_ms)
+            values[name] = (*values.get(name, ()), duration_ms)[-TIMING_SAMPLE_LIMIT:]
+            self._snapshot = replace(
+                self._snapshot, stage_timings_ms=tuple(sorted(values.items()))
+            )
+
+    def _queue_asr_presentation(
+        self, envelope: MessageEnvelope[object], source: AudioSource
+    ) -> None:
+        if (
+            self._acceptance_enabled
+            and envelope.created_monotonic_ms >= self._asr_generation_started_ms
+        ):
+            self._snapshot = replace(
+                self._snapshot,
+                asr_pending_presentations=(
+                    *self._snapshot.asr_pending_presentations,
+                    (envelope.sequence, source, envelope.created_monotonic_ms),
+                )[-TIMING_SAMPLE_LIMIT:],
+            )
+
+    def record_asr_presented(
+        self, presented: tuple[tuple[int, AudioSource, int], ...]
+    ) -> None:
+        """Measure ASR emission to completed Qt widget update, not OS paint."""
+        if not self._acceptance_enabled or not presented:
+            return
+        now_ms = self._clock.monotonic_ms()
+        if type(now_ms) is not int or now_ms < 0:
+            raise ValueError("invalid presentation clock")
+        pending = self._snapshot.asr_pending_presentations
+        for sample in pending:
+            if sample in presented:
+                _, source, emitted_ms = sample
+                if (
+                    emitted_ms >= self._asr_generation_started_ms
+                    and ProcessSource.ASR not in self._restart_pending
+                ):
+                    self._record_stage_timing(
+                        f"asr_to_ui_{source.value.lower()}", max(0, now_ms - emitted_ms)
+                    )
+        self._snapshot = replace(
+            self._snapshot,
+            asr_pending_presentations=tuple(
+                sample for sample in pending if sample not in presented
+            ),
+        )
 
     def record_ui_feedback(self, latency_ms: int) -> None:
         """Record one rendered direct-feedback latency for local acceptance."""
@@ -1281,6 +1365,7 @@ class SessionController:
             if worker is ProcessSource.ASR:
                 self._asr_generation_maximum_ms = 0
                 self._asr_generation_started_ms = self._read_clock()
+                self._snapshot = replace(self._snapshot, asr_pending_presentations=())
             if worker is ProcessSource.DISCUSSION:
                 try:
                     self._send(

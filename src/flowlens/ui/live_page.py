@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from flowlens.controller.finalization import FinalizationStep
 from flowlens.controller.session_controller import (
     FINALIZATION_LABELS,
     ControllerSnapshot,
@@ -99,8 +100,18 @@ class LivePage(QWidget):
                 if snapshot.finalization_step is not None
                 else snapshot.recording_status
             )
+            capture = (
+                "Capture stopped"
+                if snapshot.finalization_step
+                in {
+                    FinalizationStep.FINALIZE_ASR,
+                    FinalizationStep.FINAL_ANALYSIS,
+                    FinalizationStep.FINALIZE_WRITER,
+                }
+                else "Stopping capture"
+            )
             text = (
-                f"Capture stopped · {stage} · "
+                f"{capture} · {stage} · "
                 f"{seconds // 60:02d}:{seconds % 60:02d} elapsed"
             )
             self.finalization_progress.setText(text)

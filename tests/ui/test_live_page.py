@@ -122,7 +122,12 @@ def test_stopping_progress_remains_visible_with_capture_controls_disabled(
         )
     )
     assert page.finalization_progress.isVisible()
-    assert "Capture stopped" in page.finalization_progress.text()
+    capture = (
+        "Stopping capture"
+        if step is FinalizationStep.DRAIN_AUDIO
+        else "Capture stopped"
+    )
+    assert capture in page.finalization_progress.text()
     assert label in page.finalization_progress.text()
     assert "01:05 elapsed" in page.finalization_progress.text()
     assert page.finalization_progress.wordWrap()

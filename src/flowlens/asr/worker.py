@@ -15,7 +15,7 @@ from flowlens.asr.ports import DecoderPort, SpeechDetectorPort
 from flowlens.asr.types import AsrWorkerConfig, PartialTranscript
 from flowlens.asr.vad import WebRtcSpeechDetector
 from flowlens.audio.types import AudioFrame
-from flowlens.domain.enums import MessageType, ProcessSource
+from flowlens.domain.enums import AudioSource, MessageType, ProcessSource
 from flowlens.domain.messages import (
     AudioDrainFence,
     MessageEnvelope,
@@ -165,6 +165,7 @@ def _asr_worker_loop(
     fence_credits = 0
     boundary_started_ms: int | None = None
     resume_pending = False
+    input_timings: dict[AudioSource, tuple[int, int]] = {}
     emitter.emit(MessageType.WORKER_READY, {"worker": "ASR"})
     _emit_status(emitter, "READY", 0, False, lag.maximum_backlog_ms)
 
@@ -181,6 +182,16 @@ def _asr_worker_loop(
 
     def process_engine() -> None:
         now_ms = monotonic_ms()
+        for source, (oldest_capture, arrival_age) in input_timings.items():
+            emitter.emit(
+                MessageType.ASR_INPUT_TIMING,
+                {
+                    "source": source.value,
+                    "capture_to_asr_ms": arrival_age,
+                    "backlog_ms": max(0, now_ms - oldest_capture),
+                },
+            )
+        input_timings.clear()
         observe_lag(engine.backlog_ms(now_ms))
         emit_batch(engine.process_ready(now_ms))
         emit_decode_timings()
@@ -209,6 +220,14 @@ def _asr_worker_loop(
             return True
         if isinstance(value, AudioFrame):
             engine.accept(value)
+            if config.acceptance_diagnostics:
+                captured = value.captured_monotonic_ms
+                arrival_age = max(0, monotonic_ms() - captured)
+                oldest, maximum = input_timings.get(value.source, (captured, 0))
+                input_timings[value.source] = (
+                    min(oldest, captured),
+                    max(maximum, arrival_age),
+                )
         return False
 
     def drain_audio(max_frames: int = _MAX_LIVE_DRAIN_FRAMES) -> None:

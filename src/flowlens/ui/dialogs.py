@@ -90,7 +90,7 @@ class SlowFinalizationDialog(QDialog):
         super().__init__(parent)
         self.message_label = QLabel("Finalization is taking longer than expected")
         self.warning_label = QLabel(
-            "Capture has stopped. Force close can leave the final transcript or "
+            "Stopping capture. Force close can leave the final transcript or "
             "summary incomplete. Keep waiting to finish saving the session."
         )
         self.keep_waiting_button = StatefulButton("Keep waiting")
@@ -98,6 +98,14 @@ class SlowFinalizationDialog(QDialog):
         self._choice_emitted = False
         self._build_layout()
         self._connect()
+
+    def set_capture_stopped(self, stopped: bool) -> None:
+        """Reflect only the Audio worker's acknowledged stop state."""
+        capture = "Capture stopped" if stopped else "Stopping capture"
+        self.warning_label.setText(
+            f"{capture}. Force close can leave the final transcript or "
+            "summary incomplete. Keep waiting to finish saving the session."
+        )
 
     def text(self) -> str:
         """Return the primary dialog message."""

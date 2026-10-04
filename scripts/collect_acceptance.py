@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
+from flowlens.domain.diagnostics import STAGE_TIMING_NAMES, TIMING_SAMPLE_LIMIT
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -212,7 +214,8 @@ def _application_latencies(path: Path) -> dict[str, list[int]]:
         raise ValueError("application report does not prove normal completion")
     raw = _mapping(controller.get("latencies_ms"), "application latencies")
     names = {"partial", "commit", "discussion", "ui_feedback"}
-    if set(raw) not in (names, names | {"decode"}):
+    optional = STAGE_TIMING_NAMES | {"decode"}
+    if not names <= set(raw) or set(raw) - names - optional:
         raise ValueError("application latencies have missing or unknown fields")
     result: dict[str, list[int]] = {}
     for name in sorted(raw):
@@ -222,9 +225,9 @@ def _application_latencies(path: Path) -> dict[str, list[int]]:
         parsed = [
             _non_negative_int(value, f"application {name} latency") for value in values
         ]
-        if name == "decode":
-            if len(parsed) > 256:
-                raise ValueError("application decode timings exceed 256 samples")
+        if name in optional:
+            if len(parsed) > TIMING_SAMPLE_LIMIT:
+                raise ValueError("application diagnostic timings exceed 256 samples")
         else:
             result[name] = parsed
     return result

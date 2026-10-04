@@ -17,6 +17,7 @@ from flowlens.adapters.windows_shell import WindowsFolderOpener
 from flowlens.config.model import AppConfig, DevicePreferences
 from flowlens.config.store import ConfigStore
 from flowlens.config.user_settings import SettingsStore, UserSettings
+from flowlens.controller.finalization import FinalizationStep
 from flowlens.controller.models import PreflightReport, PreflightSelection
 from flowlens.controller.ports import FolderOpener
 from flowlens.controller.session_controller import ControllerSnapshot, SessionState
@@ -26,7 +27,8 @@ from flowlens.ui.settings_dialog import SettingsDialog
 
 
 class _Controller(Protocol):
-    state: SessionState
+    @property
+    def state(self) -> SessionState: ...
 
     def snapshot(self) -> ControllerSnapshot: ...
 
@@ -213,6 +215,13 @@ class QtSessionPresenter:
             return
         display_snapshot = self._snapshot_with_shell_message(snapshot)
         self._render_snapshot(display_snapshot)
+        record_presented = getattr(self.controller, "record_asr_presented", None)
+        if callable(record_presented) and snapshot.state in {
+            SessionState.RECORDING,
+            SessionState.PAUSED,
+            SessionState.STOPPING,
+        }:
+            record_presented(snapshot.asr_pending_presentations)
         self._announce_snapshot_changes(previous, display_snapshot)
         self._last_snapshot = snapshot
         self._last_render_key = key
@@ -346,6 +355,14 @@ class QtSessionPresenter:
                 self.window.preflight_page.render(snapshot.preflight)
             self.window.show_preflight()
         self.window.set_stop_confirmation_visible(snapshot.stop_confirmation_visible)
+        self.window.slow_finalization_dialog.set_capture_stopped(
+            snapshot.finalization_step
+            in {
+                FinalizationStep.FINALIZE_ASR,
+                FinalizationStep.FINAL_ANALYSIS,
+                FinalizationStep.FINALIZE_WRITER,
+            }
+        )
         self.window.set_slow_finalization_visible(snapshot.slow_finalization_visible)
 
     def _announce_snapshot_changes(

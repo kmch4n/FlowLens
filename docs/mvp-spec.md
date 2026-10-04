@@ -490,7 +490,8 @@ Finalization order is fixed:
 9. Display the completion screen.
 
 The application retains `Finalizing` as the recording status while this sequence
-runs. The live page additionally shows `Capture stopped`, the current
+runs. The live page shows `Stopping capture` until the Audio worker acknowledges
+its stop, then `Capture stopped`. It also shows the current
 acknowledged stage, and elapsed finalization wait time. Stages are `Draining
 captured audio`, `Finishing transcription`, `Updating discussion summary`, and
 `Saving session`. The latest successful save time remains visible in the status
@@ -501,7 +502,8 @@ after the Writer's durable completion acknowledgement.
 If finalization has not completed after 30 seconds, the UI changes to
 `Finalization is taking longer than expected` and offers `Keep waiting` and
 `Force close`, with `Keep waiting` as the default. The dialog explains that force
-close can leave the final transcript or summary incomplete. It must never
+close can leave the final transcript or summary incomplete, and uses the same
+acknowledged capture state as the live page. It must never
 force-close automatically. `Force close` leaves the session as `incomplete`
 for recovery on the next launch.
 

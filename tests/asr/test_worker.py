@@ -10,6 +10,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from flowlens.asr.engine import AsrBatch
 from flowlens.asr.ports import DecoderPort
 from flowlens.asr.types import AsrWorkerConfig, DecodeHypothesis, PartialTranscript
@@ -163,6 +165,7 @@ class AsrWorkerHarness:
         self,
         *,
         decoder_factory: Callable[[Path], DecoderPort] | None = None,
+        acceptance_diagnostics: bool = False,
     ) -> None:
         self.clock = FakeClock()
         self.engine = FakeEngine()
@@ -173,12 +176,14 @@ class AsrWorkerHarness:
         self.control_sequence = 0
         self.exit_code: int | None = None
         self._decoder_factory = decoder_factory
+        self.acceptance_diagnostics = acceptance_diagnostics
 
     @property
     def config(self) -> AsrWorkerConfig:
         return AsrWorkerConfig(
             session_id=SESSION_ID,
             model_path=Path.cwd().resolve(),
+            acceptance_diagnostics=self.acceptance_diagnostics,
         )
 
     def start(self) -> None:
@@ -311,6 +316,36 @@ def test_worker_emits_content_free_decode_timing_after_process_and_finalize() ->
     assert first.payload == {"duration_ms": 37}
     assert last.payload == {"duration_ms": 42}
     assert first.sequence < last.sequence
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_worker_reports_capture_arrival_and_backlog_for_each_source(
+    enabled: bool,
+) -> None:
+    from dataclasses import replace
+
+    harness = AsrWorkerHarness(acceptance_diagnostics=enabled)
+    harness.clock.advance(75)
+    harness.audio_in.put_nowait(_frame())
+    harness.audio_in.put_nowait(replace(_frame(), source=AudioSource.OTHERS))
+    harness.audio_in.put_nowait(AudioDrainFence())
+    harness.start()
+    harness.send(MessageType.WORKER_STOP, {"worker": "ASR", "finalize": True})
+    harness.output(MessageType.WORKER_STOPPED)
+    harness.join()
+    timings = [
+        item.payload
+        for item in harness.snapshot()
+        if item.message_type.value == "ASR_INPUT_TIMING"
+    ]
+    assert timings == (
+        [
+            {"source": "ME", "capture_to_asr_ms": 75, "backlog_ms": 75},
+            {"source": "OTHERS", "capture_to_asr_ms": 75, "backlog_ms": 75},
+        ]
+        if enabled
+        else []
+    )
 
 
 def test_stop_drains_audio_then_finalizes_uncommitted_text() -> None:

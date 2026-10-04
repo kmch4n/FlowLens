@@ -17,6 +17,7 @@ from typing import Any, TypedDict, cast
 
 from flowlens.config.store import ConfigStore
 from flowlens.config.user_settings import SettingsStore
+from flowlens.domain.diagnostics import STAGE_TIMING_NAMES, TIMING_SAMPLE_LIMIT
 from flowlens.integration.composition import AppOptions, build_application
 from flowlens.offline_imports import import_local_module
 from flowlens.persistence.paths import AppPaths
@@ -496,6 +497,14 @@ def _controller_measurements(
     decode_durations = list(getattr(snapshot, "decode_durations_ms", ()))
     if decode_durations:
         latencies_ms["decode"] = decode_durations
+    for name, values in getattr(snapshot, "stage_timings_ms", ()):
+        if (
+            name not in STAGE_TIMING_NAMES
+            or len(values) > TIMING_SAMPLE_LIMIT
+            or any(type(value) is not int or value < 0 for value in values)
+        ):
+            raise ValueError("invalid acceptance stage timing")
+        latencies_ms[name] = list(values)
     return {
         "state": state_value,
         "recording_status": recording_status,

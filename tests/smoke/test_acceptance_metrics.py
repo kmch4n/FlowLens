@@ -35,6 +35,78 @@ def test_decode_measurements_export_only_numeric_content(tmp_path: Path) -> None
     )
 
 
+def test_stage_measurements_export_and_collect_without_changing_p95(
+    tmp_path: Path,
+) -> None:
+    from flowlens.controller.session_controller import SessionState
+
+    controller, _, _, _, _ = make_controller(tmp_path)
+    snapshot = replace(
+        controller.snapshot(),
+        state=SessionState.COMPLETED,
+        transcript=(replace(make_transcript_record(), text="PRIVATE_SENTINEL"),),
+        stage_timings_ms=(
+            ("capture_to_asr_me", (37,)),
+            ("backlog_others", (42,)),
+            ("asr_to_ui_me", (75,)),
+        ),
+    )
+    measurements = _controller_measurements(snapshot)
+    assert measurements is not None
+    assert measurements["latencies_ms"]["capture_to_asr_me"] == [37]
+    assert "PRIVATE_SENTINEL" not in str(measurements)
+    measurements["completion_available"] = True
+    path = tmp_path / "report.json"
+    path.write_text(
+        json.dumps(
+            {"schema_version": 1, "exit_code": 0, "controller": measurements},
+            indent=4,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert _application_latencies(path) == {
+        "partial": [],
+        "commit": [],
+        "discussion": [],
+        "ui_feedback": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "name", ["capture_to_asr_me", "backlog_others", "asr_to_ui_me"]
+)
+@pytest.mark.parametrize("values", [[-1], [True], [1.5], ["PRIVATE"], [0] * 257, None])
+def test_collector_rejects_invalid_stage_diagnostics(
+    tmp_path: Path, name: str, values: object
+) -> None:
+    path = tmp_path / "report.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "exit_code": 0,
+                "controller": {
+                    "state": "COMPLETED",
+                    "completion_available": True,
+                    "latencies_ms": {
+                        "partial": [],
+                        "commit": [],
+                        "discussion": [],
+                        "ui_feedback": [],
+                        name: values,
+                    },
+                },
+            },
+            indent=4,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        _application_latencies(path)
+
+
 @pytest.mark.parametrize("decode", [None, [], [37, 42, 999_999]])
 def test_collector_accepts_optional_decode_without_changing_acceptance(
     tmp_path: Path, decode: list[int] | None

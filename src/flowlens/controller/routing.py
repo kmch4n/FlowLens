@@ -201,6 +201,14 @@ def _validate_audio_payload(message_type: MessageType, payload: object) -> objec
 
 
 def _validate_asr_payload(message_type: MessageType, payload: object) -> object:
+    if message_type is MessageType.ASR_INPUT_TIMING:
+        mapping = _mapping(
+            payload, frozenset({"source", "capture_to_asr_ms", "backlog_ms"})
+        )
+        _audio_source(mapping["source"])
+        _exact_int(mapping["capture_to_asr_ms"], "capture_to_asr_ms")
+        _exact_int(mapping["backlog_ms"], "backlog_ms")
+        return dict(mapping)
     if message_type is MessageType.ASR_DECODE_TIMING:
         mapping = _mapping(payload, frozenset({"duration_ms"}))
         return {"duration_ms": _exact_int(mapping["duration_ms"], "duration_ms")}

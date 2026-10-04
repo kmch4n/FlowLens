@@ -181,9 +181,12 @@ class AsrWorkerConfig:
     start_paused: bool = False
     min_speech_rms: int = 200
     min_speech_ms: int = 160
+    acceptance_diagnostics: bool = False
 
     def __post_init__(self) -> None:
         rms = require_non_negative_int(self.min_speech_rms, "min_speech_rms")
+        if type(self.acceptance_diagnostics) is not bool:
+            raise ContractValidationError("acceptance_diagnostics must be a boolean")
         if rms > 2_000:
             raise ContractValidationError("min_speech_rms must not exceed 2000")
         speech_ms = _require_positive_int(self.min_speech_ms, "min_speech_ms")
