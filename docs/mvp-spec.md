@@ -1264,6 +1264,13 @@ integrity checks. Run those operations off the GUI thread; keep session controls
 disabled until they complete. Do not skip integrity checks to improve startup.
 Reuse the prepared preflight report when attaching the presenter.
 
+After parsing the local manifest, check the ASR and discussion entries with two
+concurrent workers and return results in `asr`, `discussion` order. Each entry
+still receives complete path, metadata, size, SHA-256 and required sidecar
+validation. Wait for both workers before returning; do not introduce a trust
+cache or skip later session-start checks. Disk contention can limit the benefit.
+See [designated-PC measurements](verification/startup-2026-09-22.md).
+
 Initially select Meeting / discussion. Restore the saved mode when preferences
 exist, including while setup checks are still running.
 

@@ -1,11 +1,13 @@
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from flowlens.adapters import local_models
 from flowlens.adapters.local_models import LocalModelReadiness
 from flowlens.adapters.storage import LocalStorageReadiness
 from flowlens.adapters.windows_devices import WindowsDeviceCatalog
@@ -94,6 +96,62 @@ def test_model_probe_hashes_only_manifested_local_files(tmp_path: Path) -> None:
     assert result["asr"].ready is True
     assert result["discussion"].ready is True
     assert result["discussion"].path == (root / QWEN_PATH).resolve()
+
+
+def test_model_probe_hashes_large_models_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path.resolve()
+    manifest = write_ready_manifest(root)
+    barrier = threading.Barrier(2, timeout=2)
+    original_hash = local_models._hash_file
+
+    def observed_hash(path: Path, chunk_size: int) -> str:
+        if path.name in {"model.bin", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"}:
+            barrier.wait()
+        return original_hash(path, chunk_size)
+
+    monkeypatch.setattr(local_models, "_hash_file", observed_hash)
+
+    result = LocalModelReadiness(root, manifest).check_required()
+
+    assert list(result) == ["asr", "discussion"]
+    assert result["asr"].ready is True
+    assert result["discussion"].ready is True
+
+
+@pytest.mark.parametrize("model_key", ["asr", "discussion"])
+def test_parallel_probe_keeps_mixed_model_failure(
+    tmp_path: Path, model_key: str
+) -> None:
+    root = tmp_path.resolve()
+    manifest = write_ready_manifest(root)
+    path = ASR_PATH if model_key == "asr" else QWEN_PATH
+    other_key = "discussion" if model_key == "asr" else "asr"
+    (root / path).write_bytes(b"changed")
+
+    result = LocalModelReadiness(root, manifest).check_required()
+
+    assert result[model_key].ready is False
+    assert result[model_key].reason == "checksum"
+    assert result[other_key].ready is True
+
+
+@pytest.mark.parametrize("model_key", ["asr", "discussion"])
+def test_parallel_probe_rejects_disappeared_file(
+    tmp_path: Path, model_key: str
+) -> None:
+    root = tmp_path.resolve()
+    manifest = write_ready_manifest(root)
+    path = ASR_PATH if model_key == "asr" else QWEN_PATH
+    other_key = "discussion" if model_key == "asr" else "asr"
+    (root / path).unlink()
+
+    result = LocalModelReadiness(root, manifest).check_required()
+
+    assert result[model_key].ready is False
+    assert result[model_key].reason == "missing"
+    assert result[other_key].ready is True
 
 
 def test_model_probe_rejects_wrong_asr_runtime_path(tmp_path: Path) -> None:

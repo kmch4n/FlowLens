@@ -4,6 +4,7 @@ import hashlib
 import json
 import stat
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flowlens.controller.models import ModelCheck
@@ -80,10 +81,10 @@ class LocalModelReadiness:
                 "discussion": ModelCheck(_DISCUSSION_ID, None, False, "invalid"),
             }
         models = manifest["models"]
-        return {
-            "asr": self._check_entry(models, _ASR_ID),
-            "discussion": self._check_entry(models, _DISCUSSION_ID),
-        }
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            asr = executor.submit(self._check_entry, models, _ASR_ID)
+            discussion = executor.submit(self._check_entry, models, _DISCUSSION_ID)
+            return {"asr": asr.result(), "discussion": discussion.result()}
 
     def _check_entry(
         self,
