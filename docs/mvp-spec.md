@@ -192,16 +192,18 @@ The configuration contains exactly these user preferences:
 ```
 
 Window geometry must be clamped to the currently available displays on launch.
-A missing saved device does not silently select an arbitrary replacement; the
-preflight screen requires the user to confirm another available device.
+A saved device is reused while available. If it disappears, preflight selects
+the Windows default device when available, otherwise the first compatible
+device in the current WASAPI list. Both controls remain visible for correction.
+If no compatible device exists, Start remains blocked with a specific message.
 
 Configuration must not contain transcript text, audio, model prompts, or any
 credential.
 
 ## 7. User Modes
 
-The user manually selects one mode before starting. Automatic mode detection is
-not allowed.
+Meeting / Discussion is preselected before checks complete. The user may choose
+another mode before starting. Automatic mode detection is not allowed.
 
 All modes use the same internal state schema. Only labels and analysis framing
 change.
@@ -244,7 +246,9 @@ The preflight screen contains:
 - A short destination summary.
 - `Start session`.
 
-The previous device selections are restored when still available.
+The previous device selections are restored when still available. The current
+selection is persisted when the user starts a session, in addition to orderly
+shutdown. The default WASAPI input and output appear first in their lists.
 
 Start is blocked when:
 
@@ -325,6 +329,13 @@ The top bar shows:
 - Manual upward scrolling disables auto-scroll.
 - A visible `Return to latest` control restores auto-scroll.
 - Overlapping speech remains as separate entries.
+
+The live display may combine adjacent ME records into one paragraph when their
+gap is at most 1.2 seconds, the earlier fragment lacks sentence-ending
+punctuation and the paragraph remains under 180 characters. A different source
+or a longer pause starts a new paragraph. OTHERS records stay separate because
+that channel can contain several people. The original immutable records and
+`transcript.jsonl` are not rewritten by display grouping.
 
 Entries are ordered by speech start time. If start times are equal, ME appears
 before OTHERS.
