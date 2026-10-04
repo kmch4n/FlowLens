@@ -55,6 +55,12 @@ from flowlens.domain.messages import (
 from flowlens.domain.session import PauseInterval, SessionManifest
 
 READINESS_TIMEOUT_MS = 60_000
+FINALIZATION_LABELS: Mapping[FinalizationStep, str] = {
+    FinalizationStep.DRAIN_AUDIO: "Draining captured audio",
+    FinalizationStep.FINALIZE_ASR: "Finishing transcription",
+    FinalizationStep.FINAL_ANALYSIS: "Updating discussion summary",
+    FinalizationStep.FINALIZE_WRITER: "Saving session",
+}
 _START_WORKERS = (
     ProcessSource.AUDIO,
     ProcessSource.ASR,
@@ -172,6 +178,8 @@ class ControllerSnapshot:
     discussion_latencies_ms: tuple[int, ...] = ()
     ui_feedback_latencies_ms: tuple[int, ...] = ()
     decode_durations_ms: tuple[int, ...] = ()
+    finalization_step: FinalizationStep | None = None
+    finalization_elapsed_ms: int = 0
 
 
 class SessionController:
@@ -254,7 +262,21 @@ class SessionController:
     def snapshot(self) -> ControllerSnapshot:
         """Return the latest immutable UI snapshot."""
 
-        return self._snapshot
+        if self._state is not SessionState.STOPPING or self._finalization is None:
+            return self._snapshot
+        finalization = self._finalization.snapshot()
+        return replace(
+            self._snapshot,
+            finalization_step=(
+                None if finalization.force_requested else finalization.step
+            ),
+            finalization_elapsed_ms=(
+                max(0, self._last_clock_ms - finalization.started_ms)
+                if finalization.started_ms is not None
+                and self._last_clock_ms is not None
+                else 0
+            ),
+        )
 
     def enter_preflight(self) -> None:
         """Enter preflight from an idle or terminal state."""

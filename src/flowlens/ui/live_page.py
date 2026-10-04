@@ -17,7 +17,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from flowlens.controller.session_controller import ControllerSnapshot, SessionState
+from flowlens.controller.session_controller import (
+    FINALIZATION_LABELS,
+    ControllerSnapshot,
+    SessionState,
+)
 from flowlens.domain.enums import AudioSource, SessionMode
 from flowlens.domain.messages import TranscriptRecord
 from flowlens.ui.discussion_panel import DiscussionPanel, labels_for
@@ -53,6 +57,7 @@ class LivePage(QWidget):
         self.stop_button = StatefulButton("Stop")
         self.always_on_top_toggle = QCheckBox("Always on top")
         self.banner = QLabel()
+        self.finalization_progress = QLabel()
         self.transcript_view = TranscriptView()
         self.discussion_panel = DiscussionPanel()
         self.status_strip = StatusStrip()
@@ -73,7 +78,32 @@ class LivePage(QWidget):
         self._current_state = snapshot.state
         mode = self._snapshot_mode(snapshot)
         self.mode_label.setText(self._MODE_LABELS[mode])
-        self.recording_state.setText(snapshot.recording_status)
+        stopping = snapshot.state is SessionState.STOPPING
+        self.recording_state.setText(
+            "Stopping…" if stopping else snapshot.recording_status
+        )
+        self.pause_resume_button.setEnabled(
+            snapshot.state in {SessionState.RECORDING, SessionState.PAUSED}
+        )
+        self.stop_button.setEnabled(
+            snapshot.state in {SessionState.RECORDING, SessionState.PAUSED}
+        )
+        self.finalization_progress.setVisible(stopping)
+        if stopping:
+            seconds = snapshot.finalization_elapsed_ms // 1000
+            stage = (
+                FINALIZATION_LABELS.get(
+                    snapshot.finalization_step, snapshot.recording_status
+                )
+                if snapshot.finalization_step is not None
+                else snapshot.recording_status
+            )
+            text = (
+                f"Capture stopped · {stage} · "
+                f"{seconds // 60:02d}:{seconds % 60:02d} elapsed"
+            )
+            self.finalization_progress.setText(text)
+            self.finalization_progress.setAccessibleDescription(text)
         self.pause_resume_button.setText(
             "Resume" if snapshot.state is SessionState.PAUSED else "Pause"
         )
@@ -122,6 +152,7 @@ class LivePage(QWidget):
         root.setContentsMargins(20, 16, 20, 16)
         root.setSpacing(12)
         root.addWidget(self._top_bar())
+        root.addWidget(self.finalization_progress)
         root.addWidget(self.banner)
         desktop_layout = QVBoxLayout(self.desktop_slot)
         desktop_layout.setContentsMargins(0, 0, 0, 0)
@@ -164,6 +195,12 @@ class LivePage(QWidget):
         self.banner.setMinimumHeight(28)
         self.banner.setWordWrap(False)
         self.banner.setProperty("flowlensRole", "helper")
+        self.finalization_progress.setWordWrap(True)
+        self.finalization_progress.setProperty("flowlensRole", "helper")
+        self.finalization_progress.setStyleSheet(
+            "color: #D6A13D; font-weight: 500; padding: 4px 12px;"
+        )
+        self.finalization_progress.hide()
         self.stop_button.set_ui_state("default", "Stop and finalize the session")
         self.always_on_top_toggle.setMinimumSize(44, 44)
         self.always_on_top_toggle.setFocusPolicy(Qt.FocusPolicy.StrongFocus)

@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame
 from pytestqt.qtbot import QtBot
 
+from flowlens.controller.finalization import FinalizationStep
 from flowlens.controller.models import (
     DeviceOption,
     ModelCheck,
@@ -93,6 +94,43 @@ def transcript_record(text: str = "元") -> TranscriptRecord:
         28_800,
         datetime.fromisoformat("2026-08-19T12:05:00+09:00"),
     )
+
+
+@pytest.mark.parametrize(
+    ("step", "label"),
+    [
+        (FinalizationStep.DRAIN_AUDIO, "Draining captured audio"),
+        (FinalizationStep.FINALIZE_ASR, "Finishing transcription"),
+        (FinalizationStep.FINAL_ANALYSIS, "Updating discussion summary"),
+        (FinalizationStep.FINALIZE_WRITER, "Saving session"),
+    ],
+)
+def test_stopping_progress_remains_visible_with_capture_controls_disabled(
+    qtbot: QtBot, step: FinalizationStep, label: str
+) -> None:
+    page = LivePage()
+    qtbot.addWidget(page)
+    page.resize(900, 700)
+    page.show()
+    page.render(
+        replace(
+            snapshot(state=SessionState.STOPPING),
+            finalization_step=step,
+            finalization_elapsed_ms=65_000,
+        )
+    )
+    assert page.finalization_progress.isVisible()
+    assert "Capture stopped" in page.finalization_progress.text()
+    assert label in page.finalization_progress.text()
+    assert "01:05 elapsed" in page.finalization_progress.text()
+    assert page.finalization_progress.wordWrap()
+    assert not page.pause_resume_button.isEnabled()
+    assert not page.stop_button.isEnabled()
+    assert "12:35:02" in page.status_strip.save_status.text()
+    page.render(snapshot())
+    assert not page.finalization_progress.isVisible()
+    assert page.pause_resume_button.isEnabled()
+    assert page.stop_button.isEnabled()
 
 
 @pytest.mark.parametrize(

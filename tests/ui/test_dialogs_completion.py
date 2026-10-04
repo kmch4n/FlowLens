@@ -34,6 +34,8 @@ def test_slow_finalization_dialog_never_auto_selects_force_close(
     dialog.show()
 
     assert dialog.text() == "Finalization is taking longer than expected"
+    assert "final transcript or summary incomplete" in dialog.warning_label.text()
+    assert dialog.warning_label.isVisible()
     assert dialog.keep_waiting_button.isDefault() is True
     assert dialog.force_close_button.isDefault() is False
     with qtbot.waitSignal(dialog.keep_waiting_requested, timeout=500):

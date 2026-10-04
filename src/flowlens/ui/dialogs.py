@@ -89,6 +89,10 @@ class SlowFinalizationDialog(QDialog):
     def __init__(self, parent: QDialog | None = None) -> None:
         super().__init__(parent)
         self.message_label = QLabel("Finalization is taking longer than expected")
+        self.warning_label = QLabel(
+            "Capture has stopped. Force close can leave the final transcript or "
+            "summary incomplete. Keep waiting to finish saving the session."
+        )
         self.keep_waiting_button = StatefulButton("Keep waiting")
         self.force_close_button = StatefulButton("Force close")
         self._choice_emitted = False
@@ -108,6 +112,8 @@ class SlowFinalizationDialog(QDialog):
         layout.setSpacing(16)
         self.message_label.setWordWrap(True)
         layout.addWidget(self.message_label)
+        self.warning_label.setWordWrap(True)
+        layout.addWidget(self.warning_label)
         actions = QHBoxLayout()
         actions.addWidget(self.keep_waiting_button)
         actions.addWidget(self.force_close_button)

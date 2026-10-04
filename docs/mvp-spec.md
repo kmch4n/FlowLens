@@ -489,16 +489,26 @@ Finalization order is fixed:
 8. Mark the session `completed`.
 9. Display the completion screen.
 
-The application must show `Finalizing` while this sequence runs. It must not
-pretend that the session is complete before persistence finishes.
+The application retains `Finalizing` as the recording status while this sequence
+runs. The live page additionally shows `Capture stopped`, the current
+acknowledged stage, and elapsed finalization wait time. Stages are `Draining
+captured audio`, `Finishing transcription`, `Updating discussion summary`, and
+`Saving session`. The latest successful save time remains visible in the status
+strip. Capture controls are disabled; the progress band wraps at narrow widths.
+No percentage or estimated completion time is shown. Completion appears only
+after the Writer's durable completion acknowledgement.
 
 If finalization has not completed after 30 seconds, the UI changes to
 `Finalization is taking longer than expected` and offers `Keep waiting` and
-`Force close`. It must never force-close automatically. `Force close` leaves the
-session as `incomplete` for recovery on the next launch.
+`Force close`, with `Keep waiting` as the default. The dialog explains that force
+close can leave the final transcript or summary incomplete. It must never
+force-close automatically. `Force close` leaves the session as `incomplete`
+for recovery on the next launch.
 
 Closing the application during an active or paused session uses the same stop
 confirmation and finalization path.
+Closing during finalization keeps the window open and draws attention to the
+same current stage and wait time, including the explicit 30-second choice.
 
 `SESSION_COMPLETED` and `FORCE_CLOSE_REQUESTED` use the same next event sequence
 as competing terminal candidates. The sequence is consumed exactly once after

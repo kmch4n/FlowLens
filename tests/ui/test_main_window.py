@@ -11,6 +11,7 @@ from PySide6.QtGui import QAccessible, QAccessibleAnnouncementEvent
 from pytestqt.qtbot import QtBot
 
 from flowlens.config.model import AppConfig, DevicePreferences, WindowPreferences
+from flowlens.controller.finalization import FinalizationStep
 from flowlens.controller.models import (
     BlockingIssue,
     CompletionSummary,
@@ -96,6 +97,12 @@ class ConfigurableController:
             stop_confirmation_visible=self.stop_confirmation_visible,
             slow_finalization_visible=self.slow_finalization_visible,
             completion=self._completion_summary(),
+            finalization_step=(
+                FinalizationStep.FINALIZE_ASR
+                if self.state is SessionState.STOPPING
+                else None
+            ),
+            finalization_elapsed_ms=8_000,
         )
 
     def enter_preflight(self) -> None:
@@ -245,12 +252,15 @@ def test_stopping_close_before_slow_threshold_keeps_finalizing_without_dialog(
     window.close()
 
     assert window.isVisible() is True
-    assert window.live_page.banner.text() == "Finalization is in progress."
+    assert window.live_page.banner.text() == ""
+    assert window.live_page.finalization_progress.isVisible()
+    assert "Finishing transcription" in window.live_page.finalization_progress.text()
+    assert "00:08 elapsed" in window.live_page.finalization_progress.text()
     assert window.stop_dialog.isVisible() is False
     assert window.slow_finalization_dialog.isVisible() is False
     assert controller.request_stop_count == 0
     assert presenter.timer.isActive() is True
-    assert ("Finalization is in progress.", False) in announcer.messages
+    assert any("Finishing transcription" in text for text, _ in announcer.messages)
 
 
 def test_stopping_close_with_slow_flag_shows_existing_slow_dialog(

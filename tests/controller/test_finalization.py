@@ -571,6 +571,58 @@ def test_controller_confirmation_starts_once_and_matching_writer_ack_completes(
     assert runtime.shutdown_count == 1
 
 
+@pytest.mark.parametrize("paused", [False, True])
+def test_controller_projects_acknowledged_stage_and_elapsed_wait(
+    tmp_path: Path, paused: bool
+) -> None:
+    controller, runtime, clock, _ = recording_controller(tmp_path)
+    if paused:
+        controller.pause()
+    controller.request_stop()
+    controller.confirm_stop()
+    for index, (step, worker) in enumerate(
+        (
+            (
+                FinalizationStep.DRAIN_AUDIO,
+                ProcessSource.AUDIO,
+            ),
+            (
+                FinalizationStep.FINALIZE_ASR,
+                ProcessSource.ASR,
+            ),
+            (
+                FinalizationStep.FINAL_ANALYSIS,
+                ProcessSource.DISCUSSION,
+            ),
+            (FinalizationStep.FINALIZE_WRITER, None),
+        )
+    ):
+        clock.ms = 1_000 + index * 1_000
+        controller.tick()
+        observed = controller.snapshot()
+        command_count = len(runtime.sent)
+        assert observed.finalization_step is step
+        assert observed.recording_status == "Finalizing"
+        assert observed.finalization_elapsed_ms == index * 1_000
+        assert controller.snapshot() == observed
+        assert len(runtime.sent) == command_count
+        assert observed.completion is None
+        if worker is not None:
+            controller.handle_message(stopped_envelope(worker))
+    finalize = runtime.sent[-1][1]
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.WRITER,
+            MessageType.WRITER_ACK,
+            2,
+            WriterAck(finalize.sequence, NOW),
+        )
+    )
+    assert controller.snapshot().finalization_step is None
+    assert controller.snapshot().finalization_elapsed_ms == 0
+    assert controller.snapshot().state is SessionState.COMPLETED
+
+
 def test_controller_rejects_future_ack_without_consuming_current_sequence(
     tmp_path: Path,
 ) -> None:
@@ -986,6 +1038,8 @@ def test_controller_send_failure_aborts_without_later_finalization_commands(
             controller.handle_message(stopped_envelope(worker))
 
     assert controller.state is SessionState.ERROR
+    assert controller.snapshot().finalization_step is None
+    assert controller.snapshot().finalization_elapsed_ms == 0
     assert runtime.shutdown_count == 1
     assert not any(
         item.message_type is MessageType.WRITER_FINALIZE

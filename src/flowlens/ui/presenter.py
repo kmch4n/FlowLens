@@ -406,9 +406,12 @@ class QtSessionPresenter:
             )
             return
         if snapshot.state is SessionState.STOPPING:
-            self._show_close_block_message(
-                "Finalization is in progress.",
-                assertive=False,
+            self._close_block_message = None
+            self.render_current_snapshot(force=True)
+            self.announcer.announce(
+                self.window,
+                self.window.live_page.finalization_progress.text(),
+                False,
             )
 
     def _cancel_stop(self) -> None:
