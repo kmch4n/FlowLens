@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QLineEdit, QMenu
 from pytestqt.qtbot import QtBot
 
 from flowlens.config.model import AppConfig
+from flowlens.controller.finalization import FinalizationStep
 from flowlens.controller.models import (
     BlockingIssue,
     CompletionSummary,
@@ -425,6 +426,46 @@ def test_timer_drains_ticks_and_renders_only_changed_snapshots(
     assert controller.tick_count == 3
     assert presenter.render_count == initial_renders + 1
     assert window.live_page.recording_state.text() == "Paused"
+
+
+def test_stopping_elapsed_renders_once_per_second_without_delaying_changes(
+    qtbot: QtBot,
+) -> None:
+    presenter, window, controller = make_presenter(recording=True)
+    qtbot.addWidget(window)
+    stopping = replace(
+        controller.snapshot(),
+        state=SessionState.STOPPING,
+        recording_status="Finalizing",
+        finalization_step=FinalizationStep.DRAIN_AUDIO,
+    )
+    presenter.render_snapshot(stopping)
+    initial_renders = presenter.render_count
+    for elapsed in range(50, 1000, 50):
+        presenter.render_snapshot(replace(stopping, finalization_elapsed_ms=elapsed))
+    assert presenter.render_count == initial_renders
+    presenter.render_snapshot(replace(stopping, finalization_elapsed_ms=1000))
+    assert presenter.render_count == initial_renders + 1
+    assert "00:01 elapsed" in window.live_page.finalization_progress.text()
+    next_stage = replace(
+        stopping,
+        finalization_elapsed_ms=1050,
+        finalization_step=FinalizationStep.FINALIZE_ASR,
+    )
+    presenter.render_snapshot(next_stage)
+    assert presenter.render_count == initial_renders + 2
+    assert "Finishing transcription" in window.live_page.finalization_progress.text()
+    presenter.render_snapshot(
+        replace(
+            next_stage,
+            finalization_elapsed_ms=1100,
+            transcript=(make_transcript_record(1),),
+        )
+    )
+    assert window.live_page.transcript_view.model.records() == (
+        make_transcript_record(1),
+    )
+    assert presenter.render_count == initial_renders + 3
 
 
 def test_timer_exceptions_do_not_break_later_ticks(qtbot: QtBot) -> None:

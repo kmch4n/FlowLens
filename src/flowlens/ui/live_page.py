@@ -49,6 +49,7 @@ class LivePage(QWidget):
         super().__init__(parent)
         self._current_state = SessionState.RECORDING
         self._known_segments: set[str] = set()
+        self._last_committed_transcript: tuple[TranscriptRecord, ...] | None = None
         self.product_label = QLabel("FlowLens")
         self.mode_label = QLabel()
         self.recording_state = QLabel()
@@ -240,12 +241,16 @@ class LivePage(QWidget):
         self.banner.setProperty("uiState", "error" if text else "default")
 
     def _render_transcript(self, snapshot: ControllerSnapshot) -> None:
-        for record in snapshot.transcript:
-            if record.segment_id in self._known_segments:
-                self._validate_known_segment(record)
-                continue
-            self.transcript_view.model.commit(record)
-            self._known_segments.add(record.segment_id)
+        # Both the tuple and its records are immutable. Status-only snapshots
+        # reuse it, so only changed committed content needs validation.
+        if snapshot.transcript is not self._last_committed_transcript:
+            for record in snapshot.transcript:
+                if record.segment_id in self._known_segments:
+                    self._validate_known_segment(record)
+                    continue
+                self.transcript_view.model.commit(record)
+                self._known_segments.add(record.segment_id)
+            self._last_committed_transcript = snapshot.transcript
         active_sources = {
             partial.source for partial in snapshot.partials if partial.text
         }

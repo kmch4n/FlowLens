@@ -3,10 +3,12 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame
 from pytestqt.qtbot import QtBot
 
+from flowlens.asr.types import PartialTranscript
 from flowlens.controller.finalization import FinalizationStep
 from flowlens.controller.models import (
     DeviceOption,
@@ -247,6 +249,35 @@ def test_live_page_rejects_conflicting_duplicate_segment(qtbot: QtBot) -> None:
 
     with pytest.raises(ImmutableTranscriptError):
         page.render(replace(snapshot(), transcript=(replace(record, text="衝突"),)))
+
+
+def test_elapsed_only_render_skips_committed_validation_but_updates_partials(
+    qtbot: QtBot, monkeypatch: MonkeyPatch
+) -> None:
+    page = LivePage()
+    qtbot.addWidget(page)
+    record = transcript_record()
+    initial = replace(snapshot(state=SessionState.STOPPING), transcript=(record,))
+    page.render(initial)
+    validated: list[str] = []
+    original = page._validate_known_segment
+
+    def observe(item: TranscriptRecord) -> None:
+        validated.append(item.segment_id)
+        original(item)
+
+    monkeypatch.setattr(page, "_validate_known_segment", observe)
+    page.render(replace(initial, finalization_elapsed_ms=1_000))
+    assert validated == []
+    partial = PartialTranscript(AudioSource.OTHERS, "続き", 2000, 2800, 32000, 44800)
+    page.render(replace(initial, finalization_elapsed_ms=2_000, partials=(partial,)))
+    assert validated == []
+    assert page.transcript_view.model.partial(AudioSource.OTHERS) == partial
+    page.render(replace(initial, finalization_elapsed_ms=3_000))
+    assert page.transcript_view.model.partial(AudioSource.OTHERS) is None
+    with pytest.raises(ImmutableTranscriptError):
+        page.render(replace(initial, transcript=(replace(record, text="衝突"),)))
+    assert validated == [record.segment_id]
 
 
 def test_discussion_panel_is_qframe_for_existing_qss_selector(qtbot: QtBot) -> None:

@@ -201,7 +201,13 @@ class QtSessionPresenter:
             raise TypeError("snapshot must be a ControllerSnapshot")
         if snapshot.state not in {SessionState.STARTING, SessionState.STOPPING}:
             self._close_block_message = None
-        key = (snapshot, self._close_block_message)
+        # The progress label displays whole seconds; retain precise controller
+        # timing while avoiding full page renders for each 50 ms timer tick.
+        render_snapshot = replace(
+            snapshot,
+            finalization_elapsed_ms=(snapshot.finalization_elapsed_ms // 1000) * 1000,
+        )
+        key = (render_snapshot, self._close_block_message)
         previous = self._last_snapshot
         if not force and self._last_render_key == key:
             return
