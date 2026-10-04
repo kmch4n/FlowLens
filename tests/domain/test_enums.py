@@ -75,6 +75,7 @@ def test_message_type_wire_values_are_spec_values() -> None:
         "TRANSCRIPT_PARTIAL",
         "TRANSCRIPT_COMMITTED",
         "ASR_STATUS",
+        "ASR_DECODE_TIMING",
         "DISCUSSION_ANALYZE",
         "DISCUSSION_STATE_REPLACED",
         "DISCUSSION_STATUS",

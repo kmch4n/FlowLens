@@ -171,6 +171,7 @@ class ControllerSnapshot:
     commit_latencies_ms: tuple[int, ...] = ()
     discussion_latencies_ms: tuple[int, ...] = ()
     ui_feedback_latencies_ms: tuple[int, ...] = ()
+    decode_durations_ms: tuple[int, ...] = ()
 
 
 class SessionController:
@@ -229,6 +230,7 @@ class SessionController:
         self._terminal_event_consumed = False
         self._analysis_paused_for_lag = False
         self._asr_generation_maximum_ms = 0
+        self._asr_generation_started_ms = 0
         self._analysis_disabled = False
         self._announced: set[tuple[str, str]] = set()
         self._protocol_event_in_progress = False
@@ -371,6 +373,7 @@ class SessionController:
         self._finalization = None
         self._restart_pending.clear()
         self._asr_generation_maximum_ms = 0
+        self._asr_generation_started_ms = started_ms
         self._pause_started_ms = None
         self._pause_intervals = []
         self._stop_confirmed_ms = None
@@ -393,6 +396,7 @@ class SessionController:
             commit_latencies_ms=(),
             discussion_latencies_ms=(),
             ui_feedback_latencies_ms=(),
+            decode_durations_ms=(),
         )
 
     def pause(self) -> None:
@@ -614,6 +618,14 @@ class SessionController:
         envelope: MessageEnvelope[object],
         payload: object,
     ) -> bool:
+        if envelope.message_type is MessageType.ASR_DECODE_TIMING:
+            return (
+                self._state
+                in {SessionState.RECORDING, SessionState.PAUSED, SessionState.STOPPING}
+                and ProcessSource.ASR not in self._restart_pending
+                and ProcessSource.ASR not in self._drained_workers
+                and envelope.created_monotonic_ms >= self._asr_generation_started_ms
+            )
         if envelope.message_type is not MessageType.ASR_STATUS:
             return True
         if not isinstance(payload, dict):
@@ -864,6 +876,16 @@ class SessionController:
                     "discussion",
                     envelope,
                     max(item.session_end_ms for item in analyzed_records),
+                )
+            return
+        if message_type is MessageType.ASR_DECODE_TIMING and isinstance(payload, dict):
+            if self._acceptance_enabled:
+                self._snapshot = replace(
+                    self._snapshot,
+                    decode_durations_ms=(
+                        *self._snapshot.decode_durations_ms,
+                        cast(int, payload["duration_ms"]),
+                    )[-256:],
                 )
             return
         if message_type is MessageType.ASR_STATUS and isinstance(payload, dict):
@@ -1236,6 +1258,7 @@ class SessionController:
             self._restart_pending.add(worker)
             if worker is ProcessSource.ASR:
                 self._asr_generation_maximum_ms = 0
+                self._asr_generation_started_ms = self._read_clock()
             if worker is ProcessSource.DISCUSSION:
                 try:
                     self._send(

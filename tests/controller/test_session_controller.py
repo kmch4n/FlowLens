@@ -55,6 +55,106 @@ SESSION_ID = "01J00000000000000000000000"
 NOW = datetime.fromisoformat("2026-08-19T12:00:00+09:00")
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_decode_samples_are_bounded_and_acceptance_only(
+    tmp_path: Path, enabled: bool
+) -> None:
+    controller, runtime, _, _, _ = make_controller(tmp_path, acceptance_enabled=enabled)
+    controller.enter_preflight()
+    controller.start(selection())
+    controller.handle_message(writer_ack())
+    for source in (ProcessSource.AUDIO, ProcessSource.ASR, ProcessSource.DISCUSSION):
+        controller.handle_message(ready(source))
+    sent_before = len(runtime.sent)
+    for index in range(300):
+        controller.handle_message(
+            worker_envelope(
+                ProcessSource.ASR,
+                MessageType.ASR_DECODE_TIMING,
+                index + 2,
+                {"duration_ms": index},
+            )
+        )
+    assert controller.snapshot().decode_durations_ms == (
+        tuple(range(44, 300)) if enabled else ()
+    )
+    assert len(runtime.sent) == sent_before
+
+
+def test_decode_timing_rejects_invalid_duplicate_stale_and_restart_pending_samples(
+    tmp_path: Path,
+) -> None:
+    controller, _, clock, _, _ = make_controller(tmp_path, acceptance_enabled=True)
+    controller.enter_preflight()
+    controller.start(selection())
+    controller.handle_message(writer_ack())
+    for source in (ProcessSource.AUDIO, ProcessSource.ASR, ProcessSource.DISCUSSION):
+        controller.handle_message(ready(source))
+    timing = worker_envelope(
+        ProcessSource.ASR, MessageType.ASR_DECODE_TIMING, 2, {"duration_ms": 37}
+    )
+    controller.handle_message(replace(timing, payload={"duration_ms": -1}))
+    controller.handle_message(replace(timing, session_id="01J00000000000000000000001"))
+    controller.handle_message(timing)
+    controller.handle_message(timing)
+    assert controller.snapshot().decode_durations_ms == (37,)
+    clock.ms = 2000
+    controller.handle_worker_exit(ProcessSource.ASR)
+    controller.handle_message(replace(timing, sequence=10))
+    controller.handle_message(ready(ProcessSource.ASR))
+    controller.handle_message(asr_status(2, 0, 0, state="READY"))
+    controller.handle_message(asr_status(3, 0, 0))
+    controller.handle_message(replace(timing, sequence=4))
+    controller.handle_message(replace(timing, sequence=4, created_monotonic_ms=2001))
+    assert controller.snapshot().decode_durations_ms == (37, 37)
+
+
+def test_decode_timing_survives_source_disconnect_but_rejects_stale_session(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _, _ = make_controller(tmp_path, acceptance_enabled=True)
+    controller.enter_preflight()
+    controller.start(selection())
+    controller.handle_message(writer_ack())
+    for source in (ProcessSource.AUDIO, ProcessSource.ASR, ProcessSource.DISCUSSION):
+        controller.handle_message(ready(source))
+    controller.handle_message(
+        worker_envelope(
+            ProcessSource.AUDIO,
+            MessageType.SOURCE_DISCONNECTED,
+            2,
+            {"source": "ME", "device_id": "mic-1"},
+        )
+    )
+    timing = worker_envelope(
+        ProcessSource.ASR, MessageType.ASR_DECODE_TIMING, 2, {"duration_ms": 42}
+    )
+    controller.handle_message(replace(timing, session_id="01J00000000000000000000001"))
+    controller.handle_message(timing)
+    assert controller.snapshot().decode_durations_ms == (42,)
+
+
+def test_decode_timing_is_retained_during_stop_until_asr_drain_ack(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _, _ = make_controller(tmp_path, acceptance_enabled=True)
+    controller.enter_preflight()
+    controller.start(selection())
+    controller.handle_message(writer_ack())
+    for source in (ProcessSource.AUDIO, ProcessSource.ASR, ProcessSource.DISCUSSION):
+        controller.handle_message(ready(source))
+    controller.request_stop()
+    controller.confirm_stop()
+    controller.handle_message(stopped_envelope(ProcessSource.AUDIO))
+    timing = worker_envelope(
+        ProcessSource.ASR, MessageType.ASR_DECODE_TIMING, 2, {"duration_ms": 42}
+    )
+    controller.handle_message(timing)
+    controller.handle_message(stopped_envelope_with_sequence(ProcessSource.ASR, 3))
+    controller.handle_message(replace(timing, sequence=4))
+    assert controller.snapshot().decode_durations_ms == (42,)
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.ms = 1_000

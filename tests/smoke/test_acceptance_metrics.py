@@ -1,16 +1,102 @@
 """Deterministic acceptance metric and report tests."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
+from flowlens.app import _controller_measurements
 from scripts.collect_acceptance import (
     AcceptanceMetrics,
     _acceptance_artifact_errors,
+    _application_latencies,
     collect_acceptance,
     evaluate_acceptance,
     nearest_rank_p95,
 )
 from scripts.validate_session import SessionValidationResult
+from tests.controller.test_session_controller import make_controller
+from tests.factories import make_transcript_record
+
+
+def test_decode_measurements_export_only_numeric_content(tmp_path: Path) -> None:
+    controller, _, _, _, _ = make_controller(tmp_path)
+    snapshot = replace(
+        controller.snapshot(),
+        transcript=(replace(make_transcript_record(), text="PRIVATE_SENTINEL_923"),),
+        decode_durations_ms=(37, 42),
+    )
+    measurements = _controller_measurements(snapshot)
+    assert measurements is not None
+    assert measurements["latencies_ms"]["decode"] == [37, 42]
+    assert "PRIVATE_SENTINEL_923" not in json.dumps(
+        measurements, indent=4, ensure_ascii=False
+    )
+
+
+@pytest.mark.parametrize("decode", [None, [], [37, 42, 999_999]])
+def test_collector_accepts_optional_decode_without_changing_acceptance(
+    tmp_path: Path, decode: list[int] | None
+) -> None:
+    latencies = {
+        "partial": [1000],
+        "commit": [2000],
+        "discussion": [4000],
+        "ui_feedback": [80],
+    }
+    expected = dict(latencies)
+    if decode is not None:
+        latencies["decode"] = decode
+    path = tmp_path / "report.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "exit_code": 0,
+                "controller": {
+                    "state": "COMPLETED",
+                    "completion_available": True,
+                    "latencies_ms": latencies,
+                },
+            },
+            indent=4,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    assert _application_latencies(path) == expected
+
+
+@pytest.mark.parametrize("decode", [[-1], [True], [1.5], ["37"], "37", None])
+def test_collector_rejects_invalid_optional_decode(
+    tmp_path: Path, decode: object
+) -> None:
+    path = tmp_path / "report.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "exit_code": 0,
+                "controller": {
+                    "state": "COMPLETED",
+                    "completion_available": True,
+                    "latencies_ms": {
+                        "partial": [],
+                        "commit": [],
+                        "discussion": [],
+                        "ui_feedback": [],
+                        "decode": decode,
+                    },
+                },
+            },
+            indent=4,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError):
+        _application_latencies(path)
 
 
 def make_metrics(**changes: object) -> AcceptanceMetrics:

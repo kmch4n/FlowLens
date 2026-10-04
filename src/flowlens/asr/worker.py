@@ -55,6 +55,8 @@ class _EnginePort(Protocol):
 
     def backlog_ms(self, now_monotonic_ms: int) -> int: ...
 
+    def take_decode_durations_ms(self) -> tuple[int, ...]: ...
+
 
 EngineFactory = Callable[
     [AsrWorkerConfig, DecoderPort, SpeechDetectorPort],
@@ -181,7 +183,12 @@ def _asr_worker_loop(
         now_ms = monotonic_ms()
         observe_lag(engine.backlog_ms(now_ms))
         emit_batch(engine.process_ready(now_ms))
+        emit_decode_timings()
         observe_lag(engine.backlog_ms(monotonic_ms()))
+
+    def emit_decode_timings() -> None:
+        for duration in engine.take_decode_durations_ms():
+            emitter.emit(MessageType.ASR_DECODE_TIMING, {"duration_ms": duration})
 
     def observe_lag(backlog_ms: int) -> None:
         if lag.observe(backlog_ms):
@@ -297,6 +304,7 @@ def _asr_worker_loop(
                 resume_pending = False
                 continue
             emit_batch(engine.finalize(monotonic_ms()))
+            emit_decode_timings()
             emitter.emit(
                 MessageType.WORKER_STOPPED,
                 {

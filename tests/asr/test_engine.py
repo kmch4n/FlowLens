@@ -1,5 +1,6 @@
 """Two-source ASR scheduling and transcript-boundary tests."""
 
+import time
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,47 @@ from flowlens.audio.types import AudioFrame
 from flowlens.domain.enums import AudioSource
 
 NOW = datetime(2026, 8, 19, 12, 0, 0, tzinfo=UTC)
+
+
+def test_decode_timing_drains_partial_and_final_measurements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter((1_000_000, 38_999_999, 100_000_000, 142_000_000))
+    monkeypatch.setattr(time, "monotonic_ns", lambda: next(ticks))
+    engine = make_engine(
+        decoder=RecordingDecoder.repeat(hypothesis("synthetic")), speech=True
+    )
+    engine.accept(frame(AudioSource.ME, session_ms=0))
+    engine.process_ready(500)
+    assert engine.take_decode_durations_ms() == (37,)
+    engine.finalize(600)
+    assert engine.take_decode_durations_ms() == (42,)
+    assert engine.take_decode_durations_ms() == ()
+
+
+def test_decode_timing_keeps_only_latest_256_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter(value for index in range(300) for value in (0, index * 1_000_000))
+    monkeypatch.setattr(time, "monotonic_ns", lambda: next(ticks))
+    engine = make_engine(decoder=RecordingDecoder.repeat(hypothesis("")), speech=True)
+    engine.accept(frame(AudioSource.ME, session_ms=0))
+    for index in range(300):
+        engine.process_ready((index + 1) * 500)
+    assert engine.take_decode_durations_ms() == tuple(range(44, 300))
+
+
+def test_hard_split_times_one_decode_without_counting_reused_hypothesis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter((1_000_000, 43_000_000))
+    monkeypatch.setattr(time, "monotonic_ns", lambda: next(ticks))
+    engine = make_engine(
+        decoder=RecordingDecoder((hypothesis("synthetic", end_ms=12000),)), speech=True
+    )
+    feed(engine, AudioSource.ME, frame_count=600, start_ms=0)
+    engine.process_ready(12000)
+    assert engine.take_decode_durations_ms() == (42,)
 
 
 def hypothesis(text: str, start_ms: int = 0, end_ms: int = 500) -> DecodeHypothesis:

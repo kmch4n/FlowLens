@@ -1,5 +1,6 @@
 """Two-source ASR scheduling, partials, and chronological commits."""
 
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -110,6 +111,14 @@ class AsrEngine:
         }
         self._last_process_monotonic_ms: int | None = None
         self._finalized = False
+        self._decode_durations_ms: deque[int] = deque(maxlen=256)
+
+    def take_decode_durations_ms(self) -> tuple[int, ...]:
+        """Drain bounded numeric decoder runtimes without retaining content."""
+
+        durations = tuple(self._decode_durations_ms)
+        self._decode_durations_ms.clear()
+        return durations
 
     def accept(self, frame: AudioFrame) -> None:
         """Validate and enqueue one canonical source frame."""
@@ -305,11 +314,10 @@ class AsrEngine:
             if final
             else self._decoder.decode
         )
-        decoded = (
-            decode(b"".join(item[0].pcm_s16le for item in state.utterance))
-            if hypothesis is None
-            else hypothesis
-        )
+        decoded = hypothesis
+        if decoded is None:
+            pcm = b"".join(item[0].pcm_s16le for item in state.utterance)
+            decoded = self._timed_decode(decode, pcm)
         state.last_decode_monotonic_ms = now_ms
         state.decoded_frame_count = len(state.utterance)
         committed_tokens = state.stable_prefix.observe(decoded, now_ms, final)
@@ -322,6 +330,16 @@ class AsrEngine:
         if not final and is_transcript_content(normalized):
             self._emit_changed_partial(source, normalized, partials)
         return decoded
+
+    def _timed_decode(
+        self, decode: Callable[[bytes], DecodeHypothesis], pcm: bytes
+    ) -> DecodeHypothesis:
+        started_ns = time.monotonic_ns()
+        try:
+            return decode(pcm)
+        finally:
+            elapsed_ms = max(0, (time.monotonic_ns() - started_ns) // 1_000_000)
+            self._decode_durations_ms.append(elapsed_ms)
 
     def _push_tokens(
         self,
@@ -446,8 +464,9 @@ class AsrEngine:
         if not self._has_sufficient_speech(state):
             self._final_decode_and_reset(source, now_ms, partials)
             return
-        decoded = self._decoder.decode(
-            b"".join(item[0].pcm_s16le for item in state.utterance)
+        decoded = self._timed_decode(
+            self._decoder.decode,
+            b"".join(item[0].pcm_s16le for item in state.utterance),
         )
         available_ms = len(state.utterance) * FRAME_DURATION_MS
         chosen_split_ms = min(

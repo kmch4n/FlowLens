@@ -201,6 +201,9 @@ def _validate_audio_payload(message_type: MessageType, payload: object) -> objec
 
 
 def _validate_asr_payload(message_type: MessageType, payload: object) -> object:
+    if message_type is MessageType.ASR_DECODE_TIMING:
+        mapping = _mapping(payload, frozenset({"duration_ms"}))
+        return {"duration_ms": _exact_int(mapping["duration_ms"], "duration_ms")}
     if message_type is MessageType.WORKER_READY:
         return _worker_dict(payload, worker="ASR")
     if message_type is MessageType.TRANSCRIPT_COMMITTED:

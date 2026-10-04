@@ -487,6 +487,15 @@ def _controller_measurements(
         or maximum_asr_backlog_ms < 0
     ):
         return None
+    latencies_ms = {
+        "partial": list(getattr(snapshot, "partial_latencies_ms", ())),
+        "commit": list(getattr(snapshot, "commit_latencies_ms", ())),
+        "discussion": list(getattr(snapshot, "discussion_latencies_ms", ())),
+        "ui_feedback": list(getattr(snapshot, "ui_feedback_latencies_ms", ())),
+    }
+    decode_durations = list(getattr(snapshot, "decode_durations_ms", ()))
+    if decode_durations:
+        latencies_ms["decode"] = decode_durations
     return {
         "state": state_value,
         "recording_status": recording_status,
@@ -494,12 +503,7 @@ def _controller_measurements(
         "transcript_count": len(transcript),
         "asr_backlog_ms": asr_backlog_ms,
         "maximum_asr_backlog_ms": maximum_asr_backlog_ms,
-        "latencies_ms": {
-            "partial": list(getattr(snapshot, "partial_latencies_ms", ())),
-            "commit": list(getattr(snapshot, "commit_latencies_ms", ())),
-            "discussion": list(getattr(snapshot, "discussion_latencies_ms", ())),
-            "ui_feedback": list(getattr(snapshot, "ui_feedback_latencies_ms", ())),
-        },
+        "latencies_ms": latencies_ms,
     }
 
 

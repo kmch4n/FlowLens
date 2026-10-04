@@ -104,6 +104,8 @@ class FakeEngine:
         self.process_batches: deque[AsrBatch] = deque()
         self.process_calls = 0
         self.backlog = 0
+        self.decode_durations: tuple[int, ...] = ()
+        self.final_decode_durations: tuple[int, ...] = ()
         self.fail_on_process_call: int | None = None
         self._condition = threading.Condition()
 
@@ -126,12 +128,18 @@ class FakeEngine:
     def finalize(self, now_monotonic_ms: int) -> AsrBatch:
         del now_monotonic_ms
         self.finalize_calls += 1
+        self.decode_durations = self.final_decode_durations
         self.finalized.set()
         return self.final_batch
 
     def backlog_ms(self, now_monotonic_ms: int) -> int:
         del now_monotonic_ms
         return self.backlog
+
+    def take_decode_durations_ms(self) -> tuple[int, ...]:
+        values = self.decode_durations
+        self.decode_durations = ()
+        return values
 
     def wait_for_process_calls(self, minimum: int) -> None:
         with self._condition:
@@ -285,6 +293,24 @@ def _partial(text: str = "確認中") -> PartialTranscript:
         source_start_sample=640,
         source_end_sample=1_600,
     )
+
+
+def test_worker_emits_content_free_decode_timing_after_process_and_finalize() -> None:
+    harness = AsrWorkerHarness()
+    harness.engine.decode_durations = (37,)
+    harness.engine.final_decode_durations = (42,)
+    harness.start()
+    harness.send(MessageType.WORKER_START, {"worker": "ASR"})
+    harness.output(MessageType.ASR_STATUS)
+    first = harness.output(MessageType.ASR_DECODE_TIMING)
+    harness.send(MessageType.WORKER_STOP, {"worker": "ASR", "finalize": True})
+    harness.audio_in.put_nowait(AudioDrainFence())
+    last = harness.output(MessageType.ASR_DECODE_TIMING)
+    harness.output(MessageType.WORKER_STOPPED)
+    harness.join()
+    assert first.payload == {"duration_ms": 37}
+    assert last.payload == {"duration_ms": 42}
+    assert first.sequence < last.sequence
 
 
 def test_stop_drains_audio_then_finalizes_uncommitted_text() -> None:

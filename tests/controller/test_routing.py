@@ -24,6 +24,31 @@ from flowlens.domain.messages import (
 SESSION_ID = "01J00000000000000000000000"
 
 
+@pytest.mark.parametrize("duration", [0, 37])
+def test_decode_timing_accepts_exact_nonnegative_integers(duration: int) -> None:
+    value = envelope(
+        message_type=MessageType.ASR_DECODE_TIMING, payload={"duration_ms": duration}
+    )
+    assert validate_worker_payload(value) == {"duration_ms": duration}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"duration_ms": -1},
+        {"duration_ms": True},
+        {"duration_ms": 1.5},
+        {"duration_ms": "37"},
+        {},
+        {"duration_ms": 37, "text": "private"},
+    ],
+)
+def test_decode_timing_rejects_non_numeric_or_extra_content(payload: object) -> None:
+    value = envelope(message_type=MessageType.ASR_DECODE_TIMING, payload=payload)
+    with pytest.raises(PayloadValidationError):
+        validate_worker_payload(value)
+
+
 def envelope(
     *,
     source: ProcessSource = ProcessSource.ASR,

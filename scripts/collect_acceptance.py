@@ -212,16 +212,21 @@ def _application_latencies(path: Path) -> dict[str, list[int]]:
         raise ValueError("application report does not prove normal completion")
     raw = _mapping(controller.get("latencies_ms"), "application latencies")
     names = {"partial", "commit", "discussion", "ui_feedback"}
-    if set(raw) != names:
+    if set(raw) not in (names, names | {"decode"}):
         raise ValueError("application latencies have missing or unknown fields")
     result: dict[str, list[int]] = {}
-    for name in sorted(names):
+    for name in sorted(raw):
         values = raw[name]
         if not isinstance(values, list):
             raise ValueError(f"application {name} latencies must be a list")
-        result[name] = [
+        parsed = [
             _non_negative_int(value, f"application {name} latency") for value in values
         ]
+        if name == "decode":
+            if len(parsed) > 256:
+                raise ValueError("application decode timings exceed 256 samples")
+        else:
+            result[name] = parsed
     return result
 
 
