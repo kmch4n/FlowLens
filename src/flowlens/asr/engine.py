@@ -300,10 +300,13 @@ class AsrEngine:
         state = self._states[source]
         if not self._has_sufficient_speech(state):
             return DecodeHypothesis(())
+        decode = (
+            getattr(self._decoder, "decode_final", self._decoder.decode)
+            if final
+            else self._decoder.decode
+        )
         decoded = (
-            self._decoder.decode(
-                b"".join(item[0].pcm_s16le for item in state.utterance)
-            )
+            decode(b"".join(item[0].pcm_s16le for item in state.utterance))
             if hypothesis is None
             else hypothesis
         )

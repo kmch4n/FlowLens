@@ -158,7 +158,13 @@ class KotobaWhisperDecoder:
 
     def decode(self, pcm_s16le: bytes) -> DecodeHypothesis:
         """Decode complete little-endian mono int16 PCM into ordered tokens."""
+        return self._decode(pcm_s16le, beam_size=1)
 
+    def decode_final(self, pcm_s16le: bytes) -> DecodeHypothesis:
+        """Spend additional search effort on the end-of-speech hypothesis."""
+        return self._decode(pcm_s16le, beam_size=5)
+
+    def _decode(self, pcm_s16le: bytes, *, beam_size: int) -> DecodeHypothesis:
         if len(pcm_s16le) % 2 != 0:
             raise ValueError("pcm_s16le must contain whole little-endian int16 samples")
         audio = np.frombuffer(pcm_s16le, dtype="<i2").astype(np.float32)
@@ -167,7 +173,7 @@ class KotobaWhisperDecoder:
             audio,
             language="ja",
             task="transcribe",
-            beam_size=1,
+            beam_size=beam_size,
             temperature=0.0,
             condition_on_previous_text=False,
             word_timestamps=True,
