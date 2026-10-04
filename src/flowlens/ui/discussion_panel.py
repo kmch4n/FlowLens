@@ -127,8 +127,9 @@ class DiscussionPanel(QFrame):
         for _ in range(4):
             layout.addWidget(self._separator())
             title = QLabel()
-            title.setProperty("flowlensRole", "sectionTitle")
+            title.setProperty("flowlensRole", "discussionHeading")
             body = QLabel()
+            body.setProperty("flowlensRole", "discussionBody")
             body.setWordWrap(True)
             body.setProperty("flowlensTone", "muted")
             effect = QGraphicsOpacityEffect(body)

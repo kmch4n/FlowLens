@@ -1,5 +1,4 @@
-/* Hallmark · genre: atmospheric · macrostructure: Workbench · theme: Midnight · tone: technical-austere · enrichment: none */
-/* Hallmark · pre-emit critique: P5 H5 E4 S5 R5 V4 */
+/* FlowLens conversation workspace: quiet chrome, clear reading hierarchy. */
 /* motion-duration: {motion_duration} */
 /* Setup surface: native desktop controls, clear hierarchy and local readiness. */
 QLabel[flowlensRole="pageTitle"] {{
@@ -93,14 +92,14 @@ QFrame[flowlensRole="rail"],
 QFrame[flowlensRole="workArea"],
 QFrame[flowlensRole="statusStrip"] {{
     background-color: {surface};
-    border: 1px solid {rule};
-    border-radius: 6px;
+    border: none;
+    border-radius: 8px;
 }}
 
 QFrame[flowlensRole="workAreaPrimary"] {{
     background-color: {elevated_surface};
-    border: 1px solid {rule};
-    border-radius: 6px;
+    border: none;
+    border-radius: 12px;
 }}
 
 QLabel {{
@@ -124,7 +123,7 @@ QLabel[uiState="error"] {{
 }}
 
 QLabel[uiState="success"] {{
-    color: {success};
+    color: {muted_text};
 }}
 
 QPushButton[flowlensRole="stateful"] {{
@@ -145,8 +144,8 @@ QListView#transcriptList {{
     outline: none;
 }}
 QListView#transcriptList::item {{
-    padding: 8px 12px;
-    border-bottom: 1px solid {rule};
+    padding: 0px;
+    border: none;
 }}
 QListView#transcriptList::item:selected {{
     background-color: {rule};
@@ -174,11 +173,47 @@ QDialog QComboBox, QDialog QSpinBox {{
     border-radius: 6px;
     padding: 4px 8px;
 }}
+QDialog QComboBox::drop-down {{ width: 28px; border: none; }}
+QDialog QComboBox::down-arrow {{
+    image: url("{chevron_icon}");
+    width: 16px;
+    height: 16px;
+}}
 QDialog QPushButton {{
     padding: 8px 16px;
     border: 1px solid {rule};
     border-radius: 6px;
     background-color: {elevated_surface};
+}}
+
+QCheckBox {{
+    background: transparent;
+    spacing: 8px;
+    padding: 4px;
+}}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 1px solid {muted_text};
+    border-radius: 4px;
+    background-color: {surface};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {accent};
+    border-color: {accent};
+}}
+QCheckBox:focus {{ border: 1px solid {focus}; }}
+QDialog QPushButton:focus, QDialog QSpinBox:focus, QDialog QComboBox:focus {{
+    border-color: {focus};
+}}
+QLabel[flowlensRole="discussionHeading"] {{
+    font-size: 13px;
+    font-weight: 600;
+    color: {muted_text};
+}}
+QLabel[flowlensRole="discussionBody"] {{
+    font-size: 16px;
+    color: {primary_text};
 }}
 
 QPushButton[flowlensRole="stateful"]:hover {{

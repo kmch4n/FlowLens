@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from flowlens.domain.enums import AudioSource
+from flowlens.ui.transcript_delegate import TranscriptDelegate
 from flowlens.ui.transcript_model import TranscriptListModel
 from flowlens.ui.widgets import StatefulButton
 
@@ -24,6 +25,7 @@ class TranscriptView(QFrame):
         self.auto_scroll_enabled = True
         self.list_view = QListView()
         self.list_view.setObjectName("transcriptList")
+        self.list_view.setItemDelegate(TranscriptDelegate(self.list_view))
         self.partial_labels = {
             AudioSource.ME: QLabel(),
             AudioSource.OTHERS: QLabel(),

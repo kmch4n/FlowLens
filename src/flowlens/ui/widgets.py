@@ -93,7 +93,10 @@ class StatusIndicator(QLabel):
         icon, label = self._STATE_LABELS[state]
         prefix = f"{icon} {label}" if icon else label
         self.setProperty("uiState", state)
-        self.setText(f"{prefix}: {self._label} · {message}")
+        if self.property("compact") and state in {"default", "success"}:
+            self.setText(f"{self._label}  {message}")
+        else:
+            self.setText(f"{prefix}: {self._label} · {message}")
         self.setAccessibleDescription(f"{label}: {message}")
         _refresh_style(self)
 

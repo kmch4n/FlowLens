@@ -46,12 +46,8 @@ def test_tokens_match_approved_midnight_contract() -> None:
     assert contrast_ratio(tokens.focus, tokens.background) >= 3.0
 
 
-def test_stylesheet_has_hallmark_stamp_and_bans() -> None:
+def test_stylesheet_avoids_decorative_effects() -> None:
     stylesheet = build_stylesheet(DesignTokens.approved(), reduced_motion=False)
-    assert stylesheet.startswith(
-        "/* Hallmark · genre: atmospheric · macrostructure: Workbench · "
-        "theme: Midnight · tone: technical-austere · enrichment: none */"
-    )
     lowered = stylesheet.lower()
     for banned in (
         "gradient",
@@ -122,4 +118,7 @@ def test_stylesheet_reads_from_selected_package_resource_root(tmp_path: Path) ->
         resource_root=tmp_path / "assets",
     )
 
-    assert stylesheet.startswith("/* Hallmark")
+    assert (
+        str(tmp_path / "assets" / "icons" / "chevron-down.svg").replace("\\", "/")
+        in stylesheet
+    )

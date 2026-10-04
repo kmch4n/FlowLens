@@ -1,4 +1,4 @@
-"""Hallmark Midnight design contract for the FlowLens Qt surface."""
+"""Shared conversation-workspace design tokens for the FlowLens Qt surface."""
 
 import sys
 from dataclasses import astuple, dataclass
@@ -45,7 +45,7 @@ class DesignTokens:
 
     @classmethod
     def approved(cls) -> "DesignTokens":
-        """Return the approved Hallmark Midnight token set."""
+        """Keep the established midnight palette across the desktop workspace."""
 
         return cls(
             background="#0D1117",

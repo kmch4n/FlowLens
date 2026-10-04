@@ -29,6 +29,14 @@ class StatusStrip(QFrame):
         self.asr_status = StatusIndicator("ASR")
         self.analysis_status = StatusIndicator("Analysis")
         self.save_status = StatusIndicator("Latest save")
+        for indicator in (
+            self.microphone_status,
+            self.pc_audio_status,
+            self.asr_status,
+            self.analysis_status,
+            self.save_status,
+        ):
+            indicator.setProperty("compact", True)
         self._build_layout()
 
     def render(self, snapshot: StatusSnapshot) -> None:  # type: ignore[override]
@@ -71,4 +79,5 @@ class StatusStrip(QFrame):
             self.save_status,
         ):
             label.setMinimumWidth(120)
+            label.setWordWrap(True)
             layout.addWidget(label)
